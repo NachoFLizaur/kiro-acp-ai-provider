@@ -202,7 +202,11 @@ function extractToolOutput(update: SessionUpdate): string {
  * Agent Client Protocol (ACP).
  *
  * Key design decisions:
- * - A single ACP session is created lazily and reused across calls.
+ * - ACP sessions are pooled: when a `doStream()` call arrives while the
+ *   current session is busy (e.g. parent waiting for a tool result while
+ *   a subagent fires a nested prompt), a new session is created
+ *   automatically. This avoids the deadlock that kiro-cli's single-
+ *   session prompt lock would otherwise cause.
  * - System prompts from the AI SDK are injected into the user message
  *   wrapped in `<system_instructions>` tags.
  * - Tool calls executed by kiro-cli are emitted as provider-executed
@@ -218,10 +222,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
   private readonly client: ACPClient
   private readonly config: KiroACPModelConfig
-  private session: ACPSession | null = null
+  /** All ACP sessions created by this model instance. */
+  private sessions: ACPSession[] = []
+  /** Session IDs that currently have an in-flight prompt. */
+  private busySessions = new Set<string>()
   private currentModelId: string | null = null
   private initPromise: Promise<void> | null = null
-  private promptLock: Promise<unknown> = Promise.resolve()
   private totalCredits = 0
 
   constructor(modelId: string, config: KiroACPModelConfig) {
@@ -240,69 +246,93 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   // -------------------------------------------------------------------------
-  // Session lifecycle
+  // Session pool
   // -------------------------------------------------------------------------
 
   /**
-   * Ensure the ACP client is started and a session exists.
-   * Safe to call multiple times — only initializes once.
-   * If initialization fails, subsequent calls will retry.
-   *
-   * When `config.sessionId` is provided, attempts to load the existing session
-   * via `session/load` first. If that fails (e.g. session was cleaned up),
-   * falls through to creating a new session.
+   * Ensure the ACP client is started. Safe to call multiple times — only
+   * initializes once. If initialization fails, subsequent calls will retry.
    */
-  private async ensureSession(): Promise<void> {
-    if (this.session) return
+  private async ensureClient(): Promise<void> {
+    if (this.client.isRunning()) return
 
-    // Prevent concurrent initialization — join the existing attempt
     if (this.initPromise) {
       await this.initPromise
-      if (!this.session) {
-        throw new Error("Session initialization failed")
-      }
       return
     }
 
-    this.initPromise = (async () => {
-      // Start the client if not already running
-      if (!this.client.isRunning()) {
-        await this.client.start()
-      }
-
-      // Try to load existing session if sessionId was provided
-      if (this.config.sessionId) {
-        try {
-          this.session = await this.client.loadSession(this.config.sessionId)
-          this.currentModelId = this.session.models.currentModelId
-          return
-        } catch {
-          // Session load failed — fall through to create new
-        }
-      }
-
-      // Create a new session
-      this.session = await this.client.createSession()
-      this.currentModelId = this.session.models.currentModelId
-    })()
+    this.initPromise = this.client.start().then(() => {})
 
     try {
       await this.initPromise
     } catch (err) {
-      // Reset so next call retries
       this.initPromise = null
       throw err
     }
-    // Keep initPromise set on success so concurrent callers can join it
   }
 
   /**
-   * Switch the model if the requested modelId differs from the current one.
+   * Acquire a free ACP session from the pool, or create a new one.
+   *
+   * When a `doStream()` call arrives while the current session is busy
+   * (e.g. parent waiting for a tool result while a subagent fires a
+   * nested prompt), a new session is created automatically. This avoids
+   * the deadlock that kiro-cli's single-session prompt lock would cause.
+   *
+   * For the very first session, if `config.sessionId` was provided we
+   * attempt to load it via `session/load`. If that fails we fall through
+   * to creating a fresh session.
    */
-  private async ensureModel(): Promise<void> {
+  private async acquireSession(): Promise<ACPSession> {
+    await this.ensureClient()
+
+    // Find a session that isn't currently in a prompt
+    const free = this.sessions.find(s => !this.busySessions.has(s.sessionId))
+    if (free) {
+      this.busySessions.add(free.sessionId)
+      return free
+    }
+
+    // No free session — create a new one.
+    // For the first session, try loading an existing one if sessionId was provided.
+    if (this.sessions.length === 0 && this.config.sessionId) {
+      try {
+        const loaded = await this.client.loadSession(this.config.sessionId)
+        this.sessions.push(loaded)
+        this.busySessions.add(loaded.sessionId)
+        if (this.currentModelId === null) {
+          this.currentModelId = loaded.models.currentModelId
+        }
+        return loaded
+      } catch {
+        // Fall through to create new
+      }
+    }
+
+    const session = await this.client.createSession()
+    this.sessions.push(session)
+    this.busySessions.add(session.sessionId)
+    if (this.currentModelId === null) {
+      this.currentModelId = session.models.currentModelId
+    }
+    return session
+  }
+
+  /**
+   * Release a session back to the pool so it can be reused.
+   */
+  private releaseSession(sessionId: string): void {
+    this.busySessions.delete(sessionId)
+  }
+
+  /**
+   * Switch the model on a specific session if the requested modelId
+   * differs from the current one.
+   */
+  private async ensureModel(session: ACPSession): Promise<void> {
     if (this.currentModelId === this.modelId) return
 
-    await this.client.setModel(this.session!.sessionId, this.modelId)
+    await this.client.setModel(session.sessionId, this.modelId)
     this.currentModelId = this.modelId
   }
 
@@ -310,9 +340,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   // Session rehydration
   // -------------------------------------------------------------------------
 
-  /** Get the current ACP session ID (for persistence across restarts). */
+  /** Get the primary (first) ACP session ID (for persistence across restarts). */
   getSessionId(): string | null {
-    return this.session?.sessionId ?? null
+    return this.sessions[0]?.sessionId ?? null
   }
 
   /**
@@ -320,16 +350,20 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * Used when session/load fails and we need to rehydrate from opencode's history.
    */
   async injectContext(summary: string): Promise<void> {
-    await this.ensureSession()
+    const session = await this.acquireSession()
 
-    await this.client.prompt({
-      sessionId: this.session!.sessionId,
-      prompt: [{
-        type: "text",
-        text: `<context_rehydration>\nThe following is a summary of our previous conversation that was interrupted:\n\n${summary}\n\nPlease acknowledge this context and continue from where we left off.\n</context_rehydration>`,
-      }],
-      onUpdate: () => {}, // Consume but ignore the acknowledgment response
-    })
+    try {
+      await this.client.prompt({
+        sessionId: session.sessionId,
+        prompt: [{
+          type: "text",
+          text: `<context_rehydration>\nThe following is a summary of our previous conversation that was interrupted:\n\n${summary}\n\nPlease acknowledge this context and continue from where we left off.\n</context_rehydration>`,
+        }],
+        onUpdate: () => {}, // Consume but ignore the acknowledgment response
+      })
+    } finally {
+      this.releaseSession(session.sessionId)
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -379,22 +413,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   async doStream(
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3StreamResult> {
-    // Serialize prompts — ACP sessions don't support concurrent prompts.
-    // We wait for any in-flight prompt to finish before starting a new one.
-    const previousPrompt = this.promptLock
-    let releaseLock: () => void
-    this.promptLock = new Promise<void>((resolve) => {
-      releaseLock = resolve
-    })
-
-    try {
-      await previousPrompt
-    } catch {
-      // Previous prompt failed — that's fine, we can proceed
-    }
-
-    await this.ensureSession()
-    await this.ensureModel()
+    const session = await this.acquireSession()
+    await this.ensureModel(session)
 
     // Sync dynamic tools to the MCP bridge before sending the prompt.
     // opencode's permission system filters tools per-turn, so the set may
@@ -410,7 +430,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       ? `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${userMessage}`
       : userMessage
 
-    const sessionId = this.session!.sessionId
+    const sessionId = session.sessionId
 
     // State tracking for stream part generation
     let streamStarted = false
@@ -614,6 +634,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
               }
             : undefined,
         })
+
+        // Release session BEFORE closing the stream so the next doStream()
+        // call (triggered by the consumer reading the finish part) can reuse it.
+        this.releaseSession(sessionId)
         await writer.close()
       })
       .catch(async (err: unknown) => {
@@ -626,14 +650,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         }
 
         await writePart({ type: "error", error: err })
+        this.releaseSession(sessionId)
         try {
           await writer.close()
         } catch {
           // Already closed
         }
-      })
-      .finally(() => {
-        releaseLock!()
       })
 
     return {
