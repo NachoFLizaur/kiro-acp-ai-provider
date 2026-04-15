@@ -16,12 +16,16 @@ export interface KiroACPProviderSettings {
   agent?: string
   /** Pass --trust-all-tools to kiro-cli. */
   trustAllTools?: boolean
+  /** Custom system prompt for the agent config. Overrides the default prompt. */
+  agentPrompt?: string
   /** Custom permission handler for tool call approvals. */
   onPermission?: (request: PermissionRequest) => PermissionDecision
   /** Extra environment variables for the kiro-cli subprocess. */
   env?: Record<string, string>
   /** Client info sent during the ACP initialize handshake. */
   clientInfo?: { name: string; version: string; title?: string }
+  /** Resume an existing ACP session instead of creating new. */
+  sessionId?: string
 }
 
 /** The KiroACP provider interface. */
@@ -35,6 +39,12 @@ export interface KiroACPProvider {
   shutdown(): Promise<void>
   /** Get the underlying ACP client (for advanced usage). */
   getClient(): ACPClient
+  /** Get the current ACP session ID for persistence. */
+  getSessionId(): string | null
+  /** Inject context summary for session rehydration. */
+  injectContext(summary: string): Promise<void>
+  /** Get total credits consumed across all turns in this session. */
+  getTotalCredits(): number
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +74,7 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
     cwd: settings.cwd ?? process.cwd(),
     agent: settings.agent,
     trustAllTools: settings.trustAllTools,
+    agentPrompt: settings.agentPrompt,
     onPermission: settings.onPermission,
     env: settings.env,
     clientInfo: settings.clientInfo,
@@ -72,10 +83,18 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
   // Create the ACP client lazily — it will be started on first model use
   const client = new ACPClient(clientOptions)
 
+  // Track the most recently created model instance for session access.
+  // Since all models share the same client and session, any instance can
+  // provide the session ID and inject context.
+  let lastModel: KiroACPLanguageModel | null = null
+
   const createModel = (modelId: string): LanguageModelV3 => {
-    return new KiroACPLanguageModel(modelId, {
+    const model = new KiroACPLanguageModel(modelId, {
       client,
+      sessionId: settings.sessionId,
     })
+    lastModel = model
+    return model
   }
 
   // The provider function itself creates a model
@@ -92,6 +111,21 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
 
   provider.getClient = (): ACPClient => {
     return client
+  }
+
+  provider.getSessionId = (): string | null => {
+    return lastModel?.getSessionId() ?? null
+  }
+
+  provider.injectContext = async (summary: string): Promise<void> => {
+    if (!lastModel) {
+      throw new Error("No model instance created yet. Call provider(modelId) first.")
+    }
+    await lastModel.injectContext(summary)
+  }
+
+  provider.getTotalCredits = (): number => {
+    return lastModel?.getTotalCredits() ?? 0
   }
 
   return provider

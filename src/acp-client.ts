@@ -94,6 +94,8 @@ export interface ACPClientOptions {
   trustAllTools?: boolean
   /** Extra environment variables for the subprocess. */
   env?: Record<string, string>
+  /** Custom system prompt for the agent config. Overrides the default prompt. */
+  agentPrompt?: string
   /** Custom permission handler. Default: auto-approve with "allow_always". */
   onPermission?: (request: PermissionRequest) => PermissionDecision
   /** Called for every session/update notification. */
@@ -505,6 +507,7 @@ export class ACPClient {
       mcpBridgePath: bridgePath,
       toolsFilePath: toolsFile,
       cwd: this.options.cwd,
+      prompt: this.options.agentPrompt,
     })
 
     writeAgentConfig(this.options.cwd, this.options.agent!, config)

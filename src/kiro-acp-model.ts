@@ -19,6 +19,8 @@ import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
 export interface KiroACPModelConfig {
   /** The ACP client instance (shared across models). */
   client: ACPClient
+  /** If provided, try to load this existing session instead of creating new. */
+  sessionId?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -142,14 +144,26 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   readonly supportedUrls: Record<string, RegExp[]> = {}
 
   private readonly client: ACPClient
+  private readonly config: KiroACPModelConfig
   private session: ACPSession | null = null
   private currentModelId: string | null = null
   private initPromise: Promise<void> | null = null
   private promptLock: Promise<unknown> = Promise.resolve()
+  private totalCredits = 0
 
   constructor(modelId: string, config: KiroACPModelConfig) {
     this.modelId = modelId
     this.client = config.client
+    this.config = config
+  }
+
+  // -------------------------------------------------------------------------
+  // Credits tracking
+  // -------------------------------------------------------------------------
+
+  /** Get total credits consumed across all turns in this model's session. */
+  getTotalCredits(): number {
+    return this.totalCredits
   }
 
   // -------------------------------------------------------------------------
@@ -160,6 +174,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * Ensure the ACP client is started and a session exists.
    * Safe to call multiple times — only initializes once.
    * If initialization fails, subsequent calls will retry.
+   *
+   * When `config.sessionId` is provided, attempts to load the existing session
+   * via `session/load` first. If that fails (e.g. session was cleaned up),
+   * falls through to creating a new session.
    */
   private async ensureSession(): Promise<void> {
     if (this.session) return
@@ -177,6 +195,17 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       // Start the client if not already running
       if (!this.client.isRunning()) {
         await this.client.start()
+      }
+
+      // Try to load existing session if sessionId was provided
+      if (this.config.sessionId) {
+        try {
+          this.session = await this.client.loadSession(this.config.sessionId)
+          this.currentModelId = this.session.models.currentModelId
+          return
+        } catch {
+          // Session load failed — fall through to create new
+        }
       }
 
       // Create a new session
@@ -202,6 +231,32 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     await this.client.setModel(this.session!.sessionId, this.modelId)
     this.currentModelId = this.modelId
+  }
+
+  // -------------------------------------------------------------------------
+  // Session rehydration
+  // -------------------------------------------------------------------------
+
+  /** Get the current ACP session ID (for persistence across restarts). */
+  getSessionId(): string | null {
+    return this.session?.sessionId ?? null
+  }
+
+  /**
+   * Inject conversation context into the current session.
+   * Used when session/load fails and we need to rehydrate from opencode's history.
+   */
+  async injectContext(summary: string): Promise<void> {
+    await this.ensureSession()
+
+    await this.client.prompt({
+      sessionId: this.session!.sessionId,
+      prompt: [{
+        type: "text",
+        text: `<context_rehydration>\nThe following is a summary of our previous conversation that was interrupted:\n\n${summary}\n\nPlease acknowledge this context and continue from where we left off.\n</context_rehydration>`,
+      }],
+      onUpdate: () => {}, // Consume but ignore the acknowledgment response
+    })
   }
 
   // -------------------------------------------------------------------------
@@ -418,6 +473,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         // Emit metadata from ACP
         const metadata = this.client.getMetadata(sessionId)
 
+        // Accumulate credits across turns
+        const turnCredits =
+          metadata?.meteringUsage?.find((m) => m.unit === "credit")?.value ?? 0
+        this.totalCredits += turnCredits
+
         await writePart({
           type: "finish",
           finishReason,
@@ -427,6 +487,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
                 kiro: {
                   contextUsagePercentage: metadata.contextUsagePercentage ?? null,
                   turnDurationMs: metadata.turnDurationMs ?? null,
+                  credits: metadata.meteringUsage?.find((m) => m.unit === "credit")?.value ?? null,
+                  estimatedContextTokens:
+                    metadata.contextUsagePercentage != null
+                      ? Math.round(metadata.contextUsagePercentage * 200_000)
+                      : null,
                 },
               }
             : undefined,

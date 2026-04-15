@@ -579,7 +579,7 @@ describe("KiroACPLanguageModel", () => {
   })
 
   describe("doStream() — metadata", () => {
-    test("includes kiro metadata in finish part when available", async () => {
+    test("includes kiro metadata with credits and estimatedContextTokens in finish part", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -590,7 +590,45 @@ describe("KiroACPLanguageModel", () => {
         }),
         getMetadata: mock(() => ({
           sessionId: "sess-1",
-          contextUsagePercentage: 12.5,
+          contextUsagePercentage: 0.035,
+          turnDurationMs: 2500,
+          meteringUsage: [{ unit: "credit", unitPlural: "credits", value: 0.03 }],
+        })),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const finish = parts.find((p) => p.type === "finish")
+
+      expect(finish).toBeDefined()
+      if (finish?.type === "finish") {
+        expect(finish.providerMetadata).toEqual({
+          kiro: {
+            contextUsagePercentage: 0.035,
+            turnDurationMs: 2500,
+            credits: 0.03,
+            estimatedContextTokens: Math.round(0.035 * 200_000),
+          },
+        })
+      }
+    })
+
+    test("sets credits and estimatedContextTokens to null when not available", async () => {
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+        getMetadata: mock(() => ({
+          sessionId: "sess-1",
           turnDurationMs: 3200,
         })),
       } as unknown as Partial<ACPClient>)
@@ -608,11 +646,51 @@ describe("KiroACPLanguageModel", () => {
       if (finish?.type === "finish") {
         expect(finish.providerMetadata).toEqual({
           kiro: {
-            contextUsagePercentage: 12.5,
+            contextUsagePercentage: null,
             turnDurationMs: 3200,
+            credits: null,
+            estimatedContextTokens: null,
           },
         })
       }
+    })
+
+    test("accumulates credits across multiple turns", async () => {
+      let callCount = 0
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+        getMetadata: mock(() => {
+          callCount++
+          return {
+            sessionId: "sess-1",
+            contextUsagePercentage: 0.05 * callCount,
+            turnDurationMs: 1000,
+            meteringUsage: [{ unit: "credit", unitPlural: "credits", value: 0.02 * callCount }],
+          }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      // First turn
+      const r1 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "first" }] }]),
+      )
+      await collectStream(r1.stream)
+      expect(model.getTotalCredits()).toBeCloseTo(0.02)
+
+      // Second turn
+      const r2 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "second" }] }]),
+      )
+      await collectStream(r2.stream)
+      expect(model.getTotalCredits()).toBeCloseTo(0.06) // 0.02 + 0.04
     })
   })
 
