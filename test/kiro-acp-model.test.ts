@@ -44,6 +44,7 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     getStderr: mock(() => ""),
     getToolsFilePath: mock(() => null),
     getCwd: mock(() => "/tmp/test"),
+    getIpcPort: mock(() => null),
     ...overrides,
   } as unknown as ACPClient
 }

@@ -22,6 +22,8 @@ export interface MCPToolsFile {
   tools: MCPToolDefinition[]
   /** Working directory for tool execution. */
   cwd?: string
+  /** Port number for the IPC server (tool delegation). */
+  ipcPort?: number
 }
 
 /**

@@ -41,3 +41,13 @@ export {
   type MCPToolInputSchema,
   type MCPToolsFile,
 } from "./mcp-bridge-tools"
+
+// IPC Server
+export {
+  createIPCServer,
+  type IPCServer,
+  type IPCServerOptions,
+  type ToolExecutorFn,
+  type ToolExecuteRequest,
+  type ToolExecuteResponse,
+} from "./ipc-server"

@@ -1,6 +1,7 @@
 import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { ACPClient, type ACPClientOptions, type PermissionRequest, type PermissionDecision } from "./acp-client"
 import { KiroACPLanguageModel } from "./kiro-acp-model"
+import type { ToolExecutorFn } from "./ipc-server"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,6 +29,8 @@ export interface KiroACPProviderSettings {
   sessionId?: string
   /** Model's max context window in tokens (from models.dev). Default: 1_000_000. */
   contextWindow?: number
+  /** Tool executor for delegated tool calls from the MCP bridge. */
+  toolExecutor?: ToolExecutorFn
 }
 
 /** The KiroACP provider interface. */
@@ -80,6 +83,7 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
     onPermission: settings.onPermission,
     env: settings.env,
     clientInfo: settings.clientInfo,
+    toolExecutor: settings.toolExecutor,
   }
 
   // Create the ACP client lazily — it will be started on first model use

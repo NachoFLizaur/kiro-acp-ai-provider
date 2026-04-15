@@ -19,7 +19,9 @@ import { execSync } from "node:child_process"
 import { createInterface } from "node:readline"
 import * as fs from "node:fs"
 import * as path from "node:path"
+import * as http from "node:http"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
+import type { ToolExecuteResponse } from "./ipc-server"
 
 // ---------------------------------------------------------------------------
 // JSON-RPC types
@@ -138,17 +140,21 @@ const TOOL_NAME_TO_EXECUTOR: Record<string, string> = {
   list_directory: "list_directory",
 }
 
-/** Tools that are known but not executable in the MCP bridge. */
+/** Tools that are delegated to the host runtime via IPC. */
+const DELEGATED_TOOLS = new Set([
+  "task",
+  "question",
+  "todowrite",
+  "skill",
+])
+
+/** Tools that are known but not executable anywhere. */
 const UNAVAILABLE_TOOLS = new Set([
   "webfetch",
   "websearch",
   "web-research_multi_search",
   "web-research_fetch_pages",
-  "task",
   "todo",
-  "todowrite",
-  "question",
-  "skill",
 ])
 
 // ---------------------------------------------------------------------------
@@ -392,6 +398,53 @@ const EXECUTORS: Record<string, ToolExecutor> = {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP client for IPC delegation
+// ---------------------------------------------------------------------------
+
+function httpPost(url: string, body: unknown, timeoutMs: number = 310_000): Promise<ToolExecuteResponse> {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body)
+    const parsed = new URL(url)
+
+    const req = http.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: parsed.pathname,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(data),
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        let responseData = ""
+        res.on("data", (chunk: Buffer) => {
+          responseData += chunk.toString()
+        })
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(responseData) as ToolExecuteResponse)
+          } catch {
+            reject(new Error(`Invalid JSON response: ${responseData.slice(0, 200)}`))
+          }
+        })
+      },
+    )
+
+    req.on("error", reject)
+    req.on("timeout", () => {
+      req.destroy()
+      reject(new Error("HTTP request timed out"))
+    })
+
+    req.write(data)
+    req.end()
+  })
+}
+
+// ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
@@ -399,12 +452,15 @@ class MCPBridgeServer {
   private tools: MCPToolDefinition[]
   private readonly cwd: string
   private readonly toolsPath: string
+  private ipcPort: number | undefined
+  private ipcHealthy = false
   private initialized = false
 
-  constructor(tools: MCPToolDefinition[], cwd: string, toolsPath: string) {
+  constructor(tools: MCPToolDefinition[], cwd: string, toolsPath: string, ipcPort?: number) {
     this.tools = tools
     this.cwd = cwd
     this.toolsPath = toolsPath
+    this.ipcPort = ipcPort
   }
 
   /** Handle an incoming JSON-RPC message and return a response (or null for notifications). */
@@ -491,6 +547,9 @@ class MCPBridgeServer {
       if (Array.isArray(parsed.tools)) {
         this.tools = parsed.tools
       }
+      if (parsed.ipcPort !== undefined) {
+        this.ipcPort = parsed.ipcPort
+      }
     } catch (err) {
       log("warn", `Failed to re-read tools file on tools/list: ${err}`)
       // Fall through — serve whatever tools we have cached
@@ -535,7 +594,12 @@ class MCPBridgeServer {
     }
 
     // Find executor via name mapping
-    // First check if the tool is known-unavailable
+    // First check if the tool should be delegated to the host runtime via IPC
+    if (DELEGATED_TOOLS.has(toolName)) {
+      return this.delegateToIPC(request.id, toolName, toolArgs)
+    }
+
+    // Then check if the tool is known-unavailable
     if (UNAVAILABLE_TOOLS.has(toolName)) {
       return {
         jsonrpc: "2.0",
@@ -595,11 +659,144 @@ class MCPBridgeServer {
   }
 
   /** Update the tool list (e.g. when the tools file changes). */
-  updateTools(tools: MCPToolDefinition[]): void {
+  updateTools(tools: MCPToolDefinition[], ipcPort?: number): void {
     this.tools = tools
-    log("info", `Updated tool list: ${tools.length} tool(s)`)
+    if (ipcPort !== undefined) {
+      this.ipcPort = ipcPort
+    }
+    log("info", `Updated tool list: ${tools.length} tool(s)${ipcPort ? ` (ipcPort: ${ipcPort})` : ""}`)
     // Emit tools/list_changed notification
     sendNotification("notifications/tools/list_changed", {})
+  }
+
+  // -------------------------------------------------------------------------
+  // IPC delegation
+  // -------------------------------------------------------------------------
+
+  /** Check if the IPC server is reachable. */
+  private async checkHealth(): Promise<boolean> {
+    if (!this.ipcPort) return false
+
+    return new Promise<boolean>((resolve) => {
+      const req = http.request(
+        {
+          hostname: "127.0.0.1",
+          port: this.ipcPort,
+          path: "/health",
+          method: "GET",
+          timeout: 5_000,
+        },
+        (res) => {
+          let data = ""
+          res.on("data", (chunk: Buffer) => { data += chunk.toString() })
+          res.on("end", () => {
+            try {
+              const parsed = JSON.parse(data) as { status?: string }
+              resolve(parsed.status === "ok")
+            } catch {
+              resolve(false)
+            }
+          })
+        },
+      )
+      req.on("error", () => resolve(false))
+      req.on("timeout", () => {
+        req.destroy()
+        resolve(false)
+      })
+      req.end()
+    })
+  }
+
+  /** Delegate a tool call to the host runtime via IPC HTTP. */
+  private async delegateToIPC(
+    requestId: number | string,
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<JsonRpcResponse> {
+    if (!this.ipcPort) {
+      return {
+        jsonrpc: "2.0",
+        id: requestId,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: `Tool "${toolName}" requires the opencode runtime but IPC is not configured. ` +
+                `This tool cannot be executed in the standalone MCP bridge.`,
+            },
+          ],
+          isError: true,
+        } satisfies MCPToolResult,
+      }
+    }
+
+    try {
+      // Check health if we haven't confirmed it yet
+      if (!this.ipcHealthy) {
+        const healthy = await this.checkHealth()
+        if (!healthy) {
+          return {
+            jsonrpc: "2.0",
+            id: requestId,
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: `Tool "${toolName}" requires the opencode runtime but the IPC server is not responding. ` +
+                    `The server may have crashed or not started yet.`,
+                },
+              ],
+              isError: true,
+            } satisfies MCPToolResult,
+          }
+        }
+        this.ipcHealthy = true
+      }
+
+      const toolTimeout = 300_000 // 5 minutes for delegated tools
+      const response = await httpPost(
+        `http://127.0.0.1:${this.ipcPort}/tool/execute`,
+        {
+          toolName,
+          toolCallId: `${requestId}`,
+          args,
+          timeout: toolTimeout,
+        },
+        toolTimeout + 10_000, // HTTP timeout is 10s longer
+      )
+
+      if (response.status === "success") {
+        return {
+          jsonrpc: "2.0",
+          id: requestId,
+          result: {
+            content: [{ type: "text", text: response.result ?? "" }],
+          } satisfies MCPToolResult,
+        }
+      } else {
+        return {
+          jsonrpc: "2.0",
+          id: requestId,
+          result: {
+            content: [{ type: "text", text: `Error: ${response.error ?? "Unknown error"}` }],
+            isError: true,
+          } satisfies MCPToolResult,
+        }
+      }
+    } catch (err) {
+      this.ipcHealthy = false // Reset health cache on failure
+      const message = err instanceof Error ? err.message : String(err)
+      log("error", `IPC delegation failed for ${toolName}:`, message)
+      return {
+        jsonrpc: "2.0",
+        id: requestId,
+        result: {
+          content: [{ type: "text", text: `IPC delegation failed: ${message}` }],
+          isError: true,
+        } satisfies MCPToolResult,
+      }
+    }
   }
 }
 
@@ -634,7 +831,7 @@ function watchToolsFile(toolsPath: string, server: MCPBridgeServer): void {
           const raw = fs.readFileSync(toolsPath, "utf-8")
           const parsed = JSON.parse(raw) as MCPToolsFile
           if (Array.isArray(parsed.tools)) {
-            server.updateTools(parsed.tools)
+            server.updateTools(parsed.tools, parsed.ipcPort)
           }
         } catch (err) {
           log("warn", `Failed to reload tools file: ${err}`)
@@ -662,7 +859,7 @@ async function main(): Promise<void> {
   const toolsFile = loadToolsFile(toolsPath)
   const effectiveCwd = toolsFile.cwd ?? cwd
 
-  const server = new MCPBridgeServer(toolsFile.tools, effectiveCwd, toolsPath)
+  const server = new MCPBridgeServer(toolsFile.tools, effectiveCwd, toolsPath, toolsFile.ipcPort)
 
   // Watch for tool file changes
   watchToolsFile(toolsPath, server)

@@ -6,6 +6,7 @@ import { mkdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { generateAgentConfig, writeAgentConfig } from "./agent-config"
 import { getDefaultTools } from "./mcp-bridge-tools"
+import { createIPCServer, type IPCServer, type ToolExecutorFn } from "./ipc-server"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -104,6 +105,8 @@ export interface ACPClientOptions {
   onExtension?: (method: string, params: Record<string, unknown>) => void
   /** Client info sent during initialize. */
   clientInfo?: { name: string; version: string; title?: string }
+  /** Tool executor for delegated tool calls from the MCP bridge. */
+  toolExecutor?: ToolExecutorFn
 }
 
 /** Options for sending a prompt. */
@@ -202,6 +205,8 @@ export class ACPClient {
   private running = false
   private stderrBuffer = ""
   private toolsFilePath: string | null = null
+  private ipcServer: IPCServer | null = null
+  private ipcPort: number | null = null
 
   constructor(options: ACPClientOptions) {
     this.options = options
@@ -214,6 +219,16 @@ export class ACPClient {
   /** Spawn kiro-cli acp and perform the initialize handshake. */
   async start(): Promise<InitializeResult> {
     if (this.running) throw new ACPConnectionError("Client is already running")
+
+    // Start IPC server if a tool executor is provided.
+    // This must happen BEFORE setupAgentConfig so we have the port number
+    // to write into the tools file.
+    if (this.options.toolExecutor) {
+      this.ipcServer = createIPCServer({
+        toolExecutor: this.options.toolExecutor,
+      })
+      this.ipcPort = await this.ipcServer.start()
+    }
 
     // Generate agent config before spawning kiro-cli so it can find the
     // .kiro/agents/<agent>.json file with MCP bridge configuration.
@@ -341,6 +356,13 @@ export class ACPClient {
     this.pending.clear()
     this.metadata.clear()
     this.promptCallbacks.clear()
+
+    // Stop IPC server
+    if (this.ipcServer) {
+      await this.ipcServer.stop()
+      this.ipcServer = null
+      this.ipcPort = null
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -473,6 +495,11 @@ export class ACPClient {
     return this.toolsFilePath
   }
 
+  /** Get the IPC server port (if running). */
+  getIpcPort(): number | null {
+    return this.ipcPort
+  }
+
   // -------------------------------------------------------------------------
   // Internal: Agent config setup
   // -------------------------------------------------------------------------
@@ -505,7 +532,11 @@ export class ACPClient {
     mkdirSync(toolsDir, { recursive: true })
     const toolsFile = join(toolsDir, `tools-${process.pid}.json`)
     this.toolsFilePath = toolsFile
-    const toolsData = { tools: getDefaultTools(), cwd: this.options.cwd }
+    const toolsData = {
+      tools: getDefaultTools(),
+      cwd: this.options.cwd,
+      ...(this.ipcPort != null ? { ipcPort: this.ipcPort } : {}),
+    }
     writeFileSync(toolsFile, JSON.stringify(toolsData, null, 2))
 
     // Generate and write the agent config

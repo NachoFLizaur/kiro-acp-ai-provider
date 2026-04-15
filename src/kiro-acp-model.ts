@@ -363,7 +363,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       }))
 
     // Write to tools file (the bridge watches this and sends list_changed)
-    const toolsData = { tools: mcpTools, cwd: this.client.getCwd() }
+    const ipcPort = this.client.getIpcPort()
+    const toolsData = {
+      tools: mcpTools,
+      cwd: this.client.getCwd(),
+      ...(ipcPort != null ? { ipcPort } : {}),
+    }
     writeFileSync(toolsFilePath, JSON.stringify(toolsData, null, 2))
   }
 
