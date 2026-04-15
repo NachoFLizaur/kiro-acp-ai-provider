@@ -256,8 +256,10 @@ describe("KiroACPLanguageModel", () => {
       if (finish.type === "finish") {
         expect(finish.finishReason.unified).toBe("stop")
         expect(finish.finishReason.raw).toBe("end_turn")
+        // Output tokens estimated from streamed text: "Hello world!" = 12 chars ≈ 3 tokens
+        expect(finish.usage.outputTokens.total).toBe(Math.round(12 / 4))
+        // No metadata → input tokens undefined
         expect(finish.usage.inputTokens.total).toBeUndefined()
-        expect(finish.usage.outputTokens.total).toBeUndefined()
       }
     })
 
@@ -348,11 +350,11 @@ describe("KiroACPLanguageModel", () => {
     test("emits tool-input-start, tool-call, tool-result for provider-executed tools", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {
-          // Model decides to call a tool
+          // Model decides to call a tool — ACP sends title, not name
           opts.onUpdate({
             sessionUpdate: "tool_call",
             toolCallId: "tc-1",
-            name: "bash",
+            title: "Running: @opencode-tools/bash",
             status: "in_progress",
             rawInput: { command: "echo hello" },
           })
@@ -361,7 +363,6 @@ describe("KiroACPLanguageModel", () => {
           opts.onUpdate({
             sessionUpdate: "tool_call_update",
             toolCallId: "tc-1",
-            name: "bash",
             status: "completed",
             output: "hello\n",
           })
@@ -433,7 +434,7 @@ describe("KiroACPLanguageModel", () => {
     test("handles tool_call_update with rawInput when initial tool_call had no rawInput", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {
-          // Tool call without rawInput initially
+          // Tool call without rawInput initially — uses name fallback
           opts.onUpdate({
             sessionUpdate: "tool_call",
             toolCallId: "tc-2",
@@ -445,7 +446,6 @@ describe("KiroACPLanguageModel", () => {
           opts.onUpdate({
             sessionUpdate: "tool_call_update",
             toolCallId: "tc-2",
-            name: "read_file",
             status: "completed",
             rawInput: { filePath: "/tmp/test.txt" },
             output: "file contents here",
@@ -579,7 +579,7 @@ describe("KiroACPLanguageModel", () => {
   })
 
   describe("doStream() — metadata", () => {
-    test("includes kiro metadata with credits and estimatedContextTokens in finish part", async () => {
+    test("includes kiro metadata with credits in finish part", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -612,13 +612,12 @@ describe("KiroACPLanguageModel", () => {
             contextUsagePercentage: 0.035,
             turnDurationMs: 2500,
             credits: 0.03,
-            estimatedContextTokens: Math.round(0.035 * 200_000),
           },
         })
       }
     })
 
-    test("sets credits and estimatedContextTokens to null when not available", async () => {
+    test("sets credits to null when not available", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -649,7 +648,6 @@ describe("KiroACPLanguageModel", () => {
             contextUsagePercentage: null,
             turnDurationMs: 3200,
             credits: null,
-            estimatedContextTokens: null,
           },
         })
       }
@@ -692,6 +690,130 @@ describe("KiroACPLanguageModel", () => {
       await collectStream(r2.stream)
       expect(model.getTotalCredits()).toBeCloseTo(0.06) // 0.02 + 0.04
     })
+
+    test("estimates tokens from streamed text and contextUsagePercentage", async () => {
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          // Stream ~400 characters of text → ~100 output tokens
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "a".repeat(200) },
+          })
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "b".repeat(200) },
+          })
+          return { stopReason: "end_turn" }
+        }),
+        getMetadata: mock(() => ({
+          sessionId: "sess-1",
+          contextUsagePercentage: 1.14,
+          turnDurationMs: 2000,
+          meteringUsage: [{ unit: "credit", unitPlural: "credits", value: 0.05 }],
+        })),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const finish = parts.find((p) => p.type === "finish")
+
+      expect(finish).toBeDefined()
+      if (finish?.type === "finish") {
+        // 400 chars / 4 = 100 output tokens
+        expect(finish.usage.outputTokens.total).toBe(100)
+        expect(finish.usage.outputTokens.text).toBe(100)
+        expect(finish.usage.outputTokens.reasoning).toBeUndefined()
+
+        // contextUsagePercentage is 0-100 scale: (1.14 / 100) * 1_000_000 = 11_400
+        // input = 11_400 - 100 = 11_300
+        expect(finish.usage.inputTokens.total).toBe(11_300)
+        expect(finish.usage.inputTokens.noCache).toBe(11_300)
+        expect(finish.usage.inputTokens.cacheRead).toBeUndefined()
+        expect(finish.usage.inputTokens.cacheWrite).toBeUndefined()
+      }
+    })
+
+    test("returns undefined input tokens when no metadata available", async () => {
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "short reply" }, // 11 chars → ~3 tokens
+          })
+          return { stopReason: "end_turn" }
+        }),
+        // No metadata at all
+        getMetadata: mock(() => undefined),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const finish = parts.find((p) => p.type === "finish")
+
+      expect(finish).toBeDefined()
+      if (finish?.type === "finish") {
+        // Output tokens still estimated from text
+        expect(finish.usage.outputTokens.total).toBe(Math.round(11 / 4))
+        // No contextUsagePercentage → input tokens undefined
+        expect(finish.usage.inputTokens.total).toBeUndefined()
+      }
+    })
+
+    test("returns undefined output tokens when no text was streamed", async () => {
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          // Tool call only, no text output
+          opts.onUpdate({
+            sessionUpdate: "tool_call",
+            toolCallId: "tc-1",
+            title: "Running: @opencode-tools/bash",
+            status: "in_progress",
+            rawInput: { command: "ls" },
+          })
+          opts.onUpdate({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "tc-1",
+            status: "completed",
+            output: "file1.ts",
+          })
+          return { stopReason: "end_turn" }
+        }),
+        getMetadata: mock(() => ({
+          sessionId: "sess-1",
+          contextUsagePercentage: 0.05,
+          turnDurationMs: 500,
+        })),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const finish = parts.find((p) => p.type === "finish")
+
+      expect(finish).toBeDefined()
+      if (finish?.type === "finish") {
+        // No text was streamed → output tokens undefined
+        expect(finish.usage.outputTokens.total).toBeUndefined()
+        expect(finish.usage.outputTokens.text).toBeUndefined()
+        // contextUsagePercentage 0-100 scale: (0.05 / 100) * 1_000_000 = 500
+        expect(finish.usage.inputTokens.total).toBe(500)
+        expect(finish.usage.inputTokens.noCache).toBe(500)
+      }
+    })
   })
 
   describe("doGenerate()", () => {
@@ -729,14 +851,13 @@ describe("KiroACPLanguageModel", () => {
           opts.onUpdate({
             sessionUpdate: "tool_call",
             toolCallId: "tc-1",
-            name: "bash",
+            title: "Running: @opencode-tools/bash",
             status: "in_progress",
             rawInput: { command: "ls" },
           })
           opts.onUpdate({
             sessionUpdate: "tool_call_update",
             toolCallId: "tc-1",
-            name: "bash",
             status: "completed",
             output: "file1.ts\nfile2.ts",
           })

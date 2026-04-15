@@ -21,13 +21,15 @@ export interface KiroACPModelConfig {
   client: ACPClient
   /** If provided, try to load this existing session instead of creating new. */
   sessionId?: string
+  /** Model's max context window in tokens (from models.dev). Default: 1_000_000. */
+  contextWindow?: number
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Create an empty usage object (ACP doesn't provide token counts). */
+/** Create an empty usage object — used as a fallback when no estimation data is available. */
 function emptyUsage(): LanguageModelV3Usage {
   return {
     inputTokens: {
@@ -39,6 +41,50 @@ function emptyUsage(): LanguageModelV3Usage {
     outputTokens: {
       total: undefined,
       text: undefined,
+      reasoning: undefined,
+    },
+  }
+}
+
+/**
+ * Estimate token usage from streamed output and context usage percentage.
+ *
+ * ACP doesn't provide token counts directly. We estimate:
+ * - Output tokens from streamed text (~1 token per 4 characters)
+ * - Total tokens from contextUsagePercentage (0-100 scale) × context window
+ * - Input tokens = total - output (includes kiro's system prompt, tools, history)
+ *
+ * The context percentage represents total context window usage including kiro's
+ * overhead (system prompt, 13+ built-in tools, agent instructions, conversation
+ * history, and the model's response). This is honest — it shows real usage.
+ *
+ * contextUsagePercentage is on a 0-100 scale (e.g., 1.14 means 1.14%).
+ */
+function estimateUsage(
+  outputCharCount: number,
+  contextPercentage: number | undefined,
+  contextWindow: number,
+): LanguageModelV3Usage {
+  const output = Math.round(outputCharCount / 4)
+
+  // contextUsagePercentage is on a 0-100 scale (e.g., 1.14 = 1.14%)
+  const total = contextPercentage != null
+    ? Math.round((contextPercentage / 100) * contextWindow)
+    : undefined
+
+  // Input = total - output (what went IN to the model)
+  const input = total != null ? Math.max(0, total - output) : undefined
+
+  return {
+    inputTokens: {
+      total: input,
+      noCache: input,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: {
+      total: output > 0 ? output : undefined,
+      text: output > 0 ? output : undefined,
       reasoning: undefined,
     },
   }
@@ -102,6 +148,29 @@ function extractPrompt(prompt: LanguageModelV3Prompt): {
     systemPrompt: systemParts.length > 0 ? systemParts.join("\n\n") : undefined,
     userMessage: lastUserMessage,
   }
+}
+
+/**
+ * Extract the tool name from an ACP session update.
+ *
+ * ACP's `tool_call` update doesn't carry a top-level `name` field.
+ * The tool name is embedded in `update.title` formatted as
+ * `"Running: @<server>/<tool>"` or `"Running: <tool>"`.
+ * We fall back to `update.name` in case future ACP versions add it.
+ */
+function extractToolName(update: SessionUpdate): string {
+  // Try update.name first (in case future ACP versions add it)
+  if (typeof update.name === "string" && update.name) return update.name
+
+  // Parse from title: "Running: @server/toolname" → "toolname"
+  const title = update.title as string | undefined
+  if (title) {
+    const afterPrefix = title.replace(/^Running:\s*/, "")
+    const slashIdx = afterPrefix.lastIndexOf("/")
+    return slashIdx >= 0 ? afterPrefix.slice(slashIdx + 1) : afterPrefix
+  }
+
+  return "unknown_tool"
 }
 
 /**
@@ -296,6 +365,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     let streamStarted = false
     let textStarted = false
     let reasoningStarted = false
+    let outputCharCount = 0
     const textId = "txt-0"
     const reasoningId = "reasoning-0"
     const toolCalls = new Map<string, { name: string; inputStarted: boolean }>()
@@ -328,6 +398,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       if (updateType === "agent_message_chunk") {
         const text = (update.content as { text?: string } | undefined)?.text
         if (text) {
+          outputCharCount += text.length
           if (!textStarted) {
             textStarted = true
             ensureStreamStarted()
@@ -353,7 +424,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       } else if (updateType === "tool_call") {
         const status = update.status as string | undefined
         const toolCallId = update.toolCallId as string
-        const toolName = update.name as string
+        const toolName = extractToolName(update)
 
         if (status === "in_progress" || status === "pending") {
           // Close reasoning if open
@@ -481,17 +552,13 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         await writePart({
           type: "finish",
           finishReason,
-          usage: emptyUsage(),
+          usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
           providerMetadata: metadata
             ? {
                 kiro: {
                   contextUsagePercentage: metadata.contextUsagePercentage ?? null,
                   turnDurationMs: metadata.turnDurationMs ?? null,
                   credits: metadata.meteringUsage?.find((m) => m.unit === "credit")?.value ?? null,
-                  estimatedContextTokens:
-                    metadata.contextUsagePercentage != null
-                      ? Math.round(metadata.contextUsagePercentage * 200_000)
-                      : null,
                 },
               }
             : undefined,

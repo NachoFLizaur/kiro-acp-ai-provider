@@ -26,6 +26,8 @@ export interface KiroACPProviderSettings {
   clientInfo?: { name: string; version: string; title?: string }
   /** Resume an existing ACP session instead of creating new. */
   sessionId?: string
+  /** Model's max context window in tokens (from models.dev). Default: 1_000_000. */
+  contextWindow?: number
 }
 
 /** The KiroACP provider interface. */
@@ -92,6 +94,7 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
     const model = new KiroACPLanguageModel(modelId, {
       client,
       sessionId: settings.sessionId,
+      contextWindow: settings.contextWindow,
     })
     lastModel = model
     return model
