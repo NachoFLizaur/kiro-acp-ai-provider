@@ -7,6 +7,8 @@ import { join, dirname } from "node:path"
 
 /** Options for generating an agent configuration file. */
 export interface AgentConfigOptions {
+  /** Agent name used by kiro-cli to identify this agent. */
+  name?: string
   /** Path to the MCP bridge script (e.g. a Node.js stdio server). */
   mcpBridgePath: string
   /** Path to the JSON file describing available tools. */
@@ -33,13 +35,18 @@ export interface AgentConfigOptions {
  * - Use a minimal custom prompt
  */
 export function generateAgentConfig(options: AgentConfigOptions): Record<string, unknown> {
-  const mcpServerName = "@opencode-tools"
+  const mcpServerName = "opencode-tools"
+  const mcpServerRef = `@${mcpServerName}`
 
   return {
+    // Agent name — required by kiro-cli to identify this agent.
+    // Without it, kiro-cli falls back to "kiro_default" with all built-in tools.
+    name: options.name ?? "opencode",
     // Only use tools from the MCP bridge — no built-in kiro tools
-    tools: [mcpServerName],
+    // The @-prefix references "all tools from this MCP server"
+    tools: [mcpServerRef],
     // Auto-approve all tool calls from the MCP bridge
-    allowedTools: [mcpServerName],
+    allowedTools: [mcpServerRef],
     // Do not include the project's .kiro/mcp.json
     includeMcpJson: false,
     // MCP server configuration

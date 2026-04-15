@@ -61,77 +61,44 @@ function mapStopReason(stopReason: string): LanguageModelV3FinishReason {
 }
 
 /**
- * Extract the system prompt and user message text from a LanguageModelV3Prompt.
+ * Extract the system prompt and the latest user message from a LanguageModelV3Prompt.
  *
  * The AI SDK prompt is an array of messages with roles. We extract:
  * - All system messages → concatenated into a single system prompt
- * - The last user message → concatenated text parts
- * - Assistant/tool messages are included for context in the composite prompt
+ * - The LAST user message → only its text parts
+ *
+ * Assistant and tool messages are intentionally skipped because kiro-cli's
+ * ACP session maintains its own conversation history. Including them would
+ * cause the model to see every previous turn twice — once from kiro's session
+ * state and once from the embedded prompt.
  */
 function extractPrompt(prompt: LanguageModelV3Prompt): {
   systemPrompt: string | undefined
   userMessage: string
 } {
   const systemParts: string[] = []
-  const conversationParts: string[] = []
+  let lastUserMessage = ""
 
   for (const message of prompt) {
-    switch (message.role) {
-      case "system":
-        systemParts.push(message.content)
-        break
-
-      case "user":
-        for (const part of message.content) {
-          if (part.type === "text") {
-            conversationParts.push(part.text)
-          }
-          // File parts are not supported via ACP text prompt — skip
+    if (message.role === "system") {
+      systemParts.push(message.content)
+    } else if (message.role === "user") {
+      // Keep overwriting — we want the LAST user message
+      const parts: string[] = []
+      for (const part of message.content) {
+        if (part.type === "text") {
+          parts.push(part.text)
         }
-        break
-
-      case "assistant":
-        for (const part of message.content) {
-          if (part.type === "text") {
-            conversationParts.push(`[assistant]: ${part.text}`)
-          } else if (part.type === "reasoning") {
-            conversationParts.push(`[assistant reasoning]: ${part.text}`)
-          } else if (part.type === "tool-call") {
-            conversationParts.push(
-              `[assistant tool-call]: ${part.toolName}(${typeof part.input === "string" ? part.input : JSON.stringify(part.input)})`,
-            )
-          }
-        }
-        break
-
-      case "tool":
-        for (const part of message.content) {
-          if (part.type === "tool-result") {
-            const output = part.output
-            let text: string
-            if (output.type === "text" || output.type === "error-text") {
-              text = output.value
-            } else if (output.type === "json" || output.type === "error-json") {
-              text = JSON.stringify(output.value)
-            } else if (output.type === "execution-denied") {
-              text = `[execution denied]${output.reason ? `: ${output.reason}` : ""}`
-            } else {
-              // content type — extract text parts
-              text = output.value
-                .filter((v): v is Extract<typeof v, { type: "text" }> => v.type === "text")
-                .map((v) => v.text)
-                .join("\n")
-            }
-            conversationParts.push(`[tool-result ${part.toolName}]: ${text}`)
-          }
-        }
-        break
+        // File parts are not supported via ACP text prompt — skip
+      }
+      lastUserMessage = parts.join("\n")
     }
+    // Skip assistant and tool messages — kiro-cli has them in its session
   }
 
   return {
     systemPrompt: systemParts.length > 0 ? systemParts.join("\n\n") : undefined,
-    userMessage: conversationParts.join("\n"),
+    userMessage: lastUserMessage,
   }
 }
 

@@ -1,5 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process"
 import { createInterface, type Interface as ReadlineInterface } from "node:readline"
+import { fileURLToPath } from "node:url"
+import { dirname, join } from "node:path"
+import { mkdirSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { generateAgentConfig, writeAgentConfig } from "./agent-config"
+import { getDefaultTools } from "./mcp-bridge-tools"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -206,6 +212,12 @@ export class ACPClient {
   async start(): Promise<InitializeResult> {
     if (this.running) throw new ACPConnectionError("Client is already running")
 
+    // Generate agent config before spawning kiro-cli so it can find the
+    // .kiro/agents/<agent>.json file with MCP bridge configuration.
+    if (this.options.agent) {
+      this.setupAgentConfig()
+    }
+
     const args = ["acp"]
     if (this.options.agent) args.push("--agent", this.options.agent)
     if (this.options.trustAllTools) args.push("--trust-all-tools")
@@ -227,18 +239,32 @@ export class ACPClient {
       }
     })
 
-    // Handle unexpected exit
+    // Handle unexpected exit.
+    // IMPORTANT: We must wait for readline to finish processing all buffered
+    // lines before rejecting pending requests. The process can write a valid
+    // response to stdout and then exit — if we reject immediately on "exit",
+    // we race against readline's async line delivery and may reject a request
+    // whose response is still in the readline buffer.
     this.process.on("exit", (code, signal) => {
       this.running = false
-      // Reject all pending requests
-      for (const [id, pending] of this.pending) {
-        pending.reject(
-          new ACPConnectionError(
-            `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}`,
-          ),
-        )
-        clearTimeout(pending.timer)
-        this.pending.delete(id)
+
+      const rejectPending = () => {
+        for (const [id, pending] of this.pending) {
+          pending.reject(
+            new ACPConnectionError(
+              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}`,
+            ),
+          )
+          clearTimeout(pending.timer)
+          this.pending.delete(id)
+        }
+      }
+
+      // If readline is active, wait for it to close (all buffered lines processed)
+      if (this.readline) {
+        this.readline.once("close", rejectPending)
+      } else {
+        rejectPending()
       }
     })
 
@@ -265,7 +291,7 @@ export class ACPClient {
     const result = await this.sendRequest(
       "initialize",
       {
-        protocolVersion: "2025-01-01",
+        protocolVersion: 1,
         clientCapabilities: {},
         clientInfo,
       },
@@ -322,6 +348,10 @@ export class ACPClient {
   async createSession(): Promise<ACPSession> {
     const result = await this.sendRequest("session/new", {
       cwd: this.options.cwd,
+      // mcpServers is required by the ACP protocol. We pass an empty array
+      // because MCP servers are configured via the agent config file
+      // (.kiro/agents/<name>.json), not per-session.
+      mcpServers: [],
     })
     return result as ACPSession
   }
@@ -331,6 +361,8 @@ export class ACPClient {
     const result = await this.sendRequest("session/load", {
       sessionId,
       cwd: this.options.cwd,
+      // mcpServers is required by the ACP protocol.
+      mcpServers: [],
     })
     return result as ACPSession
   }
@@ -426,6 +458,56 @@ export class ACPClient {
   /** Get recent stderr output for diagnostics. */
   getStderr(): string {
     return this.stderrBuffer
+  }
+
+  /** Get the working directory configured for this client. */
+  getCwd(): string {
+    return this.options.cwd
+  }
+
+  // -------------------------------------------------------------------------
+  // Internal: Agent config setup
+  // -------------------------------------------------------------------------
+
+  /**
+   * Generate and write the agent config file so kiro-cli can discover the
+   * MCP bridge server and tool definitions.
+   *
+   * Writes:
+   * 1. A tools JSON file to a temp directory
+   * 2. The agent config to `{cwd}/.kiro/agents/{agent}.json`
+   */
+  private setupAgentConfig(): void {
+    // Resolve the MCP bridge script path — it's a sibling file in the same dist/ directory.
+    // Handle both ESM (import.meta.url) and CJS (__dirname) module systems.
+    let currentDir: string
+    if (typeof import.meta?.url === "string" && import.meta.url) {
+      currentDir = dirname(fileURLToPath(import.meta.url))
+    } else if (typeof __dirname === "string") {
+      currentDir = __dirname
+    } else {
+      throw new ACPConnectionError(
+        "Cannot resolve MCP bridge path: neither import.meta.url nor __dirname available",
+      )
+    }
+    const bridgePath = join(currentDir, "mcp-bridge.js")
+
+    // Write default tools to a temp file so the MCP bridge can load them
+    const toolsDir = join(tmpdir(), "kiro-acp")
+    mkdirSync(toolsDir, { recursive: true })
+    const toolsFile = join(toolsDir, `tools-${process.pid}.json`)
+    const toolsData = { tools: getDefaultTools(), cwd: this.options.cwd }
+    writeFileSync(toolsFile, JSON.stringify(toolsData, null, 2))
+
+    // Generate and write the agent config
+    const config = generateAgentConfig({
+      name: this.options.agent,
+      mcpBridgePath: bridgePath,
+      toolsFilePath: toolsFile,
+      cwd: this.options.cwd,
+    })
+
+    writeAgentConfig(this.options.cwd, this.options.agent!, config)
   }
 
   // -------------------------------------------------------------------------

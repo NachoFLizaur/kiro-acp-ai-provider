@@ -720,7 +720,7 @@ describe("KiroACPLanguageModel", () => {
   })
 
   describe("prompt extraction", () => {
-    test("includes assistant and tool messages in composite prompt", async () => {
+    test("sends only the last user message, skipping history and assistant messages", async () => {
       let capturedPrompt: unknown[] = []
 
       const client = createMockClient({
@@ -748,9 +748,12 @@ describe("KiroACPLanguageModel", () => {
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
-      expect(textContent).toContain("first question")
-      expect(textContent).toContain("[assistant]: first answer")
-      expect(textContent).toContain("follow up")
+      // Should only contain the last user message
+      expect(textContent).toBe("follow up")
+      // Should NOT contain previous user messages or assistant messages
+      expect(textContent).not.toContain("first question")
+      expect(textContent).not.toContain("first answer")
+      expect(textContent).not.toContain("[assistant]")
     })
 
     test("concatenates multiple system messages", async () => {
@@ -781,6 +784,63 @@ describe("KiroACPLanguageModel", () => {
       expect(textContent).toContain("Rule 1: Be helpful.")
       expect(textContent).toContain("Rule 2: Be concise.")
       expect(textContent).toContain("<system_instructions>")
+    })
+
+    test("skips tool messages — kiro-cli manages tool results in its session", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "run a command" }] },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool-call",
+                toolCallId: "tc-1",
+                toolName: "bash",
+                input: JSON.stringify({ command: "echo hello" }),
+                providerExecuted: true,
+                dynamic: true,
+              },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "tc-1",
+                toolName: "bash",
+                output: { type: "text" as const, value: "hello\n" },
+              },
+            ],
+          },
+          { role: "user", content: [{ type: "text", text: "what was the output?" }] },
+        ]),
+      )
+
+      const textContent = (capturedPrompt[0] as { text: string }).text
+      // Should only contain the last user message
+      expect(textContent).toBe("what was the output?")
+      // Should NOT contain tool results or previous messages
+      expect(textContent).not.toContain("hello\n")
+      expect(textContent).not.toContain("bash")
+      expect(textContent).not.toContain("tool-result")
+      expect(textContent).not.toContain("run a command")
     })
   })
 })
