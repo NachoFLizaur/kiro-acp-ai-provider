@@ -3,13 +3,17 @@ import type {
   LanguageModelV3CallOptions,
   LanguageModelV3Content,
   LanguageModelV3FinishReason,
+  LanguageModelV3FunctionTool,
   LanguageModelV3GenerateResult,
+  LanguageModelV3ProviderTool,
   LanguageModelV3StreamPart,
   LanguageModelV3StreamResult,
   LanguageModelV3Usage,
   LanguageModelV3Prompt,
 } from "@ai-sdk/provider"
+import { writeFileSync } from "node:fs"
 import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
+import type { MCPToolDefinition } from "./mcp-bridge-tools"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -329,6 +333,41 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   // -------------------------------------------------------------------------
+  // Dynamic tool synchronization
+  // -------------------------------------------------------------------------
+
+  /**
+   * Synchronize tool definitions from the AI SDK to the MCP bridge.
+   *
+   * Converts LanguageModelV3 tool definitions to MCP format and writes them
+   * to the tools file that the MCP bridge watches. The bridge detects the
+   * change and sends `notifications/tools/list_changed` to kiro-cli, which
+   * re-queries `tools/list` to get the updated set.
+   *
+   * Only function tools are synced — provider tools are skipped since they
+   * are handled by the provider itself, not the MCP bridge.
+   */
+  private syncTools(
+    tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
+  ): void {
+    const toolsFilePath = this.client.getToolsFilePath()
+    if (!toolsFilePath) return // No tools file — agent config not set up
+
+    // Convert AI SDK function tools to MCP format
+    const mcpTools: MCPToolDefinition[] = tools
+      .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
+      .map((tool) => ({
+        name: tool.name,
+        description: tool.description ?? "",
+        inputSchema: tool.inputSchema as MCPToolDefinition["inputSchema"],
+      }))
+
+    // Write to tools file (the bridge watches this and sends list_changed)
+    const toolsData = { tools: mcpTools, cwd: this.client.getCwd() }
+    writeFileSync(toolsFilePath, JSON.stringify(toolsData, null, 2))
+  }
+
+  // -------------------------------------------------------------------------
   // LanguageModelV3 — doStream
   // -------------------------------------------------------------------------
 
@@ -351,6 +390,13 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     await this.ensureSession()
     await this.ensureModel()
+
+    // Sync dynamic tools to the MCP bridge before sending the prompt.
+    // opencode's permission system filters tools per-turn, so the set may
+    // change between calls. The bridge watches the file and notifies kiro-cli.
+    if (options.tools && options.tools.length > 0) {
+      this.syncTools(options.tools)
+    }
 
     const { systemPrompt, userMessage } = extractPrompt(options.prompt)
 

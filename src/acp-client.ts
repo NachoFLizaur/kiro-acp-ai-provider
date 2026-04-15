@@ -201,6 +201,7 @@ export class ACPClient {
   private readonly promptCallbacks = new Map<string, (update: SessionUpdate) => void>()
   private running = false
   private stderrBuffer = ""
+  private toolsFilePath: string | null = null
 
   constructor(options: ACPClientOptions) {
     this.options = options
@@ -467,6 +468,11 @@ export class ACPClient {
     return this.options.cwd
   }
 
+  /** Get the path to the tools JSON file used by the MCP bridge. */
+  getToolsFilePath(): string | null {
+    return this.toolsFilePath
+  }
+
   // -------------------------------------------------------------------------
   // Internal: Agent config setup
   // -------------------------------------------------------------------------
@@ -498,6 +504,7 @@ export class ACPClient {
     const toolsDir = join(tmpdir(), "kiro-acp")
     mkdirSync(toolsDir, { recursive: true })
     const toolsFile = join(toolsDir, `tools-${process.pid}.json`)
+    this.toolsFilePath = toolsFile
     const toolsData = { tools: getDefaultTools(), cwd: this.options.cwd }
     writeFileSync(toolsFile, JSON.stringify(toolsData, null, 2))
 

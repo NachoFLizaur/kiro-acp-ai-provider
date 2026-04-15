@@ -113,6 +113,45 @@ function loadToolsFile(toolsPath: string): MCPToolsFile {
 }
 
 // ---------------------------------------------------------------------------
+// Tool name mapping: opencode tool names → bridge executor names
+// ---------------------------------------------------------------------------
+// When opencode passes dynamic tools (e.g. "read", "edit", "write"), we need
+// to map them to the bridge's built-in executor names (e.g. "read_file",
+// "edit_file", "write_file"). Tools that have no built-in executor are
+// reported as unavailable.
+
+const TOOL_NAME_TO_EXECUTOR: Record<string, string> = {
+  // Direct matches (opencode name === executor name)
+  bash: "bash",
+  glob: "glob",
+  grep: "grep",
+  // opencode names → bridge executor names
+  read: "read_file",
+  edit: "edit_file",
+  multiedit: "edit_file",
+  write: "write_file",
+  list: "list_directory",
+  // Bridge-native names (from default tools)
+  read_file: "read_file",
+  write_file: "write_file",
+  edit_file: "edit_file",
+  list_directory: "list_directory",
+}
+
+/** Tools that are known but not executable in the MCP bridge. */
+const UNAVAILABLE_TOOLS = new Set([
+  "webfetch",
+  "websearch",
+  "web-research_multi_search",
+  "web-research_fetch_pages",
+  "task",
+  "todo",
+  "todowrite",
+  "question",
+  "skill",
+])
+
+// ---------------------------------------------------------------------------
 // Built-in tool executors
 // ---------------------------------------------------------------------------
 
@@ -359,11 +398,13 @@ const EXECUTORS: Record<string, ToolExecutor> = {
 class MCPBridgeServer {
   private tools: MCPToolDefinition[]
   private readonly cwd: string
+  private readonly toolsPath: string
   private initialized = false
 
-  constructor(tools: MCPToolDefinition[], cwd: string) {
+  constructor(tools: MCPToolDefinition[], cwd: string, toolsPath: string) {
     this.tools = tools
     this.cwd = cwd
+    this.toolsPath = toolsPath
   }
 
   /** Handle an incoming JSON-RPC message and return a response (or null for notifications). */
@@ -443,6 +484,18 @@ class MCPBridgeServer {
   }
 
   private handleToolsList(request: JsonRpcRequest): JsonRpcResponse {
+    // Always re-read from file to pick up dynamic tool changes
+    try {
+      const raw = fs.readFileSync(this.toolsPath, "utf-8")
+      const parsed = JSON.parse(raw) as MCPToolsFile
+      if (Array.isArray(parsed.tools)) {
+        this.tools = parsed.tools
+      }
+    } catch (err) {
+      log("warn", `Failed to re-read tools file on tools/list: ${err}`)
+      // Fall through — serve whatever tools we have cached
+    }
+
     return {
       jsonrpc: "2.0",
       id: request.id,
@@ -481,8 +534,27 @@ class MCPBridgeServer {
       }
     }
 
-    // Find executor
-    const executor = EXECUTORS[toolName]
+    // Find executor via name mapping
+    // First check if the tool is known-unavailable
+    if (UNAVAILABLE_TOOLS.has(toolName)) {
+      return {
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: `Tool "${toolName}" is not available in the MCP bridge. It is handled by the host agent.`,
+            },
+          ],
+          isError: true,
+        } satisfies MCPToolResult,
+      }
+    }
+
+    // Map the tool name to an executor name
+    const executorName = TOOL_NAME_TO_EXECUTOR[toolName] ?? toolName
+    const executor = EXECUTORS[executorName]
     if (!executor) {
       return {
         jsonrpc: "2.0",
@@ -590,7 +662,7 @@ async function main(): Promise<void> {
   const toolsFile = loadToolsFile(toolsPath)
   const effectiveCwd = toolsFile.cwd ?? cwd
 
-  const server = new MCPBridgeServer(toolsFile.tools, effectiveCwd)
+  const server = new MCPBridgeServer(toolsFile.tools, effectiveCwd, toolsPath)
 
   // Watch for tool file changes
   watchToolsFile(toolsPath, server)

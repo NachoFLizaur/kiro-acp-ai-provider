@@ -5,7 +5,11 @@ import type {
   LanguageModelV3CallOptions,
   LanguageModelV3StreamPart,
   LanguageModelV3Prompt,
+  LanguageModelV3FunctionTool,
 } from "@ai-sdk/provider"
+import { readFileSync, mkdirSync, existsSync } from "node:fs"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -38,6 +42,8 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     ),
     getMetadata: mock(() => undefined),
     getStderr: mock(() => ""),
+    getToolsFilePath: mock(() => null),
+    getCwd: mock(() => "/tmp/test"),
     ...overrides,
   } as unknown as ACPClient
 }
@@ -1040,6 +1046,265 @@ describe("KiroACPLanguageModel", () => {
       expect(textContent).not.toContain("bash")
       expect(textContent).not.toContain("tool-result")
       expect(textContent).not.toContain("run a command")
+    })
+  })
+
+  describe("syncTools() — dynamic tool synchronization", () => {
+    test("writes AI SDK function tools to the tools file in MCP format", async () => {
+      // Create a temp tools file
+      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      mkdirSync(toolsDir, { recursive: true })
+      const toolsFile = join(toolsDir, "tools.json")
+
+      const client = createMockClient({
+        getToolsFilePath: mock(() => toolsFile),
+        getCwd: mock(() => "/tmp/project"),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "done" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const tools: LanguageModelV3FunctionTool[] = [
+        {
+          type: "function",
+          name: "bash",
+          description: "Execute a bash command",
+          inputSchema: {
+            type: "object",
+            properties: {
+              command: { type: "string", description: "The command to run" },
+            },
+            required: ["command"],
+          },
+        },
+        {
+          type: "function",
+          name: "read",
+          description: "Read a file",
+          inputSchema: {
+            type: "object",
+            properties: {
+              filePath: { type: "string", description: "Path to the file" },
+            },
+            required: ["filePath"],
+          },
+        },
+      ]
+
+      const result = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { tools },
+        ),
+      )
+      await collectStream(result.stream)
+
+      // Verify the tools file was written
+      expect(existsSync(toolsFile)).toBe(true)
+      const written = JSON.parse(readFileSync(toolsFile, "utf-8"))
+
+      expect(written.tools).toHaveLength(2)
+      expect(written.cwd).toBe("/tmp/project")
+
+      // Verify MCP format
+      expect(written.tools[0]).toEqual({
+        name: "bash",
+        description: "Execute a bash command",
+        inputSchema: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "The command to run" },
+          },
+          required: ["command"],
+        },
+      })
+
+      expect(written.tools[1]).toEqual({
+        name: "read",
+        description: "Read a file",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Path to the file" },
+          },
+          required: ["filePath"],
+        },
+      })
+    })
+
+    test("skips provider tools and only syncs function tools", async () => {
+      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      mkdirSync(toolsDir, { recursive: true })
+      const toolsFile = join(toolsDir, "tools.json")
+
+      const client = createMockClient({
+        getToolsFilePath: mock(() => toolsFile),
+        getCwd: mock(() => "/tmp/project"),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "done" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const tools = [
+        {
+          type: "function" as const,
+          name: "bash",
+          description: "Execute a bash command",
+          inputSchema: {
+            type: "object" as const,
+            properties: {
+              command: { type: "string", description: "The command" },
+            },
+            required: ["command"],
+          },
+        },
+        {
+          type: "provider" as const,
+          id: "openai.code_interpreter" as const,
+          name: "code_interpreter",
+          args: {},
+        },
+      ]
+
+      const result = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { tools },
+        ),
+      )
+      await collectStream(result.stream)
+
+      const written = JSON.parse(readFileSync(toolsFile, "utf-8"))
+      // Only the function tool should be written
+      expect(written.tools).toHaveLength(1)
+      expect(written.tools[0].name).toBe("bash")
+    })
+
+    test("does not write tools file when no tools are provided", async () => {
+      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      mkdirSync(toolsDir, { recursive: true })
+      const toolsFile = join(toolsDir, "tools.json")
+
+      const client = createMockClient({
+        getToolsFilePath: mock(() => toolsFile),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "done" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          // No tools
+        ),
+      )
+      await collectStream(result.stream)
+
+      // Tools file should NOT have been created
+      expect(existsSync(toolsFile)).toBe(false)
+    })
+
+    test("does not write tools file when toolsFilePath is null", async () => {
+      const client = createMockClient({
+        getToolsFilePath: mock(() => null),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "done" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const tools: LanguageModelV3FunctionTool[] = [
+        {
+          type: "function",
+          name: "bash",
+          description: "Execute a bash command",
+          inputSchema: {
+            type: "object",
+            properties: {
+              command: { type: "string" },
+            },
+            required: ["command"],
+          },
+        },
+      ]
+
+      // Should not throw even though tools are provided but no file path
+      const result = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { tools },
+        ),
+      )
+      await collectStream(result.stream)
+    })
+
+    test("uses empty string for missing tool description", async () => {
+      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      mkdirSync(toolsDir, { recursive: true })
+      const toolsFile = join(toolsDir, "tools.json")
+
+      const client = createMockClient({
+        getToolsFilePath: mock(() => toolsFile),
+        getCwd: mock(() => "/tmp/project"),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "done" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const tools: LanguageModelV3FunctionTool[] = [
+        {
+          type: "function",
+          name: "glob",
+          // No description
+          inputSchema: {
+            type: "object",
+            properties: {
+              pattern: { type: "string" },
+            },
+            required: ["pattern"],
+          },
+        },
+      ]
+
+      const result = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { tools },
+        ),
+      )
+      await collectStream(result.stream)
+
+      const written = JSON.parse(readFileSync(toolsFile, "utf-8"))
+      expect(written.tools[0].description).toBe("")
     })
   })
 })
