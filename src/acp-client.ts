@@ -1,0 +1,605 @@
+import { spawn, type ChildProcess } from "node:child_process"
+import { createInterface, type Interface as ReadlineInterface } from "node:readline"
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/** Content block in a prompt or agent message. */
+export interface ContentBlock {
+  type: "text" | "image"
+  text?: string
+  /** Base64-encoded image data (when type === "image"). */
+  data?: string
+  mimeType?: string
+}
+
+/** A mode (agent) available in a session. */
+export interface Mode {
+  id: string
+  name: string
+  description?: string
+  _meta?: { welcomeMessage?: string }
+}
+
+/** A model available in a session. */
+export interface Model {
+  modelId: string
+  name: string
+  description?: string
+}
+
+/** Session state returned by session/new and session/load. */
+export interface ACPSession {
+  sessionId: string
+  modes: { currentModeId: string; availableModes: Mode[] }
+  models: { currentModelId: string; availableModels: Model[] }
+}
+
+/** Streaming update from session/update notifications. */
+export interface SessionUpdate {
+  sessionUpdate: string
+  [key: string]: unknown
+}
+
+/** Permission request from the server. */
+export interface PermissionRequest {
+  toolCall: {
+    toolCallId: string
+    name: string
+    rawInput?: Record<string, unknown>
+  }
+  options: Array<{ id: string; label: string }>
+}
+
+/** Decision returned for a permission request. */
+export interface PermissionDecision {
+  outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" }
+}
+
+/** Result of initialize handshake. */
+export interface InitializeResult {
+  agentInfo: { name: string; version: string }
+  agentCapabilities: Record<string, unknown>
+}
+
+/** Result of a command execution. */
+export interface CommandResult {
+  success: boolean
+  message: string
+  data?: Record<string, unknown>
+}
+
+/** Cached metadata for a session. */
+export interface SessionMetadata {
+  sessionId: string
+  contextUsagePercentage?: number
+  meteringUsage?: Array<{ unit: string; unitPlural: string; value: number }>
+  turnDurationMs?: number
+}
+
+/** Options for creating an ACP client. */
+export interface ACPClientOptions {
+  /** Working directory for kiro-cli. */
+  cwd: string
+  /** Custom agent name passed via --agent flag (e.g. "opencode"). */
+  agent?: string
+  /** Pass --trust-all-tools to kiro-cli. */
+  trustAllTools?: boolean
+  /** Extra environment variables for the subprocess. */
+  env?: Record<string, string>
+  /** Custom permission handler. Default: auto-approve with "allow_always". */
+  onPermission?: (request: PermissionRequest) => PermissionDecision
+  /** Called for every session/update notification. */
+  onUpdate?: (sessionId: string, update: SessionUpdate) => void
+  /** Called for every extension notification. */
+  onExtension?: (method: string, params: Record<string, unknown>) => void
+  /** Client info sent during initialize. */
+  clientInfo?: { name: string; version: string; title?: string }
+}
+
+/** Options for sending a prompt. */
+export interface PromptOptions {
+  sessionId: string
+  prompt: ContentBlock[]
+  /** Called for each session/update notification scoped to this session. */
+  onUpdate: (update: SessionUpdate) => void
+  /** Abort signal — triggers session/cancel on abort. */
+  signal?: AbortSignal
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC types (internal)
+// ---------------------------------------------------------------------------
+
+interface JsonRpcRequest {
+  jsonrpc: "2.0"
+  id: number
+  method: string
+  params?: unknown
+}
+
+interface JsonRpcNotification {
+  jsonrpc: "2.0"
+  method: string
+  params?: unknown
+}
+
+interface JsonRpcResponse {
+  jsonrpc: "2.0"
+  id: number
+  result?: unknown
+  error?: { code: number; message: string; data?: unknown }
+}
+
+/** A server-initiated request (has both id and method). */
+interface JsonRpcServerRequest {
+  jsonrpc: "2.0"
+  id: number
+  method: string
+  params?: unknown
+}
+
+type JsonRpcMessage = JsonRpcResponse | JsonRpcNotification | JsonRpcServerRequest
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export class ACPError extends Error {
+  readonly name = "ACPError" as const
+  constructor(
+    message: string,
+    readonly code?: number,
+    readonly data?: unknown,
+  ) {
+    super(message)
+  }
+}
+
+export class ACPConnectionError extends Error {
+  readonly name = "ACPConnectionError" as const
+  constructor(message: string) {
+    super(message)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pending request tracker
+// ---------------------------------------------------------------------------
+
+interface PendingRequest {
+  resolve: (value: unknown) => void
+  reject: (error: Error) => void
+  method: string
+  timer: ReturnType<typeof setTimeout>
+}
+
+// ---------------------------------------------------------------------------
+// ACPClient
+// ---------------------------------------------------------------------------
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 300_000 // 5 minutes (prompts can be long)
+const INITIALIZE_TIMEOUT_MS = 30_000
+const STOP_TIMEOUT_MS = 10_000
+
+export class ACPClient {
+  private readonly options: ACPClientOptions
+  private process: ChildProcess | null = null
+  private readline: ReadlineInterface | null = null
+  private nextId = 0
+  private readonly pending = new Map<number, PendingRequest>()
+  private readonly metadata = new Map<string, SessionMetadata>()
+  private readonly promptCallbacks = new Map<string, (update: SessionUpdate) => void>()
+  private running = false
+  private stderrBuffer = ""
+
+  constructor(options: ACPClientOptions) {
+    this.options = options
+  }
+
+  // -------------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------------
+
+  /** Spawn kiro-cli acp and perform the initialize handshake. */
+  async start(): Promise<InitializeResult> {
+    if (this.running) throw new ACPConnectionError("Client is already running")
+
+    const args = ["acp"]
+    if (this.options.agent) args.push("--agent", this.options.agent)
+    if (this.options.trustAllTools) args.push("--trust-all-tools")
+
+    this.process = spawn("kiro-cli", args, {
+      cwd: this.options.cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, ...this.options.env },
+    })
+
+    this.running = true
+
+    // Capture stderr for diagnostics
+    this.process.stderr?.on("data", (chunk: Buffer) => {
+      this.stderrBuffer += chunk.toString()
+      // Keep only last 4KB
+      if (this.stderrBuffer.length > 4096) {
+        this.stderrBuffer = this.stderrBuffer.slice(-4096)
+      }
+    })
+
+    // Handle unexpected exit
+    this.process.on("exit", (code, signal) => {
+      this.running = false
+      // Reject all pending requests
+      for (const [id, pending] of this.pending) {
+        pending.reject(
+          new ACPConnectionError(
+            `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}`,
+          ),
+        )
+        clearTimeout(pending.timer)
+        this.pending.delete(id)
+      }
+    })
+
+    this.process.on("error", (err) => {
+      this.running = false
+      for (const [id, pending] of this.pending) {
+        pending.reject(new ACPConnectionError(`Process error: ${err.message}`))
+        clearTimeout(pending.timer)
+        this.pending.delete(id)
+      }
+    })
+
+    // Set up line-by-line reading from stdout
+    this.readline = createInterface({ input: this.process.stdout! })
+    this.readline.on("line", (line) => this.handleLine(line))
+
+    // Perform initialize handshake
+    const clientInfo = this.options.clientInfo ?? {
+      name: "kiro-acp-ai-provider",
+      version: "0.1.0",
+      title: "Kiro ACP AI Provider",
+    }
+
+    const result = await this.sendRequest(
+      "initialize",
+      {
+        protocolVersion: "2025-01-01",
+        clientCapabilities: {},
+        clientInfo,
+      },
+      INITIALIZE_TIMEOUT_MS,
+    )
+
+    return result as InitializeResult
+  }
+
+  /** Gracefully stop the kiro-cli process. */
+  async stop(): Promise<void> {
+    if (!this.running || !this.process) return
+
+    this.running = false
+
+    // Close stdin to signal EOF
+    this.process.stdin?.end()
+
+    // Wait for process to exit, with timeout.
+    // The "exit" handler from start() will fire and reject pending requests,
+    // so we just need to wait for the process to terminate.
+    const proc = this.process
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        proc.kill("SIGTERM")
+        resolve()
+      }, STOP_TIMEOUT_MS)
+
+      proc.once("exit", () => {
+        clearTimeout(timer)
+        resolve()
+      })
+    })
+
+    this.readline?.close()
+    this.readline = null
+    this.process = null
+
+    // Clean up any remaining pending requests (in case exit handler didn't fire)
+    for (const [id, pending] of this.pending) {
+      pending.reject(new ACPConnectionError("Client stopped"))
+      clearTimeout(pending.timer)
+    }
+    this.pending.clear()
+    this.metadata.clear()
+    this.promptCallbacks.clear()
+  }
+
+  // -------------------------------------------------------------------------
+  // Session management
+  // -------------------------------------------------------------------------
+
+  /** Create a new session. */
+  async createSession(): Promise<ACPSession> {
+    const result = await this.sendRequest("session/new", {
+      cwd: this.options.cwd,
+    })
+    return result as ACPSession
+  }
+
+  /** Load an existing session by ID. */
+  async loadSession(sessionId: string): Promise<ACPSession> {
+    const result = await this.sendRequest("session/load", {
+      sessionId,
+      cwd: this.options.cwd,
+    })
+    return result as ACPSession
+  }
+
+  // -------------------------------------------------------------------------
+  // Prompting
+  // -------------------------------------------------------------------------
+
+  /** Send a prompt and stream updates. Resolves when the turn completes. */
+  async prompt(options: PromptOptions): Promise<{ stopReason: string }> {
+    const { sessionId, prompt, onUpdate, signal } = options
+
+    // Register the per-prompt callback
+    this.promptCallbacks.set(sessionId, onUpdate)
+
+    // Handle abort signal
+    let abortHandler: (() => void) | undefined
+    if (signal) {
+      abortHandler = () => {
+        this.sendNotification("session/cancel", { sessionId })
+      }
+      if (signal.aborted) {
+        this.promptCallbacks.delete(sessionId)
+        throw new ACPError("Prompt aborted before sending", -1)
+      }
+      signal.addEventListener("abort", abortHandler, { once: true })
+    }
+
+    try {
+      const result = await this.sendRequest(
+        "session/prompt",
+        { sessionId, prompt },
+        DEFAULT_REQUEST_TIMEOUT_MS,
+      )
+      return result as { stopReason: string }
+    } finally {
+      this.promptCallbacks.delete(sessionId)
+      if (signal && abortHandler) {
+        signal.removeEventListener("abort", abortHandler)
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Model & mode switching
+  // -------------------------------------------------------------------------
+
+  /** Switch the model for a session via kiro.dev/commands/execute. */
+  async setModel(sessionId: string, modelId: string): Promise<void> {
+    await this.executeCommand(sessionId, "model", { value: modelId })
+  }
+
+  /** Switch the agent mode for a session. */
+  async setMode(sessionId: string, modeId: string): Promise<void> {
+    await this.sendRequest("session/set_mode", { sessionId, modeId })
+  }
+
+  // -------------------------------------------------------------------------
+  // Commands
+  // -------------------------------------------------------------------------
+
+  /** Execute a kiro slash command. */
+  async executeCommand(
+    sessionId: string,
+    command: string,
+    args: Record<string, unknown> = {},
+  ): Promise<CommandResult> {
+    const result = await this.sendRequest("_kiro.dev/commands/execute", {
+      sessionId,
+      command: { command, args },
+    })
+    return result as CommandResult
+  }
+
+  // -------------------------------------------------------------------------
+  // Metadata
+  // -------------------------------------------------------------------------
+
+  /** Get cached metadata for a session (populated by _kiro.dev/metadata notifications). */
+  getMetadata(sessionId: string): SessionMetadata | undefined {
+    return this.metadata.get(sessionId)
+  }
+
+  // -------------------------------------------------------------------------
+  // Health
+  // -------------------------------------------------------------------------
+
+  /** Check if the kiro-cli process is running. */
+  isRunning(): boolean {
+    return this.running
+  }
+
+  /** Get recent stderr output for diagnostics. */
+  getStderr(): string {
+    return this.stderrBuffer
+  }
+
+  // -------------------------------------------------------------------------
+  // Internal: JSON-RPC transport
+  // -------------------------------------------------------------------------
+
+  private sendRequest(
+    method: string,
+    params: unknown,
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+  ): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      if (!this.running || !this.process?.stdin?.writable) {
+        reject(new ACPConnectionError("Client is not running"))
+        return
+      }
+
+      const id = this.nextId++
+      const request: JsonRpcRequest = { jsonrpc: "2.0", id, method, params }
+
+      const timer = setTimeout(() => {
+        this.pending.delete(id)
+        reject(new ACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1))
+      }, timeoutMs)
+
+      this.pending.set(id, { resolve, reject, method, timer })
+
+      const line = JSON.stringify(request) + "\n"
+      this.process!.stdin!.write(line)
+    })
+  }
+
+  private sendNotification(method: string, params: unknown): void {
+    if (!this.running || !this.process?.stdin?.writable) return
+
+    const notification: JsonRpcNotification = { jsonrpc: "2.0", method, params }
+    const line = JSON.stringify(notification) + "\n"
+    this.process!.stdin!.write(line)
+  }
+
+  private sendResponse(id: number, result: unknown): void {
+    if (!this.running || !this.process?.stdin?.writable) return
+
+    const response = { jsonrpc: "2.0", id, result }
+    const line = JSON.stringify(response) + "\n"
+    this.process!.stdin!.write(line)
+  }
+
+  // -------------------------------------------------------------------------
+  // Internal: message dispatch
+  // -------------------------------------------------------------------------
+
+  private handleLine(line: string): void {
+    const trimmed = line.trim()
+    if (!trimmed) return
+
+    let msg: JsonRpcMessage
+    try {
+      msg = JSON.parse(trimmed) as JsonRpcMessage
+    } catch {
+      // Non-JSON output from kiro-cli (e.g. log lines) — ignore
+      return
+    }
+
+    // Classify the message:
+    // 1. Response: has "id" and no "method" → resolve pending request
+    // 2. Server request: has "id" AND "method" → handle (e.g. permission)
+    // 3. Notification: has "method" but no "id" → dispatch
+
+    const hasId = "id" in msg && msg.id !== undefined
+    const hasMethod = "method" in msg && typeof (msg as { method?: unknown }).method === "string"
+
+    if (hasId && !hasMethod) {
+      this.handleResponse(msg as JsonRpcResponse)
+    } else if (hasId && hasMethod) {
+      this.handleServerRequest(msg as JsonRpcServerRequest)
+    } else if (hasMethod) {
+      this.handleNotification(msg as JsonRpcNotification)
+    }
+  }
+
+  private handleResponse(msg: JsonRpcResponse): void {
+    const pending = this.pending.get(msg.id)
+    if (!pending) return
+
+    clearTimeout(pending.timer)
+    this.pending.delete(msg.id)
+
+    if (msg.error) {
+      pending.reject(new ACPError(msg.error.message, msg.error.code, msg.error.data))
+    } else {
+      pending.resolve(msg.result)
+    }
+  }
+
+  private handleServerRequest(msg: JsonRpcServerRequest): void {
+    switch (msg.method) {
+      case "session/request_permission":
+        this.handlePermissionRequest(msg.id, msg.params as PermissionRequest)
+        break
+      default:
+        // Unknown server request — respond with method not found
+        this.sendResponse(msg.id, null)
+        break
+    }
+  }
+
+  private handlePermissionRequest(id: number, request: PermissionRequest): void {
+    if (this.options.onPermission) {
+      const decision = this.options.onPermission(request)
+      this.sendResponse(id, decision)
+    } else {
+      // Default: auto-approve with "allow_always" if available, else "allow_once"
+      const alwaysOption = request.options.find((o) => o.id === "allow_always")
+      const onceOption = request.options.find((o) => o.id === "allow_once")
+      const optionId = alwaysOption?.id ?? onceOption?.id ?? request.options[0]?.id ?? "allow_once"
+
+      this.sendResponse(id, {
+        outcome: { outcome: "selected", optionId },
+      })
+    }
+  }
+
+  private handleNotification(msg: JsonRpcNotification): void {
+    const params = (msg.params ?? {}) as Record<string, unknown>
+
+    switch (msg.method) {
+      case "session/update":
+        this.handleSessionUpdate(params)
+        break
+
+      case "_kiro.dev/metadata":
+        this.handleMetadata(params)
+        break
+
+      case "_kiro.dev/session/update":
+        // Kiro-specific session updates (e.g. tool_call_chunk)
+        this.handleSessionUpdate(params)
+        break
+
+      default:
+        // Forward all extension notifications to the optional handler
+        this.options.onExtension?.(msg.method, params)
+        break
+    }
+  }
+
+  private handleSessionUpdate(params: Record<string, unknown>): void {
+    const sessionId = params.sessionId as string | undefined
+    const update = params.update as SessionUpdate | undefined
+
+    if (!update) return
+
+    // Deliver to per-prompt callback if registered
+    if (sessionId) {
+      const callback = this.promptCallbacks.get(sessionId)
+      callback?.(update)
+    }
+
+    // Deliver to global onUpdate handler
+    if (sessionId) {
+      this.options.onUpdate?.(sessionId, update)
+    }
+  }
+
+  private handleMetadata(params: Record<string, unknown>): void {
+    const sessionId = params.sessionId as string | undefined
+    if (!sessionId) return
+
+    this.metadata.set(sessionId, {
+      sessionId,
+      contextUsagePercentage: params.contextUsagePercentage as number | undefined,
+      meteringUsage: params.meteringUsage as SessionMetadata["meteringUsage"],
+      turnDurationMs: params.turnDurationMs as number | undefined,
+    })
+  }
+}

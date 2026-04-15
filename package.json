@@ -1,0 +1,43 @@
+{
+  "name": "kiro-acp-ai-provider",
+  "version": "0.1.0",
+  "description": "Kiro ACP (AWS) provider for Vercel AI SDK — ToS-compliant via kiro-cli",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run build"
+  },
+  "peerDependencies": {
+    "@ai-sdk/provider": ">=3.0.0"
+  },
+  "devDependencies": {
+    "@ai-sdk/provider": "^3.0.0",
+    "bun-types": "latest",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0"
+  },
+  "keywords": ["kiro", "acp", "ai-sdk", "vercel", "language-model", "aws", "agent-client-protocol"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NachoFLizaur/kiro-acp-ai-provider"
+  },
+  "author": "NachoFLizaur"
+}
