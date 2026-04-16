@@ -163,7 +163,7 @@ function mapStopReason(stopReason: string): LanguageModelV3FinishReason {
     case "tool_use":
       return { unified: "tool-calls", raw: stopReason }
     case "cancelled":
-      return { unified: "stop", raw: stopReason }
+      return { unified: "error", raw: "cancelled" }
     case "content_filter":
       return { unified: "content-filter", raw: stopReason }
     default:
@@ -857,6 +857,28 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           await writePart({ type: "text-end", id: textId })
         }
 
+        // Handle cancellation: emit error instead of finish so the consumer
+        // can distinguish user-initiated cancels from normal completions.
+        if (result.stopReason === "cancelled") {
+          await writePart({ type: "error", error: new Error("Request was cancelled by user") })
+
+          // Clean up abort listener to prevent leaks
+          if (options.abortSignal && userAbortHandler) {
+            options.abortSignal.removeEventListener("abort", userAbortHandler)
+          }
+
+          this.pendingTurns.delete(sessionId)
+          laneRouter?.unregister(sessionId)
+          this.releaseSession(sessionId)
+          streamClosed = true
+          try {
+            await writer.close()
+          } catch {
+            // Already closed
+          }
+          return
+        }
+
         // Emit metadata
         const metadata = this.client.getMetadata(sessionId)
         const turnCredits =
@@ -1110,6 +1132,28 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
         if (reasoningStarted) await writePart({ type: "reasoning-end", id: reasoningId })
         if (textStarted) await writePart({ type: "text-end", id: textId })
+
+        // Handle cancellation: emit error instead of finish so the consumer
+        // can distinguish user-initiated cancels from normal completions.
+        if (result.stopReason === "cancelled") {
+          await writePart({ type: "error", error: new Error("Request was cancelled by user") })
+
+          // Clean up abort listener to prevent leaks
+          if (options.abortSignal && userAbortHandler) {
+            options.abortSignal.removeEventListener("abort", userAbortHandler)
+          }
+
+          this.pendingTurns.delete(sessionId)
+          laneRouter?.unregister(sessionId)
+          this.releaseSession(sessionId)
+          streamClosed = true
+          try {
+            await writer.close()
+          } catch {
+            // Already closed
+          }
+          return
+        }
 
         const metadata = this.client.getMetadata(sessionId)
         const turnCredits =
