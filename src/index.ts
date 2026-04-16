@@ -58,3 +58,8 @@ export {
   LaneRouter,
   type PendingCorrelation,
 } from "./lane-router"
+
+// Utilities
+export { verifyAuth, type AuthStatus } from "./kiro-auth"
+export { listModels, type ListModelsOptions } from "./kiro-models"
+export { getQuota, type QuotaInfo, type GetQuotaOptions } from "./kiro-quota"

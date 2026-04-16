@@ -478,6 +478,11 @@ export class ACPClient {
     return this.metadata.get(sessionId)
   }
 
+  /** Get cached metadata for all sessions. */
+  getAllMetadata(): SessionMetadata[] {
+    return [...this.metadata.values()]
+  }
+
   // -------------------------------------------------------------------------
   // Health
   // -------------------------------------------------------------------------
