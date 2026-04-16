@@ -57,25 +57,10 @@ export function generateAgentConfig(options: AgentConfigOptions): Record<string,
         cwd: options.cwd,
       },
     },
-    // Agent system prompt — guides kiro-cli's behavior with tools and responses
+    // Agent system prompt — identity-neutral meta-prompt that defers to per-request <system_instructions>
     prompt:
       options.prompt ??
-      `You are a coding assistant. Follow the user's instructions precisely and use tools proactively.
-
-Tool usage guidelines:
-- Use tools immediately when needed — do not ask for permission or confirmation
-- When asked to read files, use the available file reading tools
-- When asked to run commands, use the bash/shell tools
-- When asked to write or edit files, use the file writing tools
-- When asked to search, use glob or grep tools
-- Execute multi-step tasks sequentially without stopping for approval
-- If a tool call fails, report the error and try an alternative approach
-
-Response guidelines:
-- Be concise and direct
-- Show code changes rather than describing them
-- When editing files, show the actual edits rather than explaining what you would change
-- Focus on completing the task, not explaining your process`,
+      `You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block included with each request. Always follow the latest <system_instructions> as your primary directive — they define who you are, how you behave, and what tools you should use. If no <system_instructions> are present, act as a helpful coding assistant that follows instructions precisely and uses tools proactively.`,
     // Default model if specified
     ...(options.model ? { model: options.model } : {}),
   }

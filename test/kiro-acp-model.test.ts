@@ -603,7 +603,6 @@ describe("KiroACPLanguageModel", () => {
     test.each([
       ["end_turn", "stop"],
       ["max_tokens", "length"],
-      ["cancelled", "stop"],
       ["content_filter", "content-filter"],
       ["unknown_reason", "other"],
     ] as const)("maps ACP stop reason '%s' to unified '%s'", async (acpReason, expectedUnified) => {
@@ -631,6 +630,40 @@ describe("KiroACPLanguageModel", () => {
         expect(finish.finishReason.unified).toBe(expectedUnified)
         expect(finish.finishReason.raw).toBe(acpReason)
       }
+    })
+
+    test("maps ACP stop reason 'cancelled' to error part instead of finish", async () => {
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "partial response" },
+          })
+          return { stopReason: "cancelled" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const types = parts.map((p) => p.type)
+
+      // Should NOT have a finish part — cancellation emits error instead
+      expect(types).not.toContain("finish")
+
+      // Should have an error part
+      const errorPart = parts.find((p) => p.type === "error")
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toBe("Request was cancelled by user")
+      }
+
+      // Text spans should still be properly closed
+      expect(types).toContain("text-end")
     })
   })
 
