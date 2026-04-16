@@ -486,6 +486,11 @@ export class ACPClient {
     return this.options.cwd
   }
 
+  /** Get the custom agent name (e.g. "opencode") if configured. */
+  getAgentName(): string | undefined {
+    return this.options.agent
+  }
+
   /** Get the path to the tools JSON file used by the MCP bridge. */
   getToolsFilePath(): string | null {
     return this.toolsFilePath

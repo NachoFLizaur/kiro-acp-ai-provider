@@ -312,6 +312,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     if (this.sessions.length === 0 && this.config.sessionId) {
       try {
         const loaded = await this.client.loadSession(this.config.sessionId)
+        await this.ensureSessionMode(loaded)
         this.sessions.push(loaded)
         this.busySessions.add(loaded.sessionId)
         if (this.currentModelId === null) {
@@ -324,6 +325,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     }
 
     const session = await this.client.createSession()
+    await this.ensureSessionMode(session)
     this.sessions.push(session)
     this.busySessions.add(session.sessionId)
     if (this.currentModelId === null) {
@@ -337,6 +339,25 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private releaseSession(sessionId: string): void {
     this.busySessions.delete(sessionId)
+  }
+
+  /**
+   * Ensure a session is in the correct agent mode.
+   *
+   * When kiro-cli creates a new session via `session/new`, only the first
+   * session inherits the `--agent` flag's mode. Subsequent sessions default
+   * to `kiro_default`, which uses kiro's built-in tools instead of our MCP
+   * bridge tools. This method explicitly sets the mode after session creation
+   * or loading to guarantee every session uses the correct agent mode.
+   */
+  private async ensureSessionMode(session: ACPSession): Promise<void> {
+    const agentName = this.client.getAgentName()
+    if (!agentName) return
+
+    if (session.modes.currentModeId !== agentName) {
+      await this.client.setMode(session.sessionId, agentName)
+      session.modes.currentModeId = agentName
+    }
   }
 
   /**
