@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process"
 import { createInterface, type Interface as ReadlineInterface } from "node:readline"
+import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
@@ -497,14 +498,20 @@ export class ACPClient {
    * spawns the MCP bridge and queries `tools/list`, the full tool set is
    * already on disk.
    *
-   * The path is stable across calls: `{tmpdir}/kiro-acp/tools-{pid}.json`.
+   * The path is stable across restarts for the same project directory:
+   * `{tmpdir}/kiro-acp/tools-{cwdHash}.json`. This avoids the stale-path
+   * problem that occurred when using `process.pid` — on restart, the PID
+   * changes but the agent config still referenced the old file. Using a
+   * hash of `cwd` ensures the same project always maps to the same file,
+   * while different projects running simultaneously get separate files.
    */
   getOrCreateToolsFilePath(): string {
     if (this.toolsFilePath) return this.toolsFilePath
 
     const toolsDir = join(tmpdir(), "kiro-acp")
     mkdirSync(toolsDir, { recursive: true })
-    this.toolsFilePath = join(toolsDir, `tools-${process.pid}.json`)
+    const cwdHash = createHash("md5").update(this.options.cwd).digest("hex").slice(0, 8)
+    this.toolsFilePath = join(toolsDir, `tools-${cwdHash}.json`)
     return this.toolsFilePath
   }
 
