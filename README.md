@@ -22,7 +22,7 @@ When the model needs to use tools (file reads, shell commands, etc.), those call
 | **Transport** | Direct HTTP to AWS APIs | `kiro-cli` subprocess (ACP over stdio) |
 | **ToS compliance** | ⚠️ Potential concerns — bypasses official client | ✅ Uses the official CLI |
 | **Authentication** | Manual credential management | Handled by `kiro-cli auth login` |
-| **Tool execution** | You implement tool handlers | MCP bridge — tools run inside kiro-cli's sandbox |
+| **Tool execution** | You implement tool handlers | MCP bridge + IPC — tools delegated back to your harness |
 | **System prompt** | Full control | Kiro's base context is always present; yours is injected via `<system_instructions>` tags |
 | **Token counts** | Available from API | Not exposed by ACP |
 | **Provider options** | Per-turn temperature, thinking, etc. | Not supported (kiro-cli controls these) |
@@ -91,6 +91,9 @@ const kiro = createKiroAcp({
   // Auto-approve all tool calls (default: false)
   trustAllTools: true,
 
+  // Custom system prompt for the agent config
+  agentPrompt: "You are a helpful coding assistant.",
+
   // Custom permission handler for tool call approvals
   onPermission: (request) => ({
     outcome: { outcome: "selected", optionId: "allow_once" },
@@ -101,6 +104,12 @@ const kiro = createKiroAcp({
 
   // Client info sent during the ACP initialize handshake
   clientInfo: { name: "my-app", version: "1.0.0" },
+
+  // Resume an existing session
+  sessionId: "previous-session-id",
+
+  // Model's max context window in tokens (default: 1_000_000)
+  contextWindow: 200_000,
 })
 ```
 
@@ -120,6 +129,9 @@ const model = kiro.languageModel("claude-sonnet-4.6")
 | `kiro.languageModel(modelId)` | Same as above |
 | `kiro.shutdown()` | Gracefully stop the `kiro-cli` process |
 | `kiro.getClient()` | Get the underlying `ACPClient` for advanced usage |
+| `kiro.getSessionId()` | Get the current ACP session ID for persistence |
+| `kiro.injectContext(summary)` | Inject context summary for session rehydration |
+| `kiro.getTotalCredits()` | Get total credits consumed across all turns |
 
 ### `KiroACPProviderSettings`
 
@@ -129,9 +141,12 @@ interface KiroACPProviderSettings {
   model?: string
   agent?: string
   trustAllTools?: boolean
+  agentPrompt?: string
   onPermission?: (request: PermissionRequest) => PermissionDecision
   env?: Record<string, string>
   clientInfo?: { name: string; version: string; title?: string }
+  sessionId?: string
+  contextWindow?: number
 }
 ```
 
@@ -173,10 +188,12 @@ await client.stop()
 
 Kiro-cli uses MCP (Model Context Protocol) servers to provide tools to the model. This provider includes an **MCP bridge server** that:
 
-1. Reads tool definitions from a JSON file
+1. Reads tool definitions from a JSON file (written by the provider)
 2. Serves them to kiro-cli via the MCP protocol (stdio JSON-RPC)
-3. Executes tool calls using built-in executors (bash, file I/O, glob, grep)
+3. Delegates tool calls back to your application via an IPC HTTP server
 4. Returns results back to the model
+
+The bridge does NOT execute tools locally — it acts as a relay between kiro-cli and your application's tool execution pipeline.
 
 ### Built-in tools
 
@@ -220,15 +237,15 @@ const toolsFile: MCPToolsFile = {
 
 ### Tool calls in the stream
 
-When the model calls a tool, the provider emits these stream parts:
+When the model calls a tool, the provider emits standard AI SDK tool-call stream parts:
 
-1. `tool-input-start` — tool call begins (with `providerExecuted: true`)
+1. `tool-input-start` — tool call begins
 2. `tool-input-delta` — the tool's input JSON
 3. `tool-input-end` — input complete
-4. `tool-call` — full tool call with input (with `providerExecuted: true`)
-5. `tool-result` — the tool's output (executed by kiro-cli, not your app)
+4. `tool-call` — full tool call with input
+5. `finish` with `finishReason: "tool-calls"`
 
-The `providerExecuted: true` flag tells the AI SDK that the tool was already executed server-side — your application doesn't need to handle it.
+The harness (your application) is responsible for executing the tool and calling `doStream()` again with the tool result. This follows the standard AI SDK tool execution contract — no special handling is needed.
 
 ## Available models
 
@@ -265,9 +282,9 @@ const configPath = writeAgentConfig(process.cwd(), "my-agent", config)
 - **Token overhead**: ~680 tokens baseline from kiro's system context (negligible on 200K context window)
 - **System prompt**: Kiro's base context is always present — your system prompt is injected inside `<system_instructions>` tags
 - **No per-turn provider options**: Temperature, thinking toggle, and other model parameters are controlled by kiro-cli, not configurable per-request
-- **No token counts**: ACP doesn't expose input/output token usage
-- **Session not persisted**: Sessions live within the `kiro-cli` process — they don't survive process restarts
-- **Single process**: One `kiro-cli` process per provider instance — concurrent requests share the same session
+- **Estimated token counts**: ACP doesn't expose exact input/output token usage — the provider estimates from streamed text and context usage percentage
+- **Session persistence**: Sessions can be persisted via `getSessionId()` / `sessionId` option, but depend on kiro-cli's session storage
+- **Single process**: One `kiro-cli` process per provider instance — concurrent sessions are pooled automatically
 
 ## License
 

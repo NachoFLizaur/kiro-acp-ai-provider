@@ -307,7 +307,7 @@ export class ACPClient {
     // Perform initialize handshake
     const clientInfo = this.options.clientInfo ?? {
       name: "kiro-acp-ai-provider",
-      version: "0.1.0",
+      version: "1.0.0",
       title: "Kiro ACP AI Provider",
     }
 
