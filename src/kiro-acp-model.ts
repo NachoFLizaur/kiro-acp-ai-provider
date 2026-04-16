@@ -197,6 +197,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private currentModelId: string | null = null
   private initPromise: Promise<void> | null = null
   private totalCredits = 0
+  /** Tracks the last set of tool names written, for change detection. */
+  private lastToolNames = ""
 
   /**
    * State for an ongoing kiro-cli prompt that is paused waiting for tool results.
@@ -260,6 +262,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   /**
    * Acquire a free ACP session from the pool, or create a new one.
    *
+   * When tools are provided, they are written to the tools file BEFORE
+   * starting the client. This ensures kiro-cli's MCP bridge sees the full
+   * tool set on its first `tools/list` query, avoiding the race condition
+   * where the system prompt is built with only default tools.
+   *
    * When a `doStream()` call arrives while the current session is busy
    * (e.g. parent waiting for a tool result while a subagent fires a
    * nested prompt), a new session is created automatically. This avoids
@@ -269,7 +276,23 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * attempt to load it via `session/load`. If that fails we fall through
    * to creating a fresh session.
    */
-  private async acquireSession(): Promise<ACPSession> {
+  private async acquireSession(
+    tools?: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
+  ): Promise<ACPSession> {
+    // Write tools BEFORE starting the client so the MCP bridge has them
+    // from the very first `tools/list` query.
+    if (tools && tools.length > 0) {
+      const toolsChanged = this.writeToolsFile(tools)
+
+      if (this.client.isRunning() && toolsChanged) {
+        // Mid-session tool change — the client is already running, so kiro
+        // needs time to process the tools/list_changed notification from the
+        // MCP bridge file watcher (100ms debounce) and re-query tools/list.
+        await new Promise(resolve => setTimeout(resolve, 300))
+      }
+      // If client not running yet, no delay needed — kiro will read on startup
+    }
+
     await this.ensureClient()
 
     // Find a session that isn't currently in a prompt
@@ -357,7 +380,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   // -------------------------------------------------------------------------
 
   /**
-   * Synchronize tool definitions from the AI SDK to the MCP bridge.
+   * Write tool definitions from the AI SDK to the MCP bridge tools file.
    *
    * Converts LanguageModelV3 tool definitions to MCP format and writes them
    * to the tools file that the MCP bridge watches. The bridge detects the
@@ -366,12 +389,15 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    *
    * Only function tools are synced — provider tools are skipped since they
    * are handled by the provider itself, not the MCP bridge.
+   *
+   * @returns `true` if the tools file was actually written (tools changed),
+   *          `false` if the tools are the same as last time (no write needed).
    */
-  private syncTools(
+  private writeToolsFile(
     tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
-  ): void {
-    const toolsFilePath = this.client.getToolsFilePath()
-    if (!toolsFilePath) return // No tools file — agent config not set up
+  ): boolean {
+    // Use getOrCreateToolsFilePath so the path exists even before start()
+    const toolsFilePath = this.client.getOrCreateToolsFilePath()
 
     // Convert AI SDK function tools to MCP format
     const mcpTools: MCPToolDefinition[] = tools
@@ -382,6 +408,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         inputSchema: tool.inputSchema as MCPToolDefinition["inputSchema"],
       }))
 
+    // Check if tools actually changed
+    const newToolNames = mcpTools.map(t => t.name).sort().join(",")
+    if (newToolNames === this.lastToolNames) return false
+    this.lastToolNames = newToolNames
+
     // Write to tools file (the bridge watches this and sends list_changed)
     const ipcPort = this.client.getIpcPort()
     const toolsData = {
@@ -390,6 +421,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       ...(ipcPort != null ? { ipcPort } : {}),
     }
     writeFileSync(toolsFilePath, JSON.stringify(toolsData, null, 2))
+    return true
   }
 
   // -------------------------------------------------------------------------
@@ -462,13 +494,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private async startFreshPrompt(
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3StreamResult> {
-    const session = await this.acquireSession()
+    // Pass tools to acquireSession so they're written BEFORE kiro-cli starts.
+    // This ensures the MCP bridge sees the full tool set on its first query.
+    const session = await this.acquireSession(options.tools)
     await this.ensureModel(session)
-
-    // Sync dynamic tools to the MCP bridge before sending the prompt.
-    if (options.tools && options.tools.length > 0) {
-      this.syncTools(options.tools)
-    }
 
     const { systemPrompt, userMessage } = extractPrompt(options.prompt)
 

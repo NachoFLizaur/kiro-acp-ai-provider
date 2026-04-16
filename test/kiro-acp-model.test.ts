@@ -1016,14 +1016,14 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
-  describe("syncTools() — dynamic tool synchronization", () => {
+  describe("writeToolsFile() — dynamic tool synchronization", () => {
     test("writes AI SDK function tools to the tools file in MCP format", async () => {
       const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
       mkdirSync(toolsDir, { recursive: true })
       const toolsFile = join(toolsDir, "tools.json")
 
       const client = createMockClient({
-        getToolsFilePath: mock(() => toolsFile),
+        getOrCreateToolsFilePath: mock(() => toolsFile),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -1108,7 +1108,7 @@ describe("KiroACPLanguageModel", () => {
       const toolsFile = join(toolsDir, "tools.json")
 
       const client = createMockClient({
-        getToolsFilePath: mock(() => toolsFile),
+        getOrCreateToolsFilePath: mock(() => toolsFile),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -1161,7 +1161,7 @@ describe("KiroACPLanguageModel", () => {
       const toolsFile = join(toolsDir, "tools.json")
 
       const client = createMockClient({
-        getToolsFilePath: mock(() => toolsFile),
+        getOrCreateToolsFilePath: mock(() => toolsFile),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
             sessionUpdate: "agent_message_chunk",
@@ -1183,9 +1183,14 @@ describe("KiroACPLanguageModel", () => {
       expect(existsSync(toolsFile)).toBe(false)
     })
 
-    test("does not write tools file when toolsFilePath is null", async () => {
+    test("writes tools file even before client is started (lazy start)", async () => {
+      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      mkdirSync(toolsDir, { recursive: true })
+      const toolsFile = join(toolsDir, "tools.json")
+
       const client = createMockClient({
-        getToolsFilePath: mock(() => null),
+        getOrCreateToolsFilePath: mock(() => toolsFile),
+        getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
             sessionUpdate: "agent_message_chunk",
@@ -1219,6 +1224,12 @@ describe("KiroACPLanguageModel", () => {
         ),
       )
       await collectStream(result.stream)
+
+      // Tools should be written even though client wasn't running before doStream
+      expect(existsSync(toolsFile)).toBe(true)
+      const written = JSON.parse(readFileSync(toolsFile, "utf-8"))
+      expect(written.tools).toHaveLength(1)
+      expect(written.tools[0].name).toBe("bash")
     })
 
     test("uses empty string for missing tool description", async () => {
@@ -1227,7 +1238,7 @@ describe("KiroACPLanguageModel", () => {
       const toolsFile = join(toolsDir, "tools.json")
 
       const client = createMockClient({
-        getToolsFilePath: mock(() => toolsFile),
+        getOrCreateToolsFilePath: mock(() => toolsFile),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -1264,6 +1275,71 @@ describe("KiroACPLanguageModel", () => {
 
       const written = JSON.parse(readFileSync(toolsFile, "utf-8"))
       expect(written.tools[0].description).toBe("")
+    })
+
+    test("skips writing when tools have not changed (change detection)", async () => {
+      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      mkdirSync(toolsDir, { recursive: true })
+      const toolsFile = join(toolsDir, "tools.json")
+
+      let writeCount = 0
+      const originalGetOrCreate = mock(() => toolsFile)
+
+      const client = createMockClient({
+        getOrCreateToolsFilePath: originalGetOrCreate,
+        getCwd: mock(() => "/tmp/project"),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "done" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const tools: LanguageModelV3FunctionTool[] = [
+        {
+          type: "function",
+          name: "bash",
+          description: "Execute a bash command",
+          inputSchema: {
+            type: "object",
+            properties: {
+              command: { type: "string", description: "The command" },
+            },
+            required: ["command"],
+          },
+        },
+      ]
+
+      // First call — should write
+      const r1 = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { tools },
+        ),
+      )
+      await collectStream(r1.stream)
+      expect(existsSync(toolsFile)).toBe(true)
+      const mtime1 = Bun.file(toolsFile).lastModified
+
+      // Small delay to ensure mtime would differ if file were rewritten
+      await new Promise(r => setTimeout(r, 50))
+
+      // Second call with same tools — should NOT rewrite
+      const r2 = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello again" }] }],
+          { tools },
+        ),
+      )
+      await collectStream(r2.stream)
+      const mtime2 = Bun.file(toolsFile).lastModified
+
+      // File should not have been rewritten (same mtime)
+      expect(mtime2).toBe(mtime1)
     })
   })
 

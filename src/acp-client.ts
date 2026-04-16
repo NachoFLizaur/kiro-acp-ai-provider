@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { createInterface, type Interface as ReadlineInterface } from "node:readline"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
-import { mkdirSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { generateAgentConfig, writeAgentConfig } from "./agent-config"
 import { getDefaultTools } from "./mcp-bridge-tools"
@@ -489,6 +489,25 @@ export class ACPClient {
     return this.toolsFilePath
   }
 
+  /**
+   * Get or create the tools file path deterministically.
+   *
+   * This allows the adapter to write tool definitions BEFORE `start()` is
+   * called (and before `setupAgentConfig()` runs), so that when kiro-cli
+   * spawns the MCP bridge and queries `tools/list`, the full tool set is
+   * already on disk.
+   *
+   * The path is stable across calls: `{tmpdir}/kiro-acp/tools-{pid}.json`.
+   */
+  getOrCreateToolsFilePath(): string {
+    if (this.toolsFilePath) return this.toolsFilePath
+
+    const toolsDir = join(tmpdir(), "kiro-acp")
+    mkdirSync(toolsDir, { recursive: true })
+    this.toolsFilePath = join(toolsDir, `tools-${process.pid}.json`)
+    return this.toolsFilePath
+  }
+
   /** Get the IPC server port (if running). */
   getIpcPort(): number | null {
     return this.ipcPort
@@ -534,17 +553,28 @@ export class ACPClient {
     }
     const bridgePath = join(currentDir, "mcp-bridge.js")
 
-    // Write default tools to a temp file so the MCP bridge can load them
-    const toolsDir = join(tmpdir(), "kiro-acp")
-    mkdirSync(toolsDir, { recursive: true })
-    const toolsFile = join(toolsDir, `tools-${process.pid}.json`)
-    this.toolsFilePath = toolsFile
-    const toolsData = {
-      tools: getDefaultTools(),
-      cwd: this.options.cwd,
-      ...(this.ipcPort != null ? { ipcPort: this.ipcPort } : {}),
+    // Get or create the tools file path. If the adapter already wrote tools
+    // (via writeToolsFile before start), this reuses that path and we skip
+    // overwriting with defaults. Otherwise, write default tools so the MCP
+    // bridge has something to serve on first `tools/list` query.
+    const toolsFile = this.getOrCreateToolsFilePath()
+    try {
+      // Check if the file already exists (adapter wrote tools before start)
+      const existing = readFileSync(toolsFile, "utf-8")
+      const parsed = JSON.parse(existing) as { tools?: unknown[] }
+      if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) {
+        throw new Error("empty or invalid tools file")
+      }
+      // File exists with tools — don't overwrite with defaults
+    } catch {
+      // File doesn't exist or is invalid — write defaults
+      const toolsData = {
+        tools: getDefaultTools(),
+        cwd: this.options.cwd,
+        ...(this.ipcPort != null ? { ipcPort: this.ipcPort } : {}),
+      }
+      writeFileSync(toolsFile, JSON.stringify(toolsData, null, 2))
     }
-    writeFileSync(toolsFile, JSON.stringify(toolsData, null, 2))
 
     // Generate and write the agent config
     const config = generateAgentConfig({
