@@ -3,7 +3,7 @@ import { createInterface, type Interface as ReadlineInterface } from "node:readl
 import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { generateAgentConfig, writeAgentConfig } from "./agent-config"
 import { getDefaultTools } from "./mcp-bridge-tools"
@@ -558,7 +558,14 @@ export class ACPClient {
         "Cannot resolve MCP bridge path: neither import.meta.url nor __dirname available",
       )
     }
-    const bridgePath = join(currentDir, "mcp-bridge.js")
+
+    // Resolve the bridge path, handling Bun's virtual filesystem.
+    // When this package is compiled into a Bun binary (bun build --compile),
+    // import.meta.url resolves to a virtual path like /$bunfs/root/... which
+    // doesn't exist on the real filesystem. The Bun process can read from these
+    // virtual paths, but the spawned `node` process (kiro-cli) cannot.
+    // In that case, we copy the bridge script to a real temp directory.
+    const bridgePath = this.resolveBridgePath(currentDir)
 
     // Get or create the tools file path. If the adapter already wrote tools
     // (via writeToolsFile before start), this reuses that path and we skip
@@ -600,6 +607,42 @@ export class ACPClient {
     })
 
     writeAgentConfig(this.options.cwd, this.options.agent!, config)
+  }
+
+  /**
+   * Resolve the MCP bridge script to a real filesystem path.
+   *
+   * When running inside a Bun-compiled binary, `import.meta.url` points to a
+   * virtual path (e.g. `/$bunfs/root/...`) that only the Bun process can read.
+   * Since kiro-cli spawns the bridge with `node`, we need the script at a real
+   * path. This method detects virtual paths and copies the bridge script to a
+   * temp directory.
+   */
+  private resolveBridgePath(currentDir: string): string {
+    const candidate = join(currentDir, "mcp-bridge.js")
+    const isVirtualPath = candidate.includes("$bunfs")
+
+    // If the file exists on the real filesystem and isn't a virtual path, use it directly.
+    if (!isVirtualPath && existsSync(candidate)) {
+      return candidate
+    }
+
+    // Virtual path or file not found on real filesystem — copy to temp.
+    // Bun can read from its virtual filesystem, so readFileSync works here
+    // even though `node` wouldn't be able to access the path.
+    const tmpBridge = join(tmpdir(), "kiro-acp", "mcp-bridge.js")
+    mkdirSync(dirname(tmpBridge), { recursive: true })
+
+    try {
+      const content = readFileSync(candidate, "utf-8")
+      writeFileSync(tmpBridge, content, "utf-8")
+      return tmpBridge
+    } catch (err) {
+      throw new ACPConnectionError(
+        `Could not resolve mcp-bridge.js: source path "${candidate}" is not readable. ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
   }
 
   // -------------------------------------------------------------------------
