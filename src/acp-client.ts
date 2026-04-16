@@ -684,10 +684,13 @@ export class ACPClient {
    * Searches multiple locations to find the bridge script on the real
    * filesystem. This handles:
    * - Development with `file:` symlinks (bridge is next to this module)
-   * - Normal npm/bun installs (bridge is in node_modules)
+   * - Normal npm/bun installs (bridge is in cwd/node_modules)
    * - Bun-compiled binaries where import.meta.url points to a virtual
    *   `/$bunfs/root/...` path that can't be read via readFileSync
    * - Bun's `.bun` cache directory structure
+   * - Running from a project directory that doesn't have this package
+   *   installed (walks up parent directories to find node_modules)
+   * - Running from a compiled binary (searches relative to process.argv[0])
    */
   private resolveBridgePath(): string {
     // Strategy 1: Direct path next to this module (works in dev with file: symlink)
@@ -704,7 +707,7 @@ export class ACPClient {
       // import.meta.url not available (CJS) — fall through to node_modules search
     }
 
-    // Strategy 2: Search node_modules for the real package
+    // Strategy 2: Search node_modules in cwd for the real package
     const nmBase = join(this.options.cwd, "node_modules")
 
     // Check direct node_modules
@@ -734,7 +737,82 @@ export class ACPClient {
       }
     }
 
-    // Strategy 3: Check temp dir (from a previous run)
+    // Strategy 3: Walk up from cwd looking for node_modules with our package.
+    // When cwd is a user project (e.g. ~/my-app) that doesn't have this package
+    // installed, the bridge won't be in cwd/node_modules. But the tool that
+    // spawned us (e.g. opencode) has it in its own node_modules somewhere up
+    // the directory tree.
+    let searchDir = this.options.cwd
+    for (let i = 0; i < 10; i++) {
+      const candidate = join(searchDir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
+      if (existsSync(candidate)) return candidate
+
+      // Also check bun's .bun cache in each ancestor
+      const ancestorBunDir = join(searchDir, "node_modules", ".bun")
+      if (existsSync(ancestorBunDir)) {
+        try {
+          for (const entry of readdirSync(ancestorBunDir)) {
+            if (entry.includes("kiro-acp-ai-provider")) {
+              const cached = join(
+                ancestorBunDir,
+                entry,
+                "node_modules",
+                "kiro-acp-ai-provider",
+                "dist",
+                "mcp-bridge.js",
+              )
+              if (existsSync(cached)) return cached
+            }
+          }
+        } catch {
+          // Ignore errors reading .bun cache
+        }
+      }
+
+      const parent = dirname(searchDir)
+      if (parent === searchDir) break // reached filesystem root
+      searchDir = parent
+    }
+
+    // Strategy 4: Search relative to the binary/executable path.
+    // When running as a compiled binary (e.g. opencode at
+    // opencode/packages/opencode/dist/bin/opencode), the package's node_modules
+    // may be several directories up from the binary location.
+    const binDir = dirname(process.argv[0] || "")
+    if (binDir) {
+      let dir = binDir
+      for (let i = 0; i < 10; i++) {
+        const candidate = join(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
+        if (existsSync(candidate)) return candidate
+
+        const binBunDir = join(dir, "node_modules", ".bun")
+        if (existsSync(binBunDir)) {
+          try {
+            for (const entry of readdirSync(binBunDir)) {
+              if (entry.includes("kiro-acp-ai-provider")) {
+                const cached = join(
+                  binBunDir,
+                  entry,
+                  "node_modules",
+                  "kiro-acp-ai-provider",
+                  "dist",
+                  "mcp-bridge.js",
+                )
+                if (existsSync(cached)) return cached
+              }
+            }
+          } catch {
+            // Ignore errors reading .bun cache
+          }
+        }
+
+        const parent = dirname(dir)
+        if (parent === dir) break // reached filesystem root
+        dir = parent
+      }
+    }
+
+    // Strategy 5: Check temp dir (from a previous run)
     const tmpPath = join(tmpdir(), "kiro-acp", "mcp-bridge.js")
     if (existsSync(tmpPath)) return tmpPath
 
