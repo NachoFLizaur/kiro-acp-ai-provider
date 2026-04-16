@@ -561,11 +561,18 @@ export class ACPClient {
     try {
       // Check if the file already exists (adapter wrote tools before start)
       const existing = readFileSync(toolsFile, "utf-8")
-      const parsed = JSON.parse(existing) as { tools?: unknown[] }
+      const parsed = JSON.parse(existing) as { tools?: unknown[]; ipcPort?: number }
       if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) {
         throw new Error("empty or invalid tools file")
       }
-      // File exists with tools — don't overwrite with defaults
+      // File exists with tools — don't overwrite with defaults.
+      // But DO ensure ipcPort is present. The adapter may have written tools
+      // before start() was called (when ipcPort was still null). Now that the
+      // IPC server is running, inject the port so the MCP bridge can delegate.
+      if (this.ipcPort != null && parsed.ipcPort !== this.ipcPort) {
+        parsed.ipcPort = this.ipcPort
+        writeFileSync(toolsFile, JSON.stringify(parsed, null, 2))
+      }
     } catch {
       // File doesn't exist or is invalid — write defaults
       const toolsData = {
