@@ -763,7 +763,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     // If the prompt completes without any tool calls (pure text response)
     promptPromise
       .then(async (result) => {
-        if (streamClosed) return // Already closed by tool call handler
+        if (streamClosed) return
 
         // Cancel any pending debounce timer
         if (debounceTimer) {
