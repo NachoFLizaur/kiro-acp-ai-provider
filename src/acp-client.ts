@@ -3,7 +3,7 @@ import { createInterface, type Interface as ReadlineInterface } from "node:readl
 import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { generateAgentConfig, writeAgentConfig } from "./agent-config"
 import { getDefaultTools } from "./mcp-bridge-tools"
@@ -546,26 +546,13 @@ export class ACPClient {
    * 2. The agent config to `{cwd}/.kiro/agents/{agent}.json`
    */
   private setupAgentConfig(): void {
-    // Resolve the MCP bridge script path — it's a sibling file in the same dist/ directory.
-    // Handle both ESM (import.meta.url) and CJS (__dirname) module systems.
-    let currentDir: string
-    if (typeof import.meta?.url === "string" && import.meta.url) {
-      currentDir = dirname(fileURLToPath(import.meta.url))
-    } else if (typeof __dirname === "string") {
-      currentDir = __dirname
-    } else {
-      throw new ACPConnectionError(
-        "Cannot resolve MCP bridge path: neither import.meta.url nor __dirname available",
-      )
-    }
-
-    // Resolve the bridge path, handling Bun's virtual filesystem.
+    // Resolve the bridge path on the real filesystem.
     // When this package is compiled into a Bun binary (bun build --compile),
     // import.meta.url resolves to a virtual path like /$bunfs/root/... which
-    // doesn't exist on the real filesystem. The Bun process can read from these
-    // virtual paths, but the spawned `node` process (kiro-cli) cannot.
-    // In that case, we copy the bridge script to a real temp directory.
-    const bridgePath = this.resolveBridgePath(currentDir)
+    // doesn't exist on the real filesystem and can't be read via readFileSync.
+    // Instead of trying to copy from the virtual path, we search for the real
+    // file in node_modules.
+    const bridgePath = this.resolveBridgePath()
 
     // Get or create the tools file path. If the adapter already wrote tools
     // (via writeToolsFile before start), this reuses that path and we skip
@@ -612,37 +599,66 @@ export class ACPClient {
   /**
    * Resolve the MCP bridge script to a real filesystem path.
    *
-   * When running inside a Bun-compiled binary, `import.meta.url` points to a
-   * virtual path (e.g. `/$bunfs/root/...`) that only the Bun process can read.
-   * Since kiro-cli spawns the bridge with `node`, we need the script at a real
-   * path. This method detects virtual paths and copies the bridge script to a
-   * temp directory.
+   * Searches multiple locations to find the bridge script on the real
+   * filesystem. This handles:
+   * - Development with `file:` symlinks (bridge is next to this module)
+   * - Normal npm/bun installs (bridge is in node_modules)
+   * - Bun-compiled binaries where import.meta.url points to a virtual
+   *   `/$bunfs/root/...` path that can't be read via readFileSync
+   * - Bun's `.bun` cache directory structure
    */
-  private resolveBridgePath(currentDir: string): string {
-    const candidate = join(currentDir, "mcp-bridge.js")
-    const isVirtualPath = candidate.includes("$bunfs")
-
-    // If the file exists on the real filesystem and isn't a virtual path, use it directly.
-    if (!isVirtualPath && existsSync(candidate)) {
-      return candidate
-    }
-
-    // Virtual path or file not found on real filesystem — copy to temp.
-    // Bun can read from its virtual filesystem, so readFileSync works here
-    // even though `node` wouldn't be able to access the path.
-    const tmpBridge = join(tmpdir(), "kiro-acp", "mcp-bridge.js")
-    mkdirSync(dirname(tmpBridge), { recursive: true })
-
+  private resolveBridgePath(): string {
+    // Strategy 1: Direct path next to this module (works in dev with file: symlink)
+    // Wrapped in try-catch because import.meta.url may be empty/undefined in CJS builds.
     try {
-      const content = readFileSync(candidate, "utf-8")
-      writeFileSync(tmpBridge, content, "utf-8")
-      return tmpBridge
-    } catch (err) {
-      throw new ACPConnectionError(
-        `Could not resolve mcp-bridge.js: source path "${candidate}" is not readable. ` +
-          `${err instanceof Error ? err.message : String(err)}`,
-      )
+      if (typeof import.meta?.url === "string" && import.meta.url) {
+        const currentDir = dirname(fileURLToPath(import.meta.url))
+        const directPath = join(currentDir, "mcp-bridge.js")
+        if (!directPath.includes("$bunfs") && existsSync(directPath)) {
+          return directPath
+        }
+      }
+    } catch {
+      // import.meta.url not available (CJS) — fall through to node_modules search
     }
+
+    // Strategy 2: Search node_modules for the real package
+    const nmBase = join(this.options.cwd, "node_modules")
+
+    // Check direct node_modules
+    const directNm = join(nmBase, "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
+    if (existsSync(directNm)) return directNm
+
+    // Check bun's .bun cache directory
+    const bunDir = join(nmBase, ".bun")
+    if (existsSync(bunDir)) {
+      try {
+        const entries = readdirSync(bunDir)
+        for (const entry of entries) {
+          if (entry.includes("kiro-acp-ai-provider")) {
+            const cached = join(
+              bunDir,
+              entry,
+              "node_modules",
+              "kiro-acp-ai-provider",
+              "dist",
+              "mcp-bridge.js",
+            )
+            if (existsSync(cached)) return cached
+          }
+        }
+      } catch {
+        // Ignore errors reading .bun cache
+      }
+    }
+
+    // Strategy 3: Check temp dir (from a previous run)
+    const tmpPath = join(tmpdir(), "kiro-acp", "mcp-bridge.js")
+    if (existsSync(tmpPath)) return tmpPath
+
+    throw new ACPConnectionError(
+      "Could not find mcp-bridge.js. Ensure kiro-acp-ai-provider is installed.",
+    )
   }
 
   // -------------------------------------------------------------------------
