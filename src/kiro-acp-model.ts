@@ -357,6 +357,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     if (session.modes.currentModeId !== agentName) {
       await this.client.setMode(session.sessionId, agentName)
       session.modes.currentModeId = agentName
+      // Wait for kiro-cli to process the mode switch and update tools
+      await new Promise(resolve => setTimeout(resolve, 500))
     }
   }
 
