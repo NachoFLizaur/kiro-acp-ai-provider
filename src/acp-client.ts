@@ -6,7 +6,6 @@ import { dirname, join } from "node:path"
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { generateAgentConfig, writeAgentConfig } from "./agent-config"
-import { getDefaultTools } from "./mcp-bridge-tools"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 
@@ -642,9 +641,15 @@ export class ACPClient {
     const bridgePath = this.resolveBridgePath()
 
     // Get or create the tools file path. If the adapter already wrote tools
-    // (via writeToolsFile before start), this reuses that path and we skip
-    // overwriting with defaults. Otherwise, write default tools so the MCP
-    // bridge has something to serve on first `tools/list` query.
+    // (via writeToolsFile before start), this reuses that path and we only
+    // inject the IPC port. Otherwise, write an empty tools array as a
+    // placeholder — the real tools will be written by writeToolsFile() in
+    // doStream() BEFORE the first prompt is sent to kiro.
+    //
+    // We intentionally do NOT seed default tools here. Seeding defaults
+    // (e.g. list_directory, read_file) caused stale tool definitions to
+    // persist in the tools file and get merged into the harness's real
+    // tools, making the model try to call tools the harness doesn't support.
     const toolsFile = this.getOrCreateToolsFilePath()
     try {
       // Check if the file already exists (adapter wrote tools before start)
@@ -653,7 +658,7 @@ export class ACPClient {
       if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) {
         throw new Error("empty or invalid tools file")
       }
-      // File exists with tools — don't overwrite with defaults.
+      // File exists with tools — don't overwrite.
       // But DO ensure ipcPort is present. The adapter may have written tools
       // before start() was called (when ipcPort was still null). Now that the
       // IPC server is running, inject the port so the MCP bridge can delegate.
@@ -662,9 +667,9 @@ export class ACPClient {
         writeFileSync(toolsFile, JSON.stringify(parsed, null, 2))
       }
     } catch {
-      // File doesn't exist or is invalid — write defaults
+      // File doesn't exist or is invalid — write empty placeholder
       const toolsData = {
-        tools: getDefaultTools(),
+        tools: [],
         cwd: this.options.cwd,
         ...(this.ipcPort != null ? { ipcPort: this.ipcPort } : {}),
       }

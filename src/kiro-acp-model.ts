@@ -11,7 +11,7 @@ import type {
   LanguageModelV3Usage,
   LanguageModelV3Prompt,
 } from "@ai-sdk/provider"
-import { readFileSync, writeFileSync } from "node:fs"
+import { writeFileSync } from "node:fs"
 import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { PendingToolCall } from "./ipc-server"
@@ -456,16 +456,20 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   /**
    * Write tool definitions from the AI SDK to the MCP bridge tools file.
    *
-   * Converts LanguageModelV3 tool definitions to MCP format and **merges**
-   * them with any existing tools in the file. This is critical for multi-
-   * session correctness: when a child session writes its subset of tools
-   * (e.g. `[bash]`), the main session's tools (e.g. `[task, read, ...]`)
-   * must not be evicted. The file always contains the UNION of all active
-   * sessions' tools.
+   * Converts LanguageModelV3 tool definitions to MCP format and **replaces**
+   * the entire tools file contents. Each `doStream()` call writes its
+   * session's complete tool set.
    *
-   * Tool removal only happens on a clean restart (file recreated from
-   * scratch). During a session, tools are never removed — the harness
-   * enforces per-agent permissions at execution time.
+   * This replacement approach is correct because:
+   * - Writes happen BEFORE prompts are sent to kiro-cli
+   * - Only one session is actively prompting at a time per bridge
+   *   (parent pauses while child runs, then parent resumes and re-writes)
+   * - The flow is: parent writes [task, bash, read] → child writes [bash]
+   *   → child finishes → parent writes [task, bash, read] → parent continues
+   *
+   * The previous merge/superset approach caused stale default tools
+   * (e.g. list_directory, read_file) to persist across runs, making the
+   * model try to call tools the harness doesn't support.
    *
    * Only function tools are synced — provider tools are skipped since they
    * are handled by the provider itself, not the MCP bridge.
@@ -488,30 +492,15 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         inputSchema: tool.inputSchema as MCPToolDefinition["inputSchema"],
       }))
 
-    // Read existing tools from the file and merge (superset / union)
-    let existingTools: MCPToolDefinition[] = []
-    try {
-      const existing = JSON.parse(readFileSync(toolsFilePath, "utf-8")) as MCPToolsFile
-      existingTools = existing.tools ?? []
-    } catch {
-      // File doesn't exist yet or is invalid — start fresh
-    }
-
-    // Merge: keep all existing tools, new tools override existing definitions
-    const toolMap = new Map<string, MCPToolDefinition>()
-    for (const tool of existingTools) toolMap.set(tool.name, tool)
-    for (const tool of newTools) toolMap.set(tool.name, tool)
-    const mergedTools = Array.from(toolMap.values())
-
-    // Check if the merged set actually changed from what we last wrote
-    const mergedNames = mergedTools.map(t => t.name).sort().join(",")
-    if (mergedNames === this.lastToolNames) return false
-    this.lastToolNames = mergedNames
+    // Check if the tool set actually changed from what we last wrote
+    const newNames = newTools.map(t => t.name).sort().join(",")
+    if (newNames === this.lastToolNames) return false
+    this.lastToolNames = newNames
 
     // Write to tools file (the bridge watches this and sends list_changed)
     const ipcPort = this.client.getIpcPort()
     const toolsData: MCPToolsFile = {
-      tools: mergedTools,
+      tools: newTools,
       cwd: this.client.getCwd(),
       ...(ipcPort != null ? { ipcPort } : {}),
     }
