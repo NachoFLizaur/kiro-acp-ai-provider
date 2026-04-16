@@ -11,9 +11,9 @@ import type {
   LanguageModelV3Usage,
   LanguageModelV3Prompt,
 } from "@ai-sdk/provider"
-import { writeFileSync } from "node:fs"
+import { readFileSync, writeFileSync } from "node:fs"
 import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
-import type { MCPToolDefinition } from "./mcp-bridge-tools"
+import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 
@@ -416,10 +416,16 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   /**
    * Write tool definitions from the AI SDK to the MCP bridge tools file.
    *
-   * Converts LanguageModelV3 tool definitions to MCP format and writes them
-   * to the tools file that the MCP bridge watches. The bridge detects the
-   * change and sends `notifications/tools/list_changed` to kiro-cli, which
-   * re-queries `tools/list` to get the updated set.
+   * Converts LanguageModelV3 tool definitions to MCP format and **merges**
+   * them with any existing tools in the file. This is critical for multi-
+   * session correctness: when a child session writes its subset of tools
+   * (e.g. `[bash]`), the main session's tools (e.g. `[task, read, ...]`)
+   * must not be evicted. The file always contains the UNION of all active
+   * sessions' tools.
+   *
+   * Tool removal only happens on a clean restart (file recreated from
+   * scratch). During a session, tools are never removed — the harness
+   * enforces per-agent permissions at execution time.
    *
    * Only function tools are synced — provider tools are skipped since they
    * are handled by the provider itself, not the MCP bridge.
@@ -433,8 +439,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     // Use getOrCreateToolsFilePath so the path exists even before start()
     const toolsFilePath = this.client.getOrCreateToolsFilePath()
 
-    // Convert AI SDK function tools to MCP format
-    const mcpTools: MCPToolDefinition[] = tools
+    // Convert current session's AI SDK function tools to MCP format
+    const newTools: MCPToolDefinition[] = tools
       .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
       .map((tool) => ({
         name: tool.name,
@@ -442,15 +448,30 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         inputSchema: tool.inputSchema as MCPToolDefinition["inputSchema"],
       }))
 
-    // Check if tools actually changed
-    const newToolNames = mcpTools.map(t => t.name).sort().join(",")
-    if (newToolNames === this.lastToolNames) return false
-    this.lastToolNames = newToolNames
+    // Read existing tools from the file and merge (superset / union)
+    let existingTools: MCPToolDefinition[] = []
+    try {
+      const existing = JSON.parse(readFileSync(toolsFilePath, "utf-8")) as MCPToolsFile
+      existingTools = existing.tools ?? []
+    } catch {
+      // File doesn't exist yet or is invalid — start fresh
+    }
+
+    // Merge: keep all existing tools, new tools override existing definitions
+    const toolMap = new Map<string, MCPToolDefinition>()
+    for (const tool of existingTools) toolMap.set(tool.name, tool)
+    for (const tool of newTools) toolMap.set(tool.name, tool)
+    const mergedTools = Array.from(toolMap.values())
+
+    // Check if the merged set actually changed from what we last wrote
+    const mergedNames = mergedTools.map(t => t.name).sort().join(",")
+    if (mergedNames === this.lastToolNames) return false
+    this.lastToolNames = mergedNames
 
     // Write to tools file (the bridge watches this and sends list_changed)
     const ipcPort = this.client.getIpcPort()
-    const toolsData = {
-      tools: mcpTools,
+    const toolsData: MCPToolsFile = {
+      tools: mergedTools,
       cwd: this.client.getCwd(),
       ...(ipcPort != null ? { ipcPort } : {}),
     }
