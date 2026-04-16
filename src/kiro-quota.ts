@@ -21,7 +21,7 @@ export interface GetQuotaOptions {
  *
  * Note: ACP doesn't expose full subscription details (plan type, monthly limits).
  * This returns per-session credit usage from _kiro.dev/metadata.
- * For full subscription info, use the kiro-ai-provider package's getQuota().
+ * Full subscription details (plan type, monthly limits) are not available via ACP.
  */
 export async function getQuota(options?: GetQuotaOptions): Promise<QuotaInfo> {
   const client = options?.client
