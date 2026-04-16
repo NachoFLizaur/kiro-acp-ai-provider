@@ -48,7 +48,12 @@ export {
   type IPCServer,
   type IPCServerOptions,
   type PendingToolCall,
-  type ToolCallHandler,
   type ToolResultRequest,
   type ToolExecuteResponse,
 } from "./ipc-server"
+
+// Lane Router
+export {
+  LaneRouter,
+  type PendingCorrelation,
+} from "./lane-router"

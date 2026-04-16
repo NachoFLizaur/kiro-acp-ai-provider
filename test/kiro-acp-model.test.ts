@@ -1,7 +1,8 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test"
 import { KiroACPLanguageModel, type KiroACPModelConfig } from "../src/kiro-acp-model"
 import type { ACPClient, ACPSession, SessionUpdate, PromptOptions } from "../src/acp-client"
-import type { IPCServer, PendingToolCall, ToolCallHandler, ToolResultRequest } from "../src/ipc-server"
+import type { IPCServer, PendingToolCall, ToolResultRequest } from "../src/ipc-server"
+import { LaneRouter } from "../src/lane-router"
 import type {
   LanguageModelV3CallOptions,
   LanguageModelV3StreamPart,
@@ -23,8 +24,7 @@ function createMockIPCServer(overrides: Partial<IPCServer> = {}): IPCServer {
     stop: mock(() => Promise.resolve()),
     getPort: mock(() => null),
     getPendingCount: mock(() => 0),
-    setToolCallHandler: mock(() => {}),
-    clearToolCallHandler: mock(() => {}),
+    getLaneRouter: mock(() => new LaneRouter()),
     resolveToolResult: mock(() => {}),
     ...overrides,
   }
@@ -32,6 +32,7 @@ function createMockIPCServer(overrides: Partial<IPCServer> = {}): IPCServer {
 
 /** Create a minimal mock ACPClient. */
 function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
+  const mockLaneRouter = new LaneRouter()
   return {
     isRunning: mock(() => false),
     start: mock(() =>
@@ -61,6 +62,7 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     getCwd: mock(() => "/tmp/test"),
     getIpcPort: mock(() => null),
     getIPCServer: mock(() => createMockIPCServer()),
+    getLaneRouter: mock(() => mockLaneRouter),
     setPromptCallback: mock(() => {}),
     ...overrides,
   } as unknown as ACPClient
@@ -368,16 +370,11 @@ describe("KiroACPLanguageModel", () => {
 
   describe("doStream() — tool calls via IPC", () => {
     test("emits tool-call parts when IPC notifies of a tool call", async () => {
-      // Create a mock IPC server that captures the handler
-      let capturedHandler: ToolCallHandler | null = null
-      const mockIPC = createMockIPCServer({
-        setToolCallHandler: mock((handler: ToolCallHandler) => {
-          capturedHandler = handler
-        }),
-      })
+      // Create a shared lane router that the adapter will use
+      const laneRouter = new LaneRouter()
 
       const client = createMockClient({
-        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
         prompt: mock(async (opts: PromptOptions) => {
           // Simulate kiro emitting some text, then a tool call arrives via IPC
           opts.onUpdate({
@@ -387,18 +384,14 @@ describe("KiroACPLanguageModel", () => {
 
           // Simulate the IPC tool call notification (happens when MCP bridge
           // sends POST /tool/pending to the IPC server)
-          if (capturedHandler) {
-            capturedHandler({
-              callId: "tc-1",
-              toolName: "bash",
-              args: { command: "echo hello" },
-            })
-          }
+          // The adapter registers a lane, so we route through the lane router
+          laneRouter.route({
+            callId: "tc-1",
+            toolName: "bash",
+            args: { command: "echo hello" },
+          })
 
           // The prompt stays pending (kiro is blocked on MCP bridge)
-          // We need to return eventually for the test, but in real usage
-          // this promise would stay pending until the tool result unblocks it.
-          // For this test, we wait a bit then return.
           await new Promise((r) => setTimeout(r, 200))
           return { stopReason: "end_turn" }
         }),
@@ -446,24 +439,17 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("emits tool-call without prior text when model immediately calls a tool", async () => {
-      let capturedHandler: ToolCallHandler | null = null
-      const mockIPC = createMockIPCServer({
-        setToolCallHandler: mock((handler: ToolCallHandler) => {
-          capturedHandler = handler
-        }),
-      })
+      const laneRouter = new LaneRouter()
 
       const client = createMockClient({
-        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
         prompt: mock(async () => {
           // Tool call immediately, no text
-          if (capturedHandler) {
-            capturedHandler({
-              callId: "tc-2",
-              toolName: "read_file",
-              args: { filePath: "/tmp/test.txt" },
-            })
-          }
+          laneRouter.route({
+            callId: "tc-2",
+            toolName: "read_file",
+            args: { filePath: "/tmp/test.txt" },
+          })
           await new Promise((r) => setTimeout(r, 200))
           return { stopReason: "end_turn" }
         }),
@@ -828,23 +814,16 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("returns tool-call content blocks (no tool-result — harness provides)", async () => {
-      let capturedHandler: ToolCallHandler | null = null
-      const mockIPC = createMockIPCServer({
-        setToolCallHandler: mock((handler: ToolCallHandler) => {
-          capturedHandler = handler
-        }),
-      })
+      const laneRouter = new LaneRouter()
 
       const client = createMockClient({
-        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
         prompt: mock(async () => {
-          if (capturedHandler) {
-            capturedHandler({
-              callId: "tc-1",
-              toolName: "bash",
-              args: { command: "ls" },
-            })
-          }
+          laneRouter.route({
+            callId: "tc-1",
+            toolName: "bash",
+            args: { command: "ls" },
+          })
           await new Promise((r) => setTimeout(r, 200))
           return { stopReason: "end_turn" }
         }),
@@ -1349,12 +1328,10 @@ describe("KiroACPLanguageModel", () => {
       // 1. doStream() → tool call → stream closes with tool-calls
       // 2. doStream() with tool result → resumes → text → stream closes with stop
 
-      let capturedHandler: ToolCallHandler | null = null
+      const laneRouter = new LaneRouter()
       let resolvedResults: ToolResultRequest[] = []
       const mockIPC = createMockIPCServer({
-        setToolCallHandler: mock((handler: ToolCallHandler) => {
-          capturedHandler = handler
-        }),
+        getLaneRouter: mock(() => laneRouter),
         resolveToolResult: mock((req: ToolResultRequest) => {
           resolvedResults.push(req)
         }),
@@ -1365,6 +1342,7 @@ describe("KiroACPLanguageModel", () => {
 
       const client = createMockClient({
         getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
         setPromptCallback: mock(() => {}),
         prompt: mock(async (opts: PromptOptions) => {
           promptCallCount++
@@ -1374,14 +1352,12 @@ describe("KiroACPLanguageModel", () => {
             content: { text: "Checking..." },
           })
 
-          // Trigger tool call via IPC
-          if (capturedHandler) {
-            capturedHandler({
-              callId: "tc-resume",
-              toolName: "bash",
-              args: { command: "ls" },
-            })
-          }
+          // Trigger tool call via lane router
+          laneRouter.route({
+            callId: "tc-resume",
+            toolName: "bash",
+            args: { command: "ls" },
+          })
 
           // Return a promise that we control
           return new Promise<{ stopReason: string }>((resolve) => {

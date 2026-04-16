@@ -15,6 +15,7 @@ import { writeFileSync } from "node:fs"
 import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
 import type { MCPToolDefinition } from "./mcp-bridge-tools"
 import type { PendingToolCall } from "./ipc-server"
+import type { LaneRouter } from "./lane-router"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -584,9 +585,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       await writer.close()
     }
 
-    // Register tool call handler on IPC server
-    const ipcServer = this.client.getIPCServer()
-    ipcServer?.setToolCallHandler((pendingCall) => {
+    // Register a lane for this session's tool calls
+    const laneRouter = this.client.getLaneRouter()
+    laneRouter?.register(sessionId, (pendingCall) => {
       bufferedToolCalls.push(pendingCall)
 
       // Debounce: wait for more tool calls to arrive (parallel calls)
@@ -629,9 +630,15 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           }
           void writePart({ type: "reasoning-delta", id: reasoningId, delta: text })
         }
+      } else if (updateType === "tool_call") {
+        // Correlate tool_call notifications with the lane for routing
+        const toolCallId = (update as Record<string, unknown>).toolCallId as string | undefined
+        const toolName = (update as Record<string, unknown>).name as string | undefined
+        const rawInput = (update as Record<string, unknown>).rawInput as Record<string, unknown> | undefined
+        if (toolCallId && toolName) {
+          laneRouter?.correlate(sessionId, toolCallId, toolName, rawInput ?? {})
+        }
       }
-      // tool_call and tool_call_update notifications are IGNORED —
-      // tool calls come through IPC, not ACP notifications
     }
 
     // Start the ACP prompt (runs in background, may be held by tool calls)
@@ -692,7 +699,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         // Release session BEFORE closing the stream so the next doStream()
         // call (triggered by the consumer reading the finish part) can reuse it.
         this.pendingTurn = null
-        ipcServer?.clearToolCallHandler()
+        laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
         streamClosed = true
         await writer.close()
@@ -716,7 +723,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
         await writePart({ type: "error", error: err })
         this.pendingTurn = null
-        ipcServer?.clearToolCallHandler()
+        laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
         streamClosed = true
         try {
@@ -811,9 +818,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       await writer.close()
     }
 
-    // Register tool call handler for potential follow-up tool calls
-    const ipcServer = this.client.getIPCServer()
-    ipcServer?.setToolCallHandler((pendingCall) => {
+    // Update the lane handler for this session (lane stays registered from startFreshPrompt)
+    const laneRouter = this.client.getLaneRouter()
+    laneRouter?.updateHandler(sessionId, (pendingCall) => {
       bufferedToolCalls.push(pendingCall)
 
       if (debounceTimer) clearTimeout(debounceTimer)
@@ -854,8 +861,16 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           }
           void writePart({ type: "reasoning-delta", id: reasoningId, delta: text })
         }
+      } else if (updateType === "tool_call") {
+        // Correlate tool_call notifications with the lane for routing
+        const toolCallId = (update as Record<string, unknown>).toolCallId as string | undefined
+        const toolName = (update as Record<string, unknown>).name as string | undefined
+        const rawInput = (update as Record<string, unknown>).rawInput as Record<string, unknown> | undefined
+        if (toolCallId && toolName) {
+          laneRouter?.correlate(sessionId, toolCallId, toolName, rawInput ?? {})
+        }
       }
-      // tool_call and tool_call_update notifications are IGNORED
+      // tool_call_update notifications are ignored
     }
 
     // Re-register the update handler for the ongoing prompt
@@ -907,7 +922,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         })
 
         this.pendingTurn = null
-        ipcServer?.clearToolCallHandler()
+        laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
         streamClosed = true
         await writer.close()
@@ -924,7 +939,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         if (textStarted) await writePart({ type: "text-end", id: textId })
         await writePart({ type: "error", error: err })
         this.pendingTurn = null
-        ipcServer?.clearToolCallHandler()
+        laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
         streamClosed = true
         try {

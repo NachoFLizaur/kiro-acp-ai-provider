@@ -17,6 +17,7 @@
 
 import * as http from "node:http"
 import type * as net from "node:net"
+import { LaneRouter } from "./lane-router"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,9 +29,6 @@ export interface PendingToolCall {
   toolName: string
   args: Record<string, unknown>
 }
-
-/** Callback invoked when a tool call arrives from the MCP bridge. */
-export type ToolCallHandler = (call: PendingToolCall) => void
 
 /** Request body for POST /tool/result. */
 export interface ToolResultRequest {
@@ -63,10 +61,8 @@ export interface IPCServer {
   getPort(): number | null
   /** Get the number of pending tool calls. */
   getPendingCount(): number
-  /** Register a callback for tool call notifications from the MCP bridge. */
-  setToolCallHandler(handler: ToolCallHandler): void
-  /** Clear the tool call handler. */
-  clearToolCallHandler(): void
+  /** Get the lane router for per-session tool call routing. */
+  getLaneRouter(): LaneRouter
   /** Resolve a pending tool call with a result (in-process, used by adapter). */
   resolveToolResult(request: ToolResultRequest): void
 }
@@ -119,11 +115,8 @@ class IPCServerImpl implements IPCServer {
   /** Pending tool calls waiting for results. Key: callId. */
   private readonly pendingCalls = new Map<string, PendingCallEntry>()
 
-  /** Callback to notify the adapter when a tool call arrives. */
-  private toolCallHandler?: ToolCallHandler
-
-  /** Buffer for tool calls that arrive before a handler is registered. */
-  private toolCallBuffer: PendingToolCall[] = []
+  /** Per-session tool call router. */
+  private readonly laneRouter = new LaneRouter()
 
   constructor(options: IPCServerOptions = {}) {
     this.host = options.host ?? "127.0.0.1"
@@ -164,8 +157,7 @@ class IPCServerImpl implements IPCServer {
       })
     }
     this.pendingCalls.clear()
-    this.toolCallBuffer = []
-    this.toolCallHandler = undefined
+    this.laneRouter.clear()
 
     // Close the HTTP server
     if (this.server) {
@@ -185,18 +177,8 @@ class IPCServerImpl implements IPCServer {
     return this.pendingCalls.size
   }
 
-  setToolCallHandler(handler: ToolCallHandler): void {
-    this.toolCallHandler = handler
-    // Flush any buffered calls
-    const buffered = this.toolCallBuffer
-    this.toolCallBuffer = []
-    for (const call of buffered) {
-      handler(call)
-    }
-  }
-
-  clearToolCallHandler(): void {
-    this.toolCallHandler = undefined
+  getLaneRouter(): LaneRouter {
+    return this.laneRouter
   }
 
   resolveToolResult(request: ToolResultRequest): void {
@@ -300,13 +282,9 @@ class IPCServerImpl implements IPCServer {
       this.pendingCalls.set(callId, { resolve, reject, toolName, timer })
     })
 
-    // Notify the adapter that a tool call is pending
+    // Notify the adapter that a tool call is pending via the lane router
     const pendingCall: PendingToolCall = { callId, toolName, args }
-    if (this.toolCallHandler) {
-      this.toolCallHandler(pendingCall)
-    } else {
-      this.toolCallBuffer.push(pendingCall)
-    }
+    this.laneRouter.route(pendingCall)
 
     // Hold the HTTP response open until the promise resolves
     const result = await resultPromise

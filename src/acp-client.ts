@@ -8,6 +8,7 @@ import { tmpdir } from "node:os"
 import { generateAgentConfig, writeAgentConfig } from "./agent-config"
 import { getDefaultTools } from "./mcp-bridge-tools"
 import { createIPCServer, type IPCServer } from "./ipc-server"
+import type { LaneRouter } from "./lane-router"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -523,6 +524,11 @@ export class ACPClient {
   /** Get the IPC server instance (for direct in-process communication). */
   getIPCServer(): IPCServer | null {
     return this.ipcServer
+  }
+
+  /** Get the lane router from the IPC server (for per-session tool call routing). */
+  getLaneRouter(): LaneRouter | null {
+    return this.ipcServer?.getLaneRouter() ?? null
   }
 
   /**

@@ -4,8 +4,8 @@ import {
   type IPCServer,
   type ToolExecuteResponse,
   type PendingToolCall,
-  type ToolCallHandler,
 } from "../src/ipc-server"
+import { LaneRouter } from "../src/lane-router"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -94,8 +94,9 @@ describe("IPCServer", () => {
       server = createIPCServer()
       port = await server.start()
 
-      // Register a handler so the call gets stored
-      server.setToolCallHandler(() => {
+      // Register a lane so the call gets routed
+      const router = server.getLaneRouter()
+      router.register("sess-1", () => {
         // Don't resolve — let it stay pending
       })
 
@@ -155,9 +156,10 @@ describe("IPCServer", () => {
       server = createIPCServer()
       port = await server.start()
 
-      // Register handler to capture the tool call
+      // Register a lane to capture the tool call
       let receivedCall: PendingToolCall | null = null
-      server.setToolCallHandler((call) => {
+      const router = server.getLaneRouter()
+      router.register("sess-1", (call) => {
         receivedCall = call
       })
 
@@ -201,7 +203,7 @@ describe("IPCServer", () => {
       server = createIPCServer()
       port = await server.start()
 
-      server.setToolCallHandler(() => {})
+      server.getLaneRouter().register("sess-1", () => {})
 
       const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
         callId: "call-err",
@@ -268,7 +270,7 @@ describe("IPCServer", () => {
       port = await server.start()
 
       const receivedCalls: PendingToolCall[] = []
-      server.setToolCallHandler((call) => {
+      server.getLaneRouter().register("sess-1", (call) => {
         receivedCalls.push(call)
       })
 
@@ -318,7 +320,7 @@ describe("IPCServer", () => {
       server = createIPCServer()
       port = await server.start()
 
-      server.setToolCallHandler(() => {})
+      server.getLaneRouter().register("sess-1", () => {})
 
       const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
         callId: "call-direct",
@@ -353,16 +355,16 @@ describe("IPCServer", () => {
   })
 
   // -------------------------------------------------------------------------
-  // setToolCallHandler() — callback and buffering
+  // getLaneRouter() — lane-based routing
   // -------------------------------------------------------------------------
 
-  describe("setToolCallHandler()", () => {
-    test("notifies handler when a pending call arrives", async () => {
+  describe("getLaneRouter()", () => {
+    test("notifies lane handler when a pending call arrives", async () => {
       server = createIPCServer()
       port = await server.start()
 
       const calls: PendingToolCall[] = []
-      server.setToolCallHandler((call) => {
+      server.getLaneRouter().register("sess-1", (call) => {
         calls.push(call)
       })
 
@@ -384,11 +386,11 @@ describe("IPCServer", () => {
       await pendingPromise
     })
 
-    test("buffers calls that arrive before handler is registered", async () => {
+    test("buffers calls that arrive before a lane is registered", async () => {
       server = createIPCServer()
       port = await server.start()
 
-      // Start a pending call WITHOUT a handler registered
+      // Start a pending call WITHOUT a lane registered
       const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
         callId: "call-buffered",
         toolName: "bash",
@@ -397,9 +399,9 @@ describe("IPCServer", () => {
 
       await new Promise((r) => setTimeout(r, 50))
 
-      // Now register the handler — should flush the buffered call
+      // Now register a lane — should flush the buffered call
       const calls: PendingToolCall[] = []
-      server.setToolCallHandler((call) => {
+      server.getLaneRouter().register("sess-1", (call) => {
         calls.push(call)
       })
 
@@ -421,7 +423,7 @@ describe("IPCServer", () => {
       server = createIPCServer()
       port = await server.start()
 
-      server.setToolCallHandler(() => {})
+      server.getLaneRouter().register("sess-1", () => {})
 
       // Start a pending call
       const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
@@ -508,7 +510,7 @@ describe("IPCServer", () => {
       server = createIPCServer()
       port = await server.start()
 
-      server.setToolCallHandler(() => {})
+      server.getLaneRouter().register("sess-1", () => {})
 
       // Start a pending call (don't await)
       const callPromise = httpRequest(port, "POST", "/tool/pending", {
