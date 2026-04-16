@@ -1,6 +1,6 @@
 {
   "name": "kiro-acp-ai-provider",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Kiro ACP (AWS) provider for Vercel AI SDK — ToS-compliant via kiro-cli",
   "license": "MIT",
   "type": "module",

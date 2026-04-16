@@ -11,7 +11,10 @@ import type {
   LanguageModelV3Usage,
   LanguageModelV3Prompt,
 } from "@ai-sdk/provider"
-import { writeFileSync } from "node:fs"
+import { writeFileSync, readFileSync, mkdirSync } from "node:fs"
+import { createHash } from "node:crypto"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
 import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { PendingToolCall } from "./ipc-server"
@@ -355,19 +358,38 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     }
 
     // No free session — create a new one.
-    // For the first session, try loading an existing one if sessionId was provided.
-    if (this.sessions.length === 0 && this.config.sessionId) {
-      try {
-        const loaded = await this.client.loadSession(this.config.sessionId)
-        await this.ensureSessionMode(loaded)
-        this.sessions.push(loaded)
-        this.busySessions.add(loaded.sessionId)
-        if (this.currentModelId === null) {
-          this.currentModelId = loaded.models.currentModelId
+    // For the first session, try loading an existing one:
+    // 1. From config.sessionId (explicit, e.g. passed by the harness)
+    // 2. From the persisted session file (automatic, survives restarts)
+    if (this.sessions.length === 0) {
+      // Try explicit sessionId first
+      if (this.config.sessionId) {
+        try {
+          const loaded = await this.client.loadSession(this.config.sessionId)
+          await this.ensureSessionMode(loaded)
+          this.sessions.push(loaded)
+          this.busySessions.add(loaded.sessionId)
+          if (this.currentModelId === null) {
+            this.currentModelId = loaded.models.currentModelId
+          }
+          this.persistSessionId(loaded.sessionId)
+          return loaded
+        } catch {
+          // Fall through to persisted session or create new
         }
-        return loaded
-      } catch {
-        // Fall through to create new
+      }
+
+      // Try loading from persisted session file
+      const persisted = await this.tryLoadPersistedSession()
+      if (persisted) {
+        this.sessions.push(persisted)
+        this.busySessions.add(persisted.sessionId)
+        if (this.currentModelId === null) {
+          this.currentModelId = persisted.models?.currentModelId ?? null
+        }
+        // Re-persist to refresh the timestamp
+        this.persistSessionId(persisted.sessionId)
+        return persisted
       }
     }
 
@@ -378,14 +400,29 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     if (this.currentModelId === null) {
       this.currentModelId = session.models.currentModelId
     }
+
+    // Persist the primary session ID (first session only)
+    if (this.sessions.length === 1) {
+      this.persistSessionId(session.sessionId)
+    }
+
     return session
   }
 
   /**
    * Release a session back to the pool so it can be reused.
+   *
+   * If this is the primary session (first in the pool), re-persist the
+   * session ID to refresh the timestamp. This keeps the file current so
+   * the 24-hour TTL doesn't expire during long-running sessions.
    */
   private releaseSession(sessionId: string): void {
     this.busySessions.delete(sessionId)
+
+    // Refresh persisted timestamp for the primary session
+    if (this.sessions[0]?.sessionId === sessionId) {
+      this.persistSessionId(sessionId)
+    }
   }
 
   /**
@@ -419,6 +456,72 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     await this.client.setModel(session.sessionId, this.modelId)
     this.currentModelId = this.modelId
+  }
+
+  // -------------------------------------------------------------------------
+  // Session persistence (across process restarts)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Get the path to the session persistence file.
+   *
+   * Uses the same cwd-hash scheme as the tools file for consistency:
+   * `{tmpdir}/kiro-acp/session-{cwdHash}.json`
+   */
+  private getSessionFilePath(): string {
+    const cwdHash = createHash("md5").update(this.client.getCwd()).digest("hex").slice(0, 8)
+    return join(tmpdir(), "kiro-acp", `session-${cwdHash}.json`)
+  }
+
+  /**
+   * Persist the primary session ID to disk so it can be resumed after restart.
+   *
+   * This is best-effort — failures are silently ignored. The file is only
+   * written for the first session (index 0); subagent sessions are transient.
+   */
+  private persistSessionId(sessionId: string): void {
+    try {
+      const dir = join(tmpdir(), "kiro-acp")
+      mkdirSync(dir, { recursive: true })
+      const data = JSON.stringify({
+        sessionId,
+        timestamp: Date.now(),
+        modelId: this.modelId,
+      })
+      writeFileSync(this.getSessionFilePath(), data)
+    } catch {
+      // Best-effort — ignore write failures
+    }
+  }
+
+  /**
+   * Try to load a previously persisted session from disk.
+   *
+   * Returns the loaded ACPSession if successful, or null if:
+   * - No persisted session file exists
+   * - The persisted session is older than 24 hours
+   * - The `session/load` RPC call fails (session expired server-side)
+   *
+   * On failure, falls through silently so the caller can create a new session.
+   */
+  private async tryLoadPersistedSession(): Promise<ACPSession | null> {
+    try {
+      const raw = readFileSync(this.getSessionFilePath(), "utf-8")
+      const data = JSON.parse(raw) as { sessionId: string; timestamp: number }
+
+      // Don't try to load very old sessions (> 24 hours)
+      if (Date.now() - data.timestamp > 24 * 60 * 60 * 1000) return null
+
+      const session = await this.client.loadSession(data.sessionId)
+
+      // Validate the loaded session has the expected shape
+      if (!session?.sessionId) return null
+
+      await this.ensureSessionMode(session)
+      return session
+    } catch {
+      return null
+    }
   }
 
   // -------------------------------------------------------------------------
