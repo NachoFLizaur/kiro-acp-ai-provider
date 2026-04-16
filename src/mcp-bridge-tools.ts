@@ -27,8 +27,8 @@ export interface MCPToolsFile {
 }
 
 /**
- * Returns the default set of tool definitions that match what opencode
- * typically provides. These are the tools kiro-cli's model can call.
+ * Returns the default set of tool definitions for the MCP bridge.
+ * These are the tools kiro-cli's model can call.
  */
 export function getDefaultTools(): MCPToolDefinition[] {
   return [

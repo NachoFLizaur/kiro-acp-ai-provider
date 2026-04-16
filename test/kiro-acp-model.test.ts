@@ -246,7 +246,7 @@ describe("KiroACPLanguageModel", () => {
   describe("mode switching — waitForToolsReady", () => {
     test("calls waitForToolsReady after setMode when mode differs", async () => {
       const client = createMockClient({
-        getAgentName: mock(() => "opencode"),
+        getAgentName: mock(() => "test-agent"),
         createSession: mock(() =>
           Promise.resolve({
             sessionId: "sess-1",
@@ -270,17 +270,17 @@ describe("KiroACPLanguageModel", () => {
       )
       await collectStream(result.stream)
 
-      expect(client.setMode).toHaveBeenCalledWith("sess-1", "opencode")
+      expect(client.setMode).toHaveBeenCalledWith("sess-1", "test-agent")
       expect(client.waitForToolsReady).toHaveBeenCalledWith({ timeoutMs: 3000 })
     })
 
     test("does not call waitForToolsReady when mode already matches", async () => {
       const client = createMockClient({
-        getAgentName: mock(() => "opencode"),
+        getAgentName: mock(() => "test-agent"),
         createSession: mock(() =>
           Promise.resolve({
             sessionId: "sess-1",
-            modes: { currentModeId: "opencode", availableModes: [] },
+            modes: { currentModeId: "test-agent", availableModes: [] },
             models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
           } satisfies ACPSession),
         ),
@@ -1508,6 +1508,102 @@ describe("KiroACPLanguageModel", () => {
 
       // Client not running → no need to wait for notification
       expect(client.waitForToolsReady).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("doStream() — affinity header", () => {
+    test("doStream extracts x-session-affinity header", async () => {
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      // Spy on setAffinityId
+      let capturedAffinityId: string | undefined = "NOT_SET"
+      const originalSetAffinityId = model.setAffinityId.bind(model)
+      model.setAffinityId = (id: string | undefined) => {
+        capturedAffinityId = id
+        originalSetAffinityId(id)
+      }
+
+      const result = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { headers: { "x-session-affinity": "sess-42" } },
+        ),
+      )
+      await collectStream(result.stream)
+
+      expect(capturedAffinityId).toBe("sess-42")
+    })
+
+    test("doStream uses undefined affinity when header missing", async () => {
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      let capturedAffinityId: string | undefined = "NOT_SET"
+      const originalSetAffinityId = model.setAffinityId.bind(model)
+      model.setAffinityId = (id: string | undefined) => {
+        capturedAffinityId = id
+        originalSetAffinityId(id)
+      }
+
+      const result = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { headers: {} },
+        ),
+      )
+      await collectStream(result.stream)
+
+      expect(capturedAffinityId).toBeUndefined()
+    })
+
+    test("doStream handles undefined headers object", async () => {
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      let capturedAffinityId: string | undefined = "NOT_SET"
+      const originalSetAffinityId = model.setAffinityId.bind(model)
+      model.setAffinityId = (id: string | undefined) => {
+        capturedAffinityId = id
+        originalSetAffinityId(id)
+      }
+
+      const result = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { headers: undefined },
+        ),
+      )
+      await collectStream(result.stream)
+
+      expect(capturedAffinityId).toBeUndefined()
     })
   })
 

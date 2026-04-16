@@ -35,13 +35,13 @@ export interface AgentConfigOptions {
  * - Use a minimal custom prompt
  */
 export function generateAgentConfig(options: AgentConfigOptions): Record<string, unknown> {
-  const mcpServerName = "opencode-tools"
+  const mcpServerName = `${(options.name ?? "kiro-acp")}-tools`
   const mcpServerRef = `@${mcpServerName}`
 
   return {
     // Agent name — required by kiro-cli to identify this agent.
     // Without it, kiro-cli falls back to "kiro_default" with all built-in tools.
-    name: options.name ?? "opencode",
+    name: options.name ?? "kiro-acp",
     // Only use tools from the MCP bridge — no built-in kiro tools
     // The @-prefix references "all tools from this MCP server"
     tools: [mcpServerRef],
@@ -60,7 +60,7 @@ export function generateAgentConfig(options: AgentConfigOptions): Record<string,
     // Agent system prompt — guides kiro-cli's behavior with tools and responses
     prompt:
       options.prompt ??
-      `You are a coding assistant integrated into the opencode editor. Follow the user's instructions precisely and use tools proactively.
+      `You are a coding assistant. Follow the user's instructions precisely and use tools proactively.
 
 Tool usage guidelines:
 - Use tools immediately when needed — do not ask for permission or confirmation
