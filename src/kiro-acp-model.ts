@@ -33,6 +33,8 @@ interface PendingTurnState {
   outputCharCount: number
   /** Incremented for unique text/reasoning IDs across stream segments. */
   streamSegment: number
+  /** Abort controller for the prompt — persists across doStream cycles. */
+  promptAbort: AbortController
 }
 
 /** Configuration for creating a KiroACPLanguageModel. */
@@ -670,6 +672,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         pendingToolCalls: new Map(bufferedToolCalls.map(c => [c.callId, c])),
         outputCharCount,
         streamSegment: 1,
+        promptAbort,
       })
 
       // Emit finish with tool-calls reason and close stream
@@ -679,6 +682,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         finishReason: { unified: "tool-calls", raw: "tool_use" },
         usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
       })
+
+      // Remove the user abort listener to prevent leaks — the promptAbort
+      // is now stored in the pending turn and will be re-wired on resumption.
+      if (options.abortSignal && userAbortHandler) {
+        options.abortSignal.removeEventListener("abort", userAbortHandler)
+      }
 
       streamClosed = true
       bufferedToolCalls = []
@@ -741,16 +750,24 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       }
     }
 
-    // Start the ACP prompt (runs in background, may be held by tool calls).
-    // No abort signal — the prompt must NOT be cancelled between tool-call
-    // cycles. The AI SDK's per-doStream abort signal fires when a stream
-    // closes for tool-calls, which would cancel the kiro-cli prompt while
-    // it's still waiting for tool results. The prompt runs until kiro
-    // finishes or the process is killed (via provider.shutdown()).
+    // Create a prompt-level abort controller that persists across doStream
+    // cycles. Only explicit user cancels (Escape/Ctrl+C) fire this — NOT
+    // stream-close-for-tool-calls.
+    const promptAbort = new AbortController()
+
+    // Forward user-initiated cancels from the AI SDK abort signal
+    let userAbortHandler: (() => void) | undefined
+    if (options.abortSignal) {
+      userAbortHandler = () => promptAbort.abort()
+      options.abortSignal.addEventListener("abort", userAbortHandler, { once: true })
+    }
+
+    // Start the ACP prompt with our controlled abort signal.
     const promptPromise = this.client.prompt({
       sessionId,
       prompt: [{ type: "text", text: compositeText }],
       onUpdate: handleUpdate,
+      signal: promptAbort.signal,
     })
 
     // If the prompt completes without any tool calls (pure text response)
@@ -800,6 +817,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             : undefined,
         })
 
+        // Clean up abort listener to prevent leaks
+        if (options.abortSignal && userAbortHandler) {
+          options.abortSignal.removeEventListener("abort", userAbortHandler)
+        }
+
         // Release session BEFORE closing the stream so the next doStream()
         // call (triggered by the consumer reading the finish part) can reuse it.
         this.pendingTurns.delete(sessionId)
@@ -826,6 +848,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         }
 
         await writePart({ type: "error", error: err })
+
+        // Clean up abort listener to prevent leaks
+        if (options.abortSignal && userAbortHandler) {
+          options.abortSignal.removeEventListener("abort", userAbortHandler)
+        }
+
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
@@ -856,6 +884,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const turn = this.pendingTurns.get(sessionId)
     if (!turn) {
       throw new Error(`No pending turn for session ${sessionId}`)
+    }
+
+    // Forward user-initiated cancels from the NEW doStream's abort signal
+    // to the SAME promptAbort that persists across doStream cycles.
+    let userAbortHandler: (() => void) | undefined
+    if (options.abortSignal) {
+      userAbortHandler = () => turn.promptAbort.abort()
+      options.abortSignal.addEventListener("abort", userAbortHandler, { once: true })
     }
 
     const { readable, writable } = new TransformStream<LanguageModelV3StreamPart>()
@@ -919,6 +955,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         finishReason: { unified: "tool-calls", raw: "tool_use" },
         usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
       })
+
+      // Remove the user abort listener to prevent leaks — the promptAbort
+      // persists in the pending turn and will be re-wired on next resumption.
+      if (options.abortSignal && userAbortHandler) {
+        options.abortSignal.removeEventListener("abort", userAbortHandler)
+      }
 
       streamClosed = true
       bufferedToolCalls = []
@@ -1028,6 +1070,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             : undefined,
         })
 
+        // Clean up abort listener to prevent leaks
+        if (options.abortSignal && userAbortHandler) {
+          options.abortSignal.removeEventListener("abort", userAbortHandler)
+        }
+
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
@@ -1045,6 +1092,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         if (reasoningStarted) await writePart({ type: "reasoning-end", id: reasoningId })
         if (textStarted) await writePart({ type: "text-end", id: textId })
         await writePart({ type: "error", error: err })
+
+        // Clean up abort listener to prevent leaks
+        if (options.abortSignal && userAbortHandler) {
+          options.abortSignal.removeEventListener("abort", userAbortHandler)
+        }
+
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)

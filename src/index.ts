@@ -1,8 +1,8 @@
 // ACP Client
 export {
   ACPClient,
-  ACPError,
-  ACPConnectionError,
+  KiroACPError,
+  KiroACPConnectionError,
   type ACPClientOptions,
   type ACPSession,
   type AvailableTool,

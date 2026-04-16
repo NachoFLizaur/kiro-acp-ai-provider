@@ -163,8 +163,8 @@ type JsonRpcMessage = JsonRpcResponse | JsonRpcNotification | JsonRpcServerReque
 // Errors
 // ---------------------------------------------------------------------------
 
-export class ACPError extends Error {
-  readonly name = "ACPError" as const
+export class KiroACPError extends Error {
+  readonly name = "KiroACPError" as const
   constructor(
     message: string,
     readonly code?: number,
@@ -174,8 +174,8 @@ export class ACPError extends Error {
   }
 }
 
-export class ACPConnectionError extends Error {
-  readonly name = "ACPConnectionError" as const
+export class KiroACPConnectionError extends Error {
+  readonly name = "KiroACPConnectionError" as const
   constructor(message: string) {
     super(message)
   }
@@ -226,7 +226,7 @@ export class ACPClient {
 
   /** Spawn kiro-cli acp and perform the initialize handshake. */
   async start(): Promise<InitializeResult> {
-    if (this.running) throw new ACPConnectionError("Client is already running")
+    if (this.running) throw new KiroACPConnectionError("Client is already running")
 
     // Start IPC server for tool call synchronization.
     // This must happen BEFORE setupAgentConfig so we have the port number
@@ -273,7 +273,7 @@ export class ACPClient {
       const rejectPending = () => {
         for (const [id, pending] of this.pending) {
           pending.reject(
-            new ACPConnectionError(
+            new KiroACPConnectionError(
               `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}`,
             ),
           )
@@ -293,7 +293,7 @@ export class ACPClient {
     this.process.on("error", (err) => {
       this.running = false
       for (const [id, pending] of this.pending) {
-        pending.reject(new ACPConnectionError(`Process error: ${err.message}`))
+        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}`))
         clearTimeout(pending.timer)
         this.pending.delete(id)
       }
@@ -354,7 +354,7 @@ export class ACPClient {
 
     // Clean up any remaining pending requests (in case exit handler didn't fire)
     for (const [id, pending] of this.pending) {
-      pending.reject(new ACPConnectionError("Client stopped"))
+      pending.reject(new KiroACPConnectionError("Client stopped"))
       clearTimeout(pending.timer)
     }
     this.pending.clear()
@@ -417,7 +417,7 @@ export class ACPClient {
       }
       if (signal.aborted) {
         this.promptCallbacks.delete(sessionId)
-        throw new ACPError("Prompt aborted before sending", -1)
+        throw new KiroACPError("Prompt aborted before sending", -1)
       }
       signal.addEventListener("abort", abortHandler, { once: true })
     }
@@ -826,7 +826,7 @@ export class ACPClient {
     const tmpPath = join(tmpdir(), "kiro-acp", "mcp-bridge.js")
     if (existsSync(tmpPath)) return tmpPath
 
-    throw new ACPConnectionError(
+    throw new KiroACPConnectionError(
       "Could not find mcp-bridge.js. Ensure kiro-acp-ai-provider is installed.",
     )
   }
@@ -842,7 +842,7 @@ export class ACPClient {
   ): Promise<unknown> {
     return new Promise((resolve, reject) => {
       if (!this.running || !this.process?.stdin?.writable) {
-        reject(new ACPConnectionError("Client is not running"))
+        reject(new KiroACPConnectionError("Client is not running"))
         return
       }
 
@@ -851,7 +851,7 @@ export class ACPClient {
 
       const timer = setTimeout(() => {
         this.pending.delete(id)
-        reject(new ACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1))
+        reject(new KiroACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1))
       }, timeoutMs)
 
       this.pending.set(id, { resolve, reject, method, timer })
@@ -918,7 +918,7 @@ export class ACPClient {
     this.pending.delete(msg.id)
 
     if (msg.error) {
-      pending.reject(new ACPError(msg.error.message, msg.error.code, msg.error.data))
+      pending.reject(new KiroACPError(msg.error.message, msg.error.code, msg.error.data))
     } else {
       pending.resolve(msg.result)
     }

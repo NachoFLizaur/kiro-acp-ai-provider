@@ -1,5 +1,5 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test"
-import { ACPClient, ACPError, ACPConnectionError, type ACPClientOptions } from "../src/acp-client"
+import { ACPClient, KiroACPError, KiroACPConnectionError, type ACPClientOptions } from "../src/acp-client"
 
 // ---------------------------------------------------------------------------
 // We can't easily spawn a real kiro-cli in tests, so we test the internal
@@ -32,7 +32,7 @@ describe("ACPClient", () => {
   })
 
   describe("start() — error cases", () => {
-    test("throws ACPConnectionError if already running", async () => {
+    test("throws KiroACPConnectionError if already running", async () => {
       const client = new ACPClient({ cwd: "/tmp" })
 
       // Manually set running state via a start that will fail on spawn
@@ -44,8 +44,8 @@ describe("ACPClient", () => {
 
       // We can't easily test this without a real process, so let's verify
       // the error class exists and works correctly
-      const err = new ACPConnectionError("Client is already running")
-      expect(err.name).toBe("ACPConnectionError")
+      const err = new KiroACPConnectionError("Client is already running")
+      expect(err.name).toBe("KiroACPConnectionError")
       expect(err.message).toBe("Client is already running")
     })
   })
@@ -60,15 +60,15 @@ describe("ACPClient", () => {
 
   describe("ACPError", () => {
     test("stores code and data", () => {
-      const err = new ACPError("test error", -32600, { detail: "bad request" })
-      expect(err.name).toBe("ACPError")
+      const err = new KiroACPError("test error", -32600, { detail: "bad request" })
+      expect(err.name).toBe("KiroACPError")
       expect(err.message).toBe("test error")
       expect(err.code).toBe(-32600)
       expect(err.data).toEqual({ detail: "bad request" })
     })
 
     test("works without code and data", () => {
-      const err = new ACPError("simple error")
+      const err = new KiroACPError("simple error")
       expect(err.code).toBeUndefined()
       expect(err.data).toBeUndefined()
     })
@@ -76,8 +76,8 @@ describe("ACPClient", () => {
 
   describe("ACPConnectionError", () => {
     test("has correct name", () => {
-      const err = new ACPConnectionError("connection failed")
-      expect(err.name).toBe("ACPConnectionError")
+      const err = new KiroACPConnectionError("connection failed")
+      expect(err.name).toBe("KiroACPConnectionError")
       expect(err.message).toBe("connection failed")
       expect(err instanceof Error).toBe(true)
     })
@@ -156,9 +156,9 @@ describe("ACPClient", () => {
         await resultPromise
         expect(true).toBe(false) // Should not reach here
       } catch (err) {
-        expect(err).toBeInstanceOf(ACPError)
-        expect((err as ACPError).message).toBe("Invalid request")
-        expect((err as ACPError).code).toBe(-32600)
+        expect(err).toBeInstanceOf(KiroACPError)
+        expect((err as KiroACPError).message).toBe("Invalid request")
+        expect((err as KiroACPError).code).toBe(-32600)
       }
     })
 
