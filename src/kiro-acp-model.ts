@@ -49,6 +49,46 @@ export interface KiroACPModelConfig {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Extract tool name and clean args from an ACP tool_call notification.
+ *
+ * ACP tool_call notifications don't have a `name` property directly.
+ * The tool name is embedded in the `title` field as "Running: @<source>/<name>".
+ * The `rawInput` may contain internal kiro-cli fields (like `__tool_use_purpose`)
+ * that aren't part of the actual tool arguments and must be stripped for
+ * correlation matching against IPC calls.
+ */
+function parseToolCallNotification(update: Record<string, unknown>): {
+  toolCallId: string | undefined
+  toolName: string | undefined
+  args: Record<string, unknown>
+} {
+  const toolCallId = update.toolCallId as string | undefined
+  const rawInput = update.rawInput as Record<string, unknown> | undefined
+
+  // Extract tool name from title: "Running: @opencode-tools/bash" → "bash"
+  let toolName: string | undefined
+  const title = update.title as string | undefined
+  if (title) {
+    const match = title.match(/\/([^/]+)$/)
+    if (match) {
+      toolName = match[1]
+    }
+  }
+
+  // Strip internal kiro-cli fields from args for clean correlation matching
+  const args: Record<string, unknown> = {}
+  if (rawInput) {
+    for (const [key, value] of Object.entries(rawInput)) {
+      if (!key.startsWith("__")) {
+        args[key] = value
+      }
+    }
+  }
+
+  return { toolCallId, toolName, args }
+}
+
 /** Create an empty usage object — used as a fallback when no estimation data is available. */
 function emptyUsage(): LanguageModelV3Usage {
   return {
@@ -703,11 +743,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         }
       } else if (updateType === "tool_call") {
         // Correlate tool_call notifications with the lane for routing
-        const toolCallId = (update as Record<string, unknown>).toolCallId as string | undefined
-        const toolName = (update as Record<string, unknown>).name as string | undefined
-        const rawInput = (update as Record<string, unknown>).rawInput as Record<string, unknown> | undefined
+        const { toolCallId, toolName, args: cleanArgs } = parseToolCallNotification(
+          update as Record<string, unknown>,
+        )
         if (toolCallId && toolName) {
-          laneRouter?.correlate(sessionId, toolCallId, toolName, rawInput ?? {})
+          laneRouter?.correlate(sessionId, toolCallId, toolName, cleanArgs)
         }
       }
     }
@@ -937,11 +977,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         }
       } else if (updateType === "tool_call") {
         // Correlate tool_call notifications with the lane for routing
-        const toolCallId = (update as Record<string, unknown>).toolCallId as string | undefined
-        const toolName = (update as Record<string, unknown>).name as string | undefined
-        const rawInput = (update as Record<string, unknown>).rawInput as Record<string, unknown> | undefined
+        const { toolCallId, toolName, args: cleanArgs } = parseToolCallNotification(
+          update as Record<string, unknown>,
+        )
         if (toolCallId && toolName) {
-          laneRouter?.correlate(sessionId, toolCallId, toolName, rawInput ?? {})
+          laneRouter?.correlate(sessionId, toolCallId, toolName, cleanArgs)
         }
       }
       // tool_call_update notifications are ignored
