@@ -752,12 +752,16 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       }
     }
 
-    // Start the ACP prompt (runs in background, may be held by tool calls)
+    // Start the ACP prompt (runs in background, may be held by tool calls).
+    // No abort signal — the prompt must NOT be cancelled between tool-call
+    // cycles. The AI SDK's per-doStream abort signal fires when a stream
+    // closes for tool-calls, which would cancel the kiro-cli prompt while
+    // it's still waiting for tool results. The prompt runs until kiro
+    // finishes or the process is killed (via provider.shutdown()).
     const promptPromise = this.client.prompt({
       sessionId,
       prompt: [{ type: "text", text: compositeText }],
       onUpdate: handleUpdate,
-      signal: options.abortSignal,
     })
 
     // If the prompt completes without any tool calls (pure text response)
