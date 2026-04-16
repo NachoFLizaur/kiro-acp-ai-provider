@@ -21,6 +21,20 @@ import type { LaneRouter } from "./lane-router"
 // Types
 // ---------------------------------------------------------------------------
 
+/** State for an ongoing kiro-cli prompt that is paused waiting for tool results. */
+interface PendingTurnState {
+  /** The ACP session this prompt is running on. */
+  sessionId: string
+  /** The promise from client.prompt() — still pending while kiro is blocked. */
+  promptPromise: Promise<{ stopReason: string }>
+  /** Pending tool calls waiting for results. Map<callId, PendingToolCall>. */
+  pendingToolCalls: Map<string, PendingToolCall>
+  /** Character count for usage estimation (accumulated across the turn). */
+  outputCharCount: number
+  /** Incremented for unique text/reasoning IDs across stream segments. */
+  streamSegment: number
+}
+
 /** Configuration for creating a KiroACPLanguageModel. */
 export interface KiroACPModelConfig {
   /** The ACP client instance (shared across models). */
@@ -202,22 +216,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private lastToolNames = ""
 
   /**
-   * State for an ongoing kiro-cli prompt that is paused waiting for tool results.
-   * When a tool call arrives via IPC, we close the stream and store this state.
-   * The next doStream() call (with tool result) uses this to resume.
+   * Per-session state for ongoing kiro-cli prompts paused waiting for tool results.
+   * Keyed by ACP sessionId so concurrent sessions don't clobber each other.
+   * When a tool call arrives via IPC, we close the stream and store state here.
+   * The next doStream() call (with tool results) uses this to resume.
    */
-  private pendingTurn: {
-    /** The ACP session this prompt is running on. */
-    sessionId: string
-    /** The promise from client.prompt() — still pending while kiro is blocked. */
-    promptPromise: Promise<{ stopReason: string }>
-    /** Pending tool calls waiting for results. Map<callId, PendingToolCall>. */
-    pendingToolCalls: Map<string, PendingToolCall>
-    /** Character count for usage estimation (accumulated across the turn). */
-    outputCharCount: number
-    /** Incremented for unique text/reasoning IDs across stream segments. */
-    streamSegment: number
-  } | null = null
+  private pendingTurns = new Map<string, PendingTurnState>()
 
   constructor(modelId: string, config: KiroACPModelConfig) {
     this.modelId = modelId
@@ -474,18 +478,35 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     // Check for tool results in the prompt
     const toolResults = this.extractToolResults(options.prompt)
 
-    if (toolResults.length > 0 && this.pendingTurn) {
-      return this.resumeWithToolResults(toolResults, options)
+    // Find which session has a pending turn matching these tool results
+    if (toolResults.length > 0) {
+      const pendingEntry = this.findPendingTurnForResults(toolResults)
+      if (pendingEntry) {
+        return this.resumeWithToolResults(pendingEntry.sessionId, toolResults, options)
+      }
     }
 
-    // If pendingTurn exists but no tool results, this is a fresh prompt
-    // (e.g., the harness decided to start over). Clean up the stale state.
-    if (this.pendingTurn) {
-      this.pendingTurn = null
-    }
-
-    // Fresh prompt — start a new turn
+    // Fresh prompt — no need to clear other sessions' pending turns
     return this.startFreshPrompt(options)
+  }
+
+  // -------------------------------------------------------------------------
+  // Pending turn lookup
+  // -------------------------------------------------------------------------
+
+  /**
+   * Find the pending turn whose tool call IDs match the given tool results.
+   * This allows correct routing when multiple sessions have pending turns.
+   */
+  private findPendingTurnForResults(
+    toolResults: Array<{ toolCallId: string }>,
+  ): { sessionId: string; state: PendingTurnState } | null {
+    for (const [sessionId, state] of this.pendingTurns) {
+      const pendingCallIds = new Set(state.pendingToolCalls.keys())
+      const hasMatch = toolResults.some(r => pendingCallIds.has(r.toolCallId))
+      if (hasMatch) return { sessionId, state }
+    }
+    return null
   }
 
   // -------------------------------------------------------------------------
@@ -563,14 +584,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         })
       }
 
-      // Store pending state for resumption
-      this.pendingTurn = {
+      // Store pending state for resumption (keyed by session)
+      this.pendingTurns.set(sessionId, {
         sessionId,
         promptPromise,
         pendingToolCalls: new Map(bufferedToolCalls.map(c => [c.callId, c])),
         outputCharCount,
         streamSegment: 1,
-      }
+      })
 
       // Emit finish with tool-calls reason and close stream
       const metadata = this.client.getMetadata(sessionId)
@@ -698,7 +719,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
         // Release session BEFORE closing the stream so the next doStream()
         // call (triggered by the consumer reading the finish part) can reuse it.
-        this.pendingTurn = null
+        this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
         streamClosed = true
@@ -722,7 +743,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         }
 
         await writePart({ type: "error", error: err })
-        this.pendingTurn = null
+        this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
         streamClosed = true
@@ -745,11 +766,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   // -------------------------------------------------------------------------
 
   private async resumeWithToolResults(
+    sessionId: string,
     toolResults: Array<{ toolCallId: string; toolName: string; result: string }>,
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3StreamResult> {
-    const turn = this.pendingTurn!
-    const sessionId = turn.sessionId
+    const turn = this.pendingTurns.get(sessionId)
+    if (!turn) {
+      throw new Error(`No pending turn for session ${sessionId}`)
+    }
 
     const { readable, writable } = new TransformStream<LanguageModelV3StreamPart>()
     const writer = writable.getWriter()
@@ -921,7 +945,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             : undefined,
         })
 
-        this.pendingTurn = null
+        this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
         streamClosed = true
@@ -938,7 +962,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         if (reasoningStarted) await writePart({ type: "reasoning-end", id: reasoningId })
         if (textStarted) await writePart({ type: "text-end", id: textId })
         await writePart({ type: "error", error: err })
-        this.pendingTurn = null
+        this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
         this.releaseSession(sessionId)
         streamClosed = true
