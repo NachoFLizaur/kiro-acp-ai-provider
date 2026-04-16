@@ -25,6 +25,11 @@ import * as http from "node:http"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { ToolExecuteResponse } from "./ipc-server"
 
+// Monotonic counter for generating globally unique callIds within this process.
+// Using the JSON-RPC request ID as callId is unsafe because kiro-cli's request
+// IDs reset per session — concurrent sessions can produce colliding IDs.
+let globalCallCounter = 0
+
 // ---------------------------------------------------------------------------
 // JSON-RPC types
 // ---------------------------------------------------------------------------
@@ -414,7 +419,7 @@ class MCPBridgeServer {
       // POST to /tool/pending — this will BLOCK until the harness executes the tool
       const response = await httpPost(
         `http://127.0.0.1:${this.ipcPort}/tool/pending`,
-        { callId: `${requestId}`, toolName, args },
+        { callId: `call-${++globalCallCounter}`, toolName, args },
         310_000, // HTTP timeout: 10s longer than IPC hold timeout
       )
 
