@@ -391,5 +391,259 @@ describe("ACPClient", () => {
       // No metadata should be stored
       expect(client.getMetadata("")).toBeUndefined()
     })
+
+    test("dispatches _kiro.dev/commands/available to toolsReadyListeners with parsed tools", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      const listener = mock(() => {})
+      const listeners = (client as any).toolsReadyListeners as Set<(tools: any[]) => void>
+      listeners.add(listener)
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [
+              { name: "bash", source: "mcp:opencode-tools", description: "Run command" },
+            ],
+          },
+        }),
+      )
+
+      expect(listener).toHaveBeenCalledTimes(1)
+      expect(listener).toHaveBeenCalledWith([
+        { name: "bash", source: "mcp:opencode-tools", description: "Run command" },
+      ])
+    })
+
+    test("stores available tools from _kiro.dev/commands/available", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      expect(client.getAvailableTools()).toEqual([])
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [
+              { name: "bash", source: "mcp:opencode-tools", description: "Run command" },
+              { name: "task", source: "mcp:opencode-tools", description: "Launch subagent" },
+            ],
+          },
+        }),
+      )
+
+      const tools = client.getAvailableTools()
+      expect(tools).toHaveLength(2)
+      expect(tools[0].name).toBe("bash")
+      expect(tools[1].name).toBe("task")
+    })
+
+    test("getAvailableTools returns a copy", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [{ name: "bash", source: "mcp:tools" }],
+          },
+        }),
+      )
+
+      const tools1 = client.getAvailableTools()
+      const tools2 = client.getAvailableTools()
+      expect(tools1).toEqual(tools2)
+      expect(tools1).not.toBe(tools2) // Different array instances
+    })
+
+    test("handles _kiro.dev/commands/available with missing tools field", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {},
+        }),
+      )
+
+      expect(client.getAvailableTools()).toEqual([])
+    })
+
+    test("_kiro.dev/commands/available does not forward to onExtension", () => {
+      const onExtension = mock(() => {})
+      const client = new ACPClient({ cwd: "/tmp", onExtension })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: { commands: [] },
+        }),
+      )
+
+      expect(onExtension).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("waitForToolsReady()", () => {
+    test("resolves with tools when _kiro.dev/commands/available notification arrives", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      const promise = client.waitForToolsReady({ timeoutMs: 5000 })
+
+      // Simulate the notification arriving
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [{ name: "bash", source: "mcp:tools", description: "Run command" }],
+          },
+        }),
+      )
+
+      // Should resolve without waiting for timeout
+      const tools = await promise
+      expect(tools).toHaveLength(1)
+      expect(tools[0].name).toBe("bash")
+
+      // Listener should have been cleaned up
+      const listeners = (client as any).toolsReadyListeners as Set<Function>
+      expect(listeners.size).toBe(0)
+    })
+
+    test("resolves on timeout with current tools if notification never arrives", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+
+      const start = Date.now()
+      const tools = await client.waitForToolsReady({ timeoutMs: 100 }) // Short timeout for test speed
+      const elapsed = Date.now() - start
+
+      expect(elapsed).toBeGreaterThanOrEqual(90) // Allow small timing variance
+      expect(elapsed).toBeLessThan(500)
+      expect(tools).toEqual([]) // No tools available yet
+
+      // Listener should have been cleaned up
+      const listeners = (client as any).toolsReadyListeners as Set<Function>
+      expect(listeners.size).toBe(0)
+    })
+
+    test("cleans up listener after notification resolves", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+      const listeners = (client as any).toolsReadyListeners as Set<Function>
+
+      const promise = client.waitForToolsReady({ timeoutMs: 5000 })
+      expect(listeners.size).toBe(1)
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: { tools: [] },
+        }),
+      )
+
+      await promise
+      expect(listeners.size).toBe(0)
+    })
+
+    test("multiple waiters all resolve on single notification", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      const p1 = client.waitForToolsReady({ timeoutMs: 5000 })
+      const p2 = client.waitForToolsReady({ timeoutMs: 5000 })
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [{ name: "bash", source: "mcp:tools" }],
+          },
+        }),
+      )
+
+      const [tools1, tools2] = await Promise.all([p1, p2])
+      expect(tools1).toHaveLength(1)
+      expect(tools2).toHaveLength(1)
+
+      const listeners = (client as any).toolsReadyListeners as Set<Function>
+      expect(listeners.size).toBe(0)
+    })
+
+    test("waits for expectedTools to be present", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      const promise = client.waitForToolsReady({
+        timeoutMs: 5000,
+        expectedTools: ["bash", "task"],
+      })
+
+      // First notification — only has "bash", should NOT resolve yet
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [{ name: "bash", source: "mcp:tools" }],
+          },
+        }),
+      )
+
+      // Give a tick for the handler to run
+      await new Promise((r) => setTimeout(r, 10))
+      const listeners = (client as any).toolsReadyListeners as Set<Function>
+      expect(listeners.size).toBe(1) // Still waiting
+
+      // Second notification — has both, should resolve
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [
+              { name: "bash", source: "mcp:tools" },
+              { name: "task", source: "mcp:tools" },
+            ],
+          },
+        }),
+      )
+
+      const tools = await promise
+      expect(tools).toHaveLength(2)
+      expect(listeners.size).toBe(0)
+    })
+
+    test("resolves with defaults when no options provided", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      const promise = client.waitForToolsReady()
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: { tools: [{ name: "bash", source: "mcp:tools" }] },
+        }),
+      )
+
+      const tools = await promise
+      expect(tools).toHaveLength(1)
+    })
   })
 })

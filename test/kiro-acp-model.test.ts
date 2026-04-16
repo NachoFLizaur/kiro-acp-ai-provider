@@ -65,6 +65,7 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     getIPCServer: mock(() => createMockIPCServer()),
     getLaneRouter: mock(() => mockLaneRouter),
     setPromptCallback: mock(() => {}),
+    waitForToolsReady: mock(() => Promise.resolve()),
     ...overrides,
   } as unknown as ACPClient
 }
@@ -239,6 +240,68 @@ describe("KiroACPLanguageModel", () => {
       await collectStream(result.stream)
 
       expect(client.setModel).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("mode switching — waitForToolsReady", () => {
+    test("calls waitForToolsReady after setMode when mode differs", async () => {
+      const client = createMockClient({
+        getAgentName: mock(() => "opencode"),
+        createSession: mock(() =>
+          Promise.resolve({
+            sessionId: "sess-1",
+            modes: { currentModeId: "kiro_default", availableModes: [] },
+            models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+          } satisfies ACPSession),
+        ),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+      await collectStream(result.stream)
+
+      expect(client.setMode).toHaveBeenCalledWith("sess-1", "opencode")
+      expect(client.waitForToolsReady).toHaveBeenCalledWith({ timeoutMs: 3000 })
+    })
+
+    test("does not call waitForToolsReady when mode already matches", async () => {
+      const client = createMockClient({
+        getAgentName: mock(() => "opencode"),
+        createSession: mock(() =>
+          Promise.resolve({
+            sessionId: "sess-1",
+            modes: { currentModeId: "opencode", availableModes: [] },
+            models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+          } satisfies ACPSession),
+        ),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+      await collectStream(result.stream)
+
+      expect(client.setMode).not.toHaveBeenCalled()
+      expect(client.waitForToolsReady).not.toHaveBeenCalled()
     })
   })
 
@@ -1320,6 +1383,131 @@ describe("KiroACPLanguageModel", () => {
 
       // File should not have been rewritten (same mtime)
       expect(mtime2).toBe(mtime1)
+    })
+
+    test("calls waitForToolsReady when tools change mid-session", async () => {
+      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      mkdirSync(toolsDir, { recursive: true })
+      const toolsFile = join(toolsDir, "tools.json")
+
+      const client = createMockClient({
+        isRunning: mock(() => true),
+        getOrCreateToolsFilePath: mock(() => toolsFile),
+        getCwd: mock(() => "/tmp/project"),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "done" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const tools1: LanguageModelV3FunctionTool[] = [
+        {
+          type: "function",
+          name: "bash",
+          description: "Execute a bash command",
+          inputSchema: {
+            type: "object",
+            properties: { command: { type: "string" } },
+            required: ["command"],
+          },
+        },
+      ]
+
+      // First call — writes tools, client already running
+      const r1 = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { tools: tools1 },
+        ),
+      )
+      await collectStream(r1.stream)
+
+      // waitForToolsReady should have been called (tools changed + client running)
+      expect(client.waitForToolsReady).toHaveBeenCalledWith({
+        timeoutMs: 3000,
+        expectedTools: ["bash"],
+      })
+
+      // Reset mock to check second call
+      ;(client.waitForToolsReady as ReturnType<typeof mock>).mockClear()
+
+      // Second call with different tools — should trigger waitForToolsReady again
+      const tools2: LanguageModelV3FunctionTool[] = [
+        ...tools1,
+        {
+          type: "function",
+          name: "read",
+          description: "Read a file",
+          inputSchema: {
+            type: "object",
+            properties: { filePath: { type: "string" } },
+            required: ["filePath"],
+          },
+        },
+      ]
+
+      const r2 = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello again" }] }],
+          { tools: tools2 },
+        ),
+      )
+      await collectStream(r2.stream)
+
+      expect(client.waitForToolsReady).toHaveBeenCalledWith({
+        timeoutMs: 3000,
+        expectedTools: ["bash", "read"],
+      })
+    })
+
+    test("does not call waitForToolsReady when tools change but client is not running", async () => {
+      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      mkdirSync(toolsDir, { recursive: true })
+      const toolsFile = join(toolsDir, "tools.json")
+
+      const client = createMockClient({
+        isRunning: mock(() => false),
+        getOrCreateToolsFilePath: mock(() => toolsFile),
+        getCwd: mock(() => "/tmp/project"),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "done" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const tools: LanguageModelV3FunctionTool[] = [
+        {
+          type: "function",
+          name: "bash",
+          description: "Execute a bash command",
+          inputSchema: {
+            type: "object",
+            properties: { command: { type: "string" } },
+            required: ["command"],
+          },
+        },
+      ]
+
+      const result = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { tools },
+        ),
+      )
+      await collectStream(result.stream)
+
+      // Client not running → no need to wait for notification
+      expect(client.waitForToolsReady).not.toHaveBeenCalled()
     })
   })
 

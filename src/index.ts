@@ -5,6 +5,7 @@ export {
   ACPConnectionError,
   type ACPClientOptions,
   type ACPSession,
+  type AvailableTool,
   type ContentBlock,
   type Mode,
   type Model,

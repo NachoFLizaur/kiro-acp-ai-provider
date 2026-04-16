@@ -79,6 +79,13 @@ export interface CommandResult {
   data?: Record<string, unknown>
 }
 
+/** A tool reported as available by kiro-cli via `_kiro.dev/commands/available`. */
+export interface AvailableTool {
+  name: string
+  source: string
+  description?: string
+}
+
 /** Cached metadata for a session. */
 export interface SessionMetadata {
   sessionId: string
@@ -207,6 +214,8 @@ export class ACPClient {
   private toolsFilePath: string | null = null
   private ipcServer: IPCServer | null = null
   private ipcPort: number | null = null
+  private availableTools: AvailableTool[] = []
+  private toolsReadyListeners = new Set<(tools: AvailableTool[]) => void>()
 
   constructor(options: ACPClientOptions) {
     this.options = options
@@ -352,6 +361,8 @@ export class ACPClient {
     this.pending.clear()
     this.metadata.clear()
     this.promptCallbacks.clear()
+    this.toolsReadyListeners.clear()
+    this.availableTools = []
 
     // Stop IPC server
     if (this.ipcServer) {
@@ -491,6 +502,11 @@ export class ACPClient {
     return this.options.agent
   }
 
+  /** Get the current list of tools that kiro-cli has available. */
+  getAvailableTools(): AvailableTool[] {
+    return [...this.availableTools]
+  }
+
   /** Get the path to the tools JSON file used by the MCP bridge. */
   getToolsFilePath(): string | null {
     return this.toolsFilePath
@@ -542,6 +558,61 @@ export class ACPClient {
    */
   setPromptCallback(sessionId: string, callback: (update: SessionUpdate) => void): void {
     this.promptCallbacks.set(sessionId, callback)
+  }
+
+  /**
+   * Wait for kiro-cli to send a `_kiro.dev/commands/available` notification.
+   *
+   * This notification fires after mode switches and tool list updates, signaling
+   * that kiro-cli has finished processing the change and the new tool set is ready.
+   *
+   * If `expectedTools` is provided, waits until ALL expected tool names are present
+   * in the notification payload. If the timeout expires first, resolves with
+   * whatever tools are currently available.
+   */
+  waitForToolsReady(options?: {
+    timeoutMs?: number
+    expectedTools?: string[]
+  }): Promise<AvailableTool[]> {
+    const { timeoutMs = 5000, expectedTools } = options ?? {}
+
+    return new Promise<AvailableTool[]>((resolve) => {
+      const timer = setTimeout(() => {
+        this.removeToolsReadyListener(handler)
+        resolve(this.availableTools) // resolve with whatever we have
+      }, timeoutMs)
+
+      const handler = (tools: AvailableTool[]): void => {
+        // If no expected tools specified, resolve immediately on any notification
+        if (!expectedTools) {
+          clearTimeout(timer)
+          this.removeToolsReadyListener(handler)
+          resolve(tools)
+          return
+        }
+
+        // Check if all expected tools are present
+        const names = new Set(tools.map((t) => t.name))
+        const allPresent = expectedTools.every((name) => names.has(name))
+        if (allPresent) {
+          clearTimeout(timer)
+          this.removeToolsReadyListener(handler)
+          resolve(tools)
+        }
+        // If not all present, keep waiting for next notification
+      }
+      this.addToolsReadyListener(handler)
+    })
+  }
+
+  /** Register a listener for `_kiro.dev/commands/available` notifications. */
+  addToolsReadyListener(listener: (tools: AvailableTool[]) => void): void {
+    this.toolsReadyListeners.add(listener)
+  }
+
+  /** Remove a previously registered tools-ready listener. */
+  removeToolsReadyListener(listener: (tools: AvailableTool[]) => void): void {
+    this.toolsReadyListeners.delete(listener)
   }
 
   // -------------------------------------------------------------------------
@@ -809,6 +880,17 @@ export class ACPClient {
         // Kiro-specific session updates (e.g. tool_call_chunk)
         this.handleSessionUpdate(params)
         break
+
+      case "_kiro.dev/commands/available": {
+        // Kiro-cli has finished processing a mode switch or tool list update.
+        // Parse the available tools and notify all waiters so they can proceed.
+        const tools = (Array.isArray(params.tools) ? params.tools : []) as AvailableTool[]
+        this.availableTools = tools
+        for (const listener of this.toolsReadyListeners) {
+          listener(tools)
+        }
+        break
+      }
 
       default:
         // Forward all extension notifications to the optional handler

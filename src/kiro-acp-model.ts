@@ -290,10 +290,15 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       const toolsChanged = this.writeToolsFile(tools)
 
       if (this.client.isRunning() && toolsChanged) {
-        // Mid-session tool change — the client is already running, so kiro
-        // needs time to process the tools/list_changed notification from the
-        // MCP bridge file watcher (100ms debounce) and re-query tools/list.
-        await new Promise(resolve => setTimeout(resolve, 300))
+        // Mid-session tool change — wait for kiro-cli to process the
+        // tools/list_changed notification and send _kiro.dev/commands/available.
+        const toolNames = tools
+          .filter((t): t is LanguageModelV3FunctionTool => t.type === "function")
+          .map((t) => t.name)
+        await this.client.waitForToolsReady({
+          timeoutMs: 3000,
+          expectedTools: toolNames,
+        })
       }
       // If client not running yet, no delay needed — kiro will read on startup
     }
@@ -357,8 +362,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     if (session.modes.currentModeId !== agentName) {
       await this.client.setMode(session.sessionId, agentName)
       session.modes.currentModeId = agentName
-      // Wait for kiro-cli to process the mode switch and update tools
-      await new Promise(resolve => setTimeout(resolve, 500))
+      // Wait for kiro-cli to process the mode switch and send
+      // _kiro.dev/commands/available with the updated tool set.
+      await this.client.waitForToolsReady({ timeoutMs: 3000 })
     }
   }
 
