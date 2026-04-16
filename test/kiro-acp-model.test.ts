@@ -1,6 +1,7 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test"
 import { KiroACPLanguageModel, type KiroACPModelConfig } from "../src/kiro-acp-model"
 import type { ACPClient, ACPSession, SessionUpdate, PromptOptions } from "../src/acp-client"
+import type { IPCServer, PendingToolCall, ToolCallHandler, ToolResultRequest } from "../src/ipc-server"
 import type {
   LanguageModelV3CallOptions,
   LanguageModelV3StreamPart,
@@ -14,6 +15,20 @@ import { tmpdir } from "node:os"
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Create a minimal mock IPC server. */
+function createMockIPCServer(overrides: Partial<IPCServer> = {}): IPCServer {
+  return {
+    start: mock(() => Promise.resolve(0)),
+    stop: mock(() => Promise.resolve()),
+    getPort: mock(() => null),
+    getPendingCount: mock(() => 0),
+    setToolCallHandler: mock(() => {}),
+    clearToolCallHandler: mock(() => {}),
+    resolveToolResult: mock(() => {}),
+    ...overrides,
+  }
+}
 
 /** Create a minimal mock ACPClient. */
 function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
@@ -45,6 +60,8 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     getToolsFilePath: mock(() => null),
     getCwd: mock(() => "/tmp/test"),
     getIpcPort: mock(() => null),
+    getIPCServer: mock(() => createMockIPCServer()),
+    setPromptCallback: mock(() => {}),
     ...overrides,
   } as unknown as ACPClient
 }
@@ -95,7 +112,6 @@ describe("KiroACPLanguageModel", () => {
     test("creates session lazily on first doStream call", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {
-          // Emit a simple text chunk then complete
           opts.onUpdate({
             sessionUpdate: "agent_message_chunk",
             content: { text: "hi" },
@@ -175,7 +191,6 @@ describe("KiroACPLanguageModel", () => {
   describe("model switching", () => {
     test("calls setModel when modelId differs from session default", async () => {
       const client = createMockClient({
-        // Session default is claude-sonnet-4.6
         createSession: mock(() =>
           Promise.resolve({
             sessionId: "sess-1",
@@ -192,7 +207,6 @@ describe("KiroACPLanguageModel", () => {
         }),
       } as unknown as Partial<ACPClient>)
 
-      // Request a different model
       const model = new KiroACPLanguageModel("claude-opus-4.6", { client })
 
       const result = await model.doStream(
@@ -316,7 +330,6 @@ describe("KiroACPLanguageModel", () => {
         ]),
       )
 
-      // The prompt sent to ACP should contain system instructions wrapped in tags
       expect(capturedPrompt).toHaveLength(1)
       const textContent = (capturedPrompt[0] as { text: string }).text
       expect(textContent).toContain("<system_instructions>")
@@ -353,33 +366,40 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
-  describe("doStream() — tool calls", () => {
-    test("emits tool-input-start, tool-call, tool-result for provider-executed tools", async () => {
+  describe("doStream() — tool calls via IPC", () => {
+    test("emits tool-call parts when IPC notifies of a tool call", async () => {
+      // Create a mock IPC server that captures the handler
+      let capturedHandler: ToolCallHandler | null = null
+      const mockIPC = createMockIPCServer({
+        setToolCallHandler: mock((handler: ToolCallHandler) => {
+          capturedHandler = handler
+        }),
+      })
+
       const client = createMockClient({
+        getIPCServer: mock(() => mockIPC),
         prompt: mock(async (opts: PromptOptions) => {
-          // Model decides to call a tool — ACP sends title, not name
-          opts.onUpdate({
-            sessionUpdate: "tool_call",
-            toolCallId: "tc-1",
-            title: "Running: @opencode-tools/bash",
-            status: "in_progress",
-            rawInput: { command: "echo hello" },
-          })
-
-          // Tool completes
-          opts.onUpdate({
-            sessionUpdate: "tool_call_update",
-            toolCallId: "tc-1",
-            status: "completed",
-            output: "hello\n",
-          })
-
-          // Model responds with text after tool
+          // Simulate kiro emitting some text, then a tool call arrives via IPC
           opts.onUpdate({
             sessionUpdate: "agent_message_chunk",
-            content: { text: "Done!" },
+            content: { text: "Let me check..." },
           })
 
+          // Simulate the IPC tool call notification (happens when MCP bridge
+          // sends POST /tool/pending to the IPC server)
+          if (capturedHandler) {
+            capturedHandler({
+              callId: "tc-1",
+              toolName: "bash",
+              args: { command: "echo hello" },
+            })
+          }
+
+          // The prompt stays pending (kiro is blocked on MCP bridge)
+          // We need to return eventually for the test, but in real usage
+          // this promise would stay pending until the tool result unblocks it.
+          // For this test, we wait a bit then return.
+          await new Promise((r) => setTimeout(r, 200))
           return { stopReason: "end_turn" }
         }),
       } as unknown as Partial<ACPClient>)
@@ -393,22 +413,19 @@ describe("KiroACPLanguageModel", () => {
       const parts = await collectStream(result.stream)
       const types = parts.map((p) => p.type)
 
-      // Should have tool-input-start, tool-input-delta, tool-input-end, tool-call, tool-result
+      // Should have text before tool call
+      expect(types).toContain("text-start")
+      expect(types).toContain("text-delta")
+      expect(types).toContain("text-end")
+
+      // Should have tool-call parts (no providerExecuted flag)
       expect(types).toContain("tool-input-start")
       expect(types).toContain("tool-input-delta")
       expect(types).toContain("tool-input-end")
       expect(types).toContain("tool-call")
-      expect(types).toContain("tool-result")
 
-      // Verify tool-input-start
-      const toolStart = parts.find((p) => p.type === "tool-input-start")!
-      expect(toolStart).toMatchObject({
-        type: "tool-input-start",
-        id: "tc-1",
-        toolName: "bash",
-        providerExecuted: true,
-        dynamic: true,
-      })
+      // Should NOT have tool-result (harness provides results)
+      expect(types).not.toContain("tool-result")
 
       // Verify tool-call
       const toolCall = parts.find((p) => p.type === "tool-call")!
@@ -417,47 +434,37 @@ describe("KiroACPLanguageModel", () => {
         toolCallId: "tc-1",
         toolName: "bash",
         input: JSON.stringify({ command: "echo hello" }),
-        providerExecuted: true,
-        dynamic: true,
       })
+      // No providerExecuted flag
+      expect((toolCall as any).providerExecuted).toBeUndefined()
 
-      // Verify tool-result
-      const toolResult = parts.find((p) => p.type === "tool-result")!
-      expect(toolResult).toMatchObject({
-        type: "tool-result",
-        toolCallId: "tc-1",
-        toolName: "bash",
-        result: "hello\n",
-        dynamic: true,
-      })
-
-      // Finish reason should be tool-calls since we had tool calls
+      // Finish reason should be tool-calls
       const finish = parts.find((p) => p.type === "finish")!
       if (finish.type === "finish") {
         expect(finish.finishReason.unified).toBe("tool-calls")
       }
     })
 
-    test("handles tool_call_update with rawInput when initial tool_call had no rawInput", async () => {
+    test("emits tool-call without prior text when model immediately calls a tool", async () => {
+      let capturedHandler: ToolCallHandler | null = null
+      const mockIPC = createMockIPCServer({
+        setToolCallHandler: mock((handler: ToolCallHandler) => {
+          capturedHandler = handler
+        }),
+      })
+
       const client = createMockClient({
-        prompt: mock(async (opts: PromptOptions) => {
-          // Tool call without rawInput initially — uses name fallback
-          opts.onUpdate({
-            sessionUpdate: "tool_call",
-            toolCallId: "tc-2",
-            name: "read_file",
-            status: "in_progress",
-          })
-
-          // Completed with rawInput in the update
-          opts.onUpdate({
-            sessionUpdate: "tool_call_update",
-            toolCallId: "tc-2",
-            status: "completed",
-            rawInput: { filePath: "/tmp/test.txt" },
-            output: "file contents here",
-          })
-
+        getIPCServer: mock(() => mockIPC),
+        prompt: mock(async () => {
+          // Tool call immediately, no text
+          if (capturedHandler) {
+            capturedHandler({
+              callId: "tc-2",
+              toolName: "read_file",
+              args: { filePath: "/tmp/test.txt" },
+            })
+          }
+          await new Promise((r) => setTimeout(r, 200))
           return { stopReason: "end_turn" }
         }),
       } as unknown as Partial<ACPClient>)
@@ -469,20 +476,12 @@ describe("KiroACPLanguageModel", () => {
       )
 
       const parts = await collectStream(result.stream)
+      const types = parts.map((p) => p.type)
 
-      // Should have tool-input-delta from the update
-      const inputDelta = parts.find((p) => p.type === "tool-input-delta")
-      expect(inputDelta).toBeDefined()
-      if (inputDelta?.type === "tool-input-delta") {
-        expect(inputDelta.delta).toBe(JSON.stringify({ filePath: "/tmp/test.txt" }))
-      }
-
-      // Should have tool-result
-      const toolResult = parts.find((p) => p.type === "tool-result")
-      expect(toolResult).toBeDefined()
-      if (toolResult?.type === "tool-result") {
-        expect(toolResult.result).toBe("file contents here")
-      }
+      // Should have tool-call but no text
+      expect(types).toContain("tool-call")
+      expect(types).not.toContain("text-delta")
+      expect(types).toContain("finish")
     })
   })
 
@@ -701,7 +700,6 @@ describe("KiroACPLanguageModel", () => {
     test("estimates tokens from streamed text and contextUsagePercentage", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {
-          // Stream ~400 characters of text → ~100 output tokens
           opts.onUpdate({
             sessionUpdate: "agent_message_chunk",
             content: { text: "a".repeat(200) },
@@ -731,13 +729,9 @@ describe("KiroACPLanguageModel", () => {
 
       expect(finish).toBeDefined()
       if (finish?.type === "finish") {
-        // 400 chars / 4 = 100 output tokens
         expect(finish.usage.outputTokens.total).toBe(100)
         expect(finish.usage.outputTokens.text).toBe(100)
         expect(finish.usage.outputTokens.reasoning).toBeUndefined()
-
-        // contextUsagePercentage is 0-100 scale: (1.14 / 100) * 1_000_000 = 11_400
-        // input = 11_400 - 100 = 11_300
         expect(finish.usage.inputTokens.total).toBe(11_300)
         expect(finish.usage.inputTokens.noCache).toBe(11_300)
         expect(finish.usage.inputTokens.cacheRead).toBeUndefined()
@@ -750,11 +744,10 @@ describe("KiroACPLanguageModel", () => {
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
             sessionUpdate: "agent_message_chunk",
-            content: { text: "short reply" }, // 11 chars → ~3 tokens
+            content: { text: "short reply" },
           })
           return { stopReason: "end_turn" }
         }),
-        // No metadata at all
         getMetadata: mock(() => undefined),
       } as unknown as Partial<ACPClient>)
 
@@ -769,9 +762,7 @@ describe("KiroACPLanguageModel", () => {
 
       expect(finish).toBeDefined()
       if (finish?.type === "finish") {
-        // Output tokens still estimated from text
         expect(finish.usage.outputTokens.total).toBe(Math.round(11 / 4))
-        // No contextUsagePercentage → input tokens undefined
         expect(finish.usage.inputTokens.total).toBeUndefined()
       }
     })
@@ -779,20 +770,7 @@ describe("KiroACPLanguageModel", () => {
     test("returns undefined output tokens when no text was streamed", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {
-          // Tool call only, no text output
-          opts.onUpdate({
-            sessionUpdate: "tool_call",
-            toolCallId: "tc-1",
-            title: "Running: @opencode-tools/bash",
-            status: "in_progress",
-            rawInput: { command: "ls" },
-          })
-          opts.onUpdate({
-            sessionUpdate: "tool_call_update",
-            toolCallId: "tc-1",
-            status: "completed",
-            output: "file1.ts",
-          })
+          // No text output at all — just completes
           return { stopReason: "end_turn" }
         }),
         getMetadata: mock(() => ({
@@ -813,10 +791,8 @@ describe("KiroACPLanguageModel", () => {
 
       expect(finish).toBeDefined()
       if (finish?.type === "finish") {
-        // No text was streamed → output tokens undefined
         expect(finish.usage.outputTokens.total).toBeUndefined()
         expect(finish.usage.outputTokens.text).toBeUndefined()
-        // contextUsagePercentage 0-100 scale: (0.05 / 100) * 1_000_000 = 500
         expect(finish.usage.inputTokens.total).toBe(500)
         expect(finish.usage.inputTokens.noCache).toBe(500)
       }
@@ -845,29 +821,31 @@ describe("KiroACPLanguageModel", () => {
         makeCallOptions([{ role: "user", content: [{ type: "text", text: "greet me" }] }]),
       )
 
-      // Should have a single text content block with concatenated text
       expect(result.content).toHaveLength(1)
       expect(result.content[0]).toEqual({ type: "text", text: "Hello world!" })
       expect(result.finishReason.unified).toBe("stop")
       expect(result.warnings).toEqual([])
     })
 
-    test("returns tool-call and tool-result content blocks", async () => {
+    test("returns tool-call content blocks (no tool-result — harness provides)", async () => {
+      let capturedHandler: ToolCallHandler | null = null
+      const mockIPC = createMockIPCServer({
+        setToolCallHandler: mock((handler: ToolCallHandler) => {
+          capturedHandler = handler
+        }),
+      })
+
       const client = createMockClient({
-        prompt: mock(async (opts: PromptOptions) => {
-          opts.onUpdate({
-            sessionUpdate: "tool_call",
-            toolCallId: "tc-1",
-            title: "Running: @opencode-tools/bash",
-            status: "in_progress",
-            rawInput: { command: "ls" },
-          })
-          opts.onUpdate({
-            sessionUpdate: "tool_call_update",
-            toolCallId: "tc-1",
-            status: "completed",
-            output: "file1.ts\nfile2.ts",
-          })
+        getIPCServer: mock(() => mockIPC),
+        prompt: mock(async () => {
+          if (capturedHandler) {
+            capturedHandler({
+              callId: "tc-1",
+              toolName: "bash",
+              args: { command: "ls" },
+            })
+          }
+          await new Promise((r) => setTimeout(r, 200))
           return { stopReason: "end_turn" }
         }),
       } as unknown as Partial<ACPClient>)
@@ -879,21 +857,18 @@ describe("KiroACPLanguageModel", () => {
       )
 
       const toolCall = result.content.find((c) => c.type === "tool-call")
-      const toolResult = result.content.find((c) => c.type === "tool-result")
-
       expect(toolCall).toBeDefined()
-      expect(toolResult).toBeDefined()
 
       if (toolCall?.type === "tool-call") {
         expect(toolCall.toolName).toBe("bash")
         expect(toolCall.input).toBe(JSON.stringify({ command: "ls" }))
-        expect(toolCall.providerExecuted).toBe(true)
+        // No providerExecuted flag
+        expect((toolCall as any).providerExecuted).toBeUndefined()
       }
 
-      if (toolResult?.type === "tool-result") {
-        expect(toolResult.toolName).toBe("bash")
-        expect(toolResult.result).toBe("file1.ts\nfile2.ts")
-      }
+      // No tool-result — harness provides results
+      const toolResult = result.content.find((c) => c.type === "tool-result")
+      expect(toolResult).toBeUndefined()
     })
 
     test("returns reasoning content blocks", async () => {
@@ -954,12 +929,9 @@ describe("KiroACPLanguageModel", () => {
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
-      // Should only contain the last user message
       expect(textContent).toBe("follow up")
-      // Should NOT contain previous user messages or assistant messages
       expect(textContent).not.toContain("first question")
       expect(textContent).not.toContain("first answer")
-      expect(textContent).not.toContain("[assistant]")
     })
 
     test("concatenates multiple system messages", async () => {
@@ -1019,8 +991,6 @@ describe("KiroACPLanguageModel", () => {
                 toolCallId: "tc-1",
                 toolName: "bash",
                 input: JSON.stringify({ command: "echo hello" }),
-                providerExecuted: true,
-                dynamic: true,
               },
             ],
           },
@@ -1040,19 +1010,14 @@ describe("KiroACPLanguageModel", () => {
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
-      // Should only contain the last user message
       expect(textContent).toBe("what was the output?")
-      // Should NOT contain tool results or previous messages
       expect(textContent).not.toContain("hello\n")
       expect(textContent).not.toContain("bash")
-      expect(textContent).not.toContain("tool-result")
-      expect(textContent).not.toContain("run a command")
     })
   })
 
   describe("syncTools() — dynamic tool synchronization", () => {
     test("writes AI SDK function tools to the tools file in MCP format", async () => {
-      // Create a temp tools file
       const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
       mkdirSync(toolsDir, { recursive: true })
       const toolsFile = join(toolsDir, "tools.json")
@@ -1106,14 +1071,12 @@ describe("KiroACPLanguageModel", () => {
       )
       await collectStream(result.stream)
 
-      // Verify the tools file was written
       expect(existsSync(toolsFile)).toBe(true)
       const written = JSON.parse(readFileSync(toolsFile, "utf-8"))
 
       expect(written.tools).toHaveLength(2)
       expect(written.cwd).toBe("/tmp/project")
 
-      // Verify MCP format
       expect(written.tools[0]).toEqual({
         name: "bash",
         description: "Execute a bash command",
@@ -1188,7 +1151,6 @@ describe("KiroACPLanguageModel", () => {
       await collectStream(result.stream)
 
       const written = JSON.parse(readFileSync(toolsFile, "utf-8"))
-      // Only the function tool should be written
       expect(written.tools).toHaveLength(1)
       expect(written.tools[0].name).toBe("bash")
     })
@@ -1214,12 +1176,10 @@ describe("KiroACPLanguageModel", () => {
       const result = await model.doStream(
         makeCallOptions(
           [{ role: "user", content: [{ type: "text", text: "hello" }] }],
-          // No tools
         ),
       )
       await collectStream(result.stream)
 
-      // Tools file should NOT have been created
       expect(existsSync(toolsFile)).toBe(false)
     })
 
@@ -1252,7 +1212,6 @@ describe("KiroACPLanguageModel", () => {
         },
       ]
 
-      // Should not throw even though tools are provided but no file path
       const result = await model.doStream(
         makeCallOptions(
           [{ role: "user", content: [{ type: "text", text: "hello" }] }],
@@ -1285,7 +1244,6 @@ describe("KiroACPLanguageModel", () => {
         {
           type: "function",
           name: "glob",
-          // No description
           inputSchema: {
             type: "object",
             properties: {
@@ -1306,6 +1264,126 @@ describe("KiroACPLanguageModel", () => {
 
       const written = JSON.parse(readFileSync(toolsFile, "utf-8"))
       expect(written.tools[0].description).toBe("")
+    })
+  })
+
+  describe("doStream() — tool result resumption", () => {
+    test("detects tool results in prompt and resumes pending turn", async () => {
+      // This test simulates the full cycle:
+      // 1. doStream() → tool call → stream closes with tool-calls
+      // 2. doStream() with tool result → resumes → text → stream closes with stop
+
+      let capturedHandler: ToolCallHandler | null = null
+      let resolvedResults: ToolResultRequest[] = []
+      const mockIPC = createMockIPCServer({
+        setToolCallHandler: mock((handler: ToolCallHandler) => {
+          capturedHandler = handler
+        }),
+        resolveToolResult: mock((req: ToolResultRequest) => {
+          resolvedResults.push(req)
+        }),
+      })
+
+      let promptCallCount = 0
+      let promptResolve: ((value: { stopReason: string }) => void) | null = null
+
+      const client = createMockClient({
+        getIPCServer: mock(() => mockIPC),
+        setPromptCallback: mock(() => {}),
+        prompt: mock(async (opts: PromptOptions) => {
+          promptCallCount++
+          // First call: emit text, then tool call via IPC, then stay pending
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "Checking..." },
+          })
+
+          // Trigger tool call via IPC
+          if (capturedHandler) {
+            capturedHandler({
+              callId: "tc-resume",
+              toolName: "bash",
+              args: { command: "ls" },
+            })
+          }
+
+          // Return a promise that we control
+          return new Promise<{ stopReason: string }>((resolve) => {
+            promptResolve = resolve
+          })
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      // Step 1: First doStream — should get tool call and close
+      const result1 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "list files" }] }]),
+      )
+
+      const parts1 = await collectStream(result1.stream)
+      const types1 = parts1.map((p) => p.type)
+
+      expect(types1).toContain("tool-call")
+      expect(types1).toContain("finish")
+
+      const finish1 = parts1.find((p) => p.type === "finish")!
+      if (finish1.type === "finish") {
+        expect(finish1.finishReason.unified).toBe("tool-calls")
+      }
+
+      // Step 2: Resolve the prompt (simulating kiro continuing after tool result)
+      // In real usage, resolveToolResult unblocks the MCP bridge which unblocks kiro
+      setTimeout(() => {
+        if (promptResolve) {
+          promptResolve({ stopReason: "end_turn" })
+        }
+      }, 50)
+
+      // Step 3: Second doStream with tool result
+      const result2 = await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "list files" }] },
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool-call",
+                toolCallId: "tc-resume",
+                toolName: "bash",
+                input: JSON.stringify({ command: "ls" }),
+              },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "tc-resume",
+                toolName: "bash",
+                output: { type: "text" as const, value: "file1.ts\nfile2.ts" },
+              },
+            ],
+          },
+        ]),
+      )
+
+      const parts2 = await collectStream(result2.stream)
+      const finish2 = parts2.find((p) => p.type === "finish")
+
+      expect(finish2).toBeDefined()
+      if (finish2?.type === "finish") {
+        expect(finish2.finishReason.unified).toBe("stop")
+      }
+
+      // Verify the tool result was sent to IPC
+      expect(resolvedResults).toHaveLength(1)
+      expect(resolvedResults[0].callId).toBe("tc-resume")
+      expect(resolvedResults[0].result).toBe("file1.ts\nfile2.ts")
+
+      // Only one prompt call should have been made (the second doStream resumes)
+      expect(promptCallCount).toBe(1)
     })
   })
 })

@@ -9,16 +9,18 @@
 // It reads tool definitions from a JSON file and serves them via the MCP
 // protocol over newline-delimited JSON-RPC on stdio.
 //
+// All tool calls are delegated to the harness via IPC. The bridge does NOT
+// execute any tools locally — it acts as a pure relay between kiro-cli and
+// the harness's tool execution pipeline.
+//
 // Communication:
 //   stdin  ← JSON-RPC requests from kiro-cli (one JSON object per line)
 //   stdout → JSON-RPC responses to kiro-cli (one JSON object per line)
 //   stderr → Debug logging (does not interfere with the protocol)
 // ---------------------------------------------------------------------------
 
-import { execSync } from "node:child_process"
 import { createInterface } from "node:readline"
 import * as fs from "node:fs"
-import * as path from "node:path"
 import * as http from "node:http"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { ToolExecuteResponse } from "./ipc-server"
@@ -112,289 +114,6 @@ function loadToolsFile(toolsPath: string): MCPToolsFile {
     log("error", `Failed to load tools file: ${err}`)
     process.exit(1)
   }
-}
-
-// ---------------------------------------------------------------------------
-// Tool name mapping: opencode tool names → bridge executor names
-// ---------------------------------------------------------------------------
-// When opencode passes dynamic tools (e.g. "read", "edit", "write"), we need
-// to map them to the bridge's built-in executor names (e.g. "read_file",
-// "edit_file", "write_file"). Tools that have no built-in executor are
-// reported as unavailable.
-
-const TOOL_NAME_TO_EXECUTOR: Record<string, string> = {
-  // Direct matches (opencode name === executor name)
-  bash: "bash",
-  glob: "glob",
-  grep: "grep",
-  // opencode names → bridge executor names
-  read: "read_file",
-  edit: "edit_file",
-  multiedit: "edit_file",
-  write: "write_file",
-  list: "list_directory",
-  // Bridge-native names (from default tools)
-  read_file: "read_file",
-  write_file: "write_file",
-  edit_file: "edit_file",
-  list_directory: "list_directory",
-}
-
-/** Tools that are delegated to the host runtime via IPC. */
-const DELEGATED_TOOLS = new Set([
-  "task",
-  "question",
-  "todowrite",
-  "skill",
-])
-
-/** Tools that are known but not executable anywhere. */
-const UNAVAILABLE_TOOLS = new Set([
-  "webfetch",
-  "websearch",
-  "web-research_multi_search",
-  "web-research_fetch_pages",
-  "todo",
-])
-
-// ---------------------------------------------------------------------------
-// Built-in tool executors
-// ---------------------------------------------------------------------------
-
-const DEFAULT_TOOL_TIMEOUT_MS = 30_000
-
-type ToolExecutor = (
-  args: Record<string, unknown>,
-  cwd: string,
-) => Promise<string>
-
-const EXECUTORS: Record<string, ToolExecutor> = {
-  bash: async (args, cwd) => {
-    const command = args.command as string
-    if (!command) throw new Error("Missing required argument: command")
-
-    const timeout = (args.timeout as number) ?? DEFAULT_TOOL_TIMEOUT_MS
-    const workdir = (args.workdir as string) ?? cwd
-
-    try {
-      const result = execSync(command, {
-        cwd: workdir,
-        timeout,
-        encoding: "utf-8",
-        maxBuffer: 10 * 1024 * 1024, // 10MB
-        stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env },
-      })
-      return result
-    } catch (err: unknown) {
-      const execErr = err as {
-        stdout?: string
-        stderr?: string
-        status?: number
-        signal?: string
-        message?: string
-      }
-      const stdout = execErr.stdout ?? ""
-      const stderr = execErr.stderr ?? ""
-      const status = execErr.status ?? "unknown"
-      const signal = execErr.signal ?? ""
-
-      let output = ""
-      if (stdout) output += stdout
-      if (stderr) output += (output ? "\n" : "") + stderr
-      if (!output) output = execErr.message ?? "Command failed"
-
-      return `[exit code: ${status}${signal ? `, signal: ${signal}` : ""}]\n${output}`
-    }
-  },
-
-  read_file: async (args, _cwd) => {
-    const filePath = args.filePath as string
-    if (!filePath) throw new Error("Missing required argument: filePath")
-
-    const offset = Math.max(1, (args.offset as number) ?? 1)
-    const limit = (args.limit as number) ?? 2000
-
-    const content = fs.readFileSync(filePath, "utf-8")
-    const lines = content.split("\n")
-
-    // Apply offset (1-indexed) and limit
-    const startIdx = offset - 1
-    const slice = lines.slice(startIdx, startIdx + limit)
-
-    // Prefix each line with its line number
-    return slice.map((line, i) => `${startIdx + i + 1}: ${line}`).join("\n")
-  },
-
-  write_file: async (args, _cwd) => {
-    const filePath = args.filePath as string
-    const content = args.content as string
-    if (!filePath) throw new Error("Missing required argument: filePath")
-    if (content === undefined || content === null) {
-      throw new Error("Missing required argument: content")
-    }
-
-    // Create parent directories if needed
-    const dir = path.dirname(filePath)
-    fs.mkdirSync(dir, { recursive: true })
-
-    fs.writeFileSync(filePath, content, "utf-8")
-    return `Successfully wrote ${content.length} characters to ${filePath}`
-  },
-
-  edit_file: async (args, _cwd) => {
-    const filePath = args.filePath as string
-    const oldString = args.oldString as string
-    const newString = args.newString as string
-    const replaceAll = (args.replaceAll as boolean) ?? false
-
-    if (!filePath) throw new Error("Missing required argument: filePath")
-    if (oldString === undefined) throw new Error("Missing required argument: oldString")
-    if (newString === undefined) throw new Error("Missing required argument: newString")
-
-    let content = fs.readFileSync(filePath, "utf-8")
-
-    if (!content.includes(oldString)) {
-      throw new Error("oldString not found in file content")
-    }
-
-    if (replaceAll) {
-      // Replace all occurrences safely (handles case where newString contains oldString)
-      content = content.split(oldString).join(newString)
-    } else {
-      // Check for multiple matches
-      const firstIdx = content.indexOf(oldString)
-      const secondIdx = content.indexOf(oldString, firstIdx + 1)
-      if (secondIdx !== -1) {
-        throw new Error(
-          "Found multiple matches for oldString. Provide more surrounding context to identify the correct match, or use replaceAll.",
-        )
-      }
-      content = content.replace(oldString, newString)
-    }
-
-    fs.writeFileSync(filePath, content, "utf-8")
-    return `Successfully edited ${filePath}`
-  },
-
-  glob: async (args, cwd) => {
-    const pattern = args.pattern as string
-    if (!pattern) throw new Error("Missing required argument: pattern")
-
-    const searchPath = (args.path as string) ?? cwd
-
-    // Try Bun.Glob first (Bun runtime only), then fall back to Node.js-compatible approach
-    if (typeof globalThis.Bun !== "undefined") {
-      try {
-        const glob = new Bun.Glob(pattern)
-        const matches: string[] = []
-        for await (const match of glob.scan({ cwd: searchPath, absolute: true })) {
-          matches.push(match)
-        }
-        if (matches.length === 0) {
-          return "No files found matching pattern: " + pattern
-        }
-        return matches.join("\n")
-      } catch {
-        // Fall through to Node.js fallback
-      }
-    }
-
-    // Node.js fallback: use fs.glob (Node 22+) or find command
-    try {
-      // Node.js 22+ has fs.glob
-      const fsPromises = await import("node:fs/promises")
-      if ("glob" in fsPromises) {
-        const globFn = (fsPromises as any).glob as (pattern: string, options: { cwd: string }) => AsyncIterable<string>
-        const matches: string[] = []
-        for await (const match of globFn(pattern, { cwd: searchPath })) {
-          matches.push(path.resolve(searchPath, match))
-        }
-        if (matches.length === 0) {
-          return "No files found matching pattern: " + pattern
-        }
-        return matches.join("\n")
-      }
-    } catch {
-      // Fall through to find command
-    }
-
-    // Final fallback: use find command with -path for glob-like patterns
-    try {
-      // Convert glob pattern to find-compatible: **/*.ts → -name "*.ts"
-      const basename = pattern.split("/").pop() ?? pattern
-      const result = execSync(
-        `find . -type f -name ${JSON.stringify(basename)} 2>/dev/null | head -1000`,
-        {
-          cwd: searchPath,
-          encoding: "utf-8",
-          timeout: DEFAULT_TOOL_TIMEOUT_MS,
-        },
-      )
-      if (!result.trim()) {
-        return "No files found matching pattern: " + pattern
-      }
-      // Convert relative paths to absolute
-      return result
-        .trim()
-        .split("\n")
-        .map((p) => path.resolve(searchPath, p))
-        .join("\n")
-    } catch {
-      return "No files found matching pattern: " + pattern
-    }
-  },
-
-  grep: async (args, cwd) => {
-    const pattern = args.pattern as string
-    if (!pattern) throw new Error("Missing required argument: pattern")
-
-    const searchPath = (args.path as string) ?? cwd
-    const include = args.include as string | undefined
-
-    // Use ripgrep if available, fall back to grep
-    const grepIncludeFlag = include ? `--include="${include}"` : ""
-
-    try {
-      // Try ripgrep first
-      const result = execSync(
-        `rg --line-number --no-heading ${include ? `--glob "${include}"` : ""} ${JSON.stringify(pattern)} .`,
-        {
-          cwd: searchPath,
-          encoding: "utf-8",
-          timeout: DEFAULT_TOOL_TIMEOUT_MS,
-          maxBuffer: 10 * 1024 * 1024,
-        },
-      )
-      return result.trim() || "No matches found"
-    } catch {
-      // Fall back to grep
-      try {
-        const result = execSync(
-          `grep -rn ${grepIncludeFlag} ${JSON.stringify(pattern)} .`,
-          {
-            cwd: searchPath,
-            encoding: "utf-8",
-            timeout: DEFAULT_TOOL_TIMEOUT_MS,
-            maxBuffer: 10 * 1024 * 1024,
-          },
-        )
-        return result.trim() || "No matches found"
-      } catch {
-        return "No matches found"
-      }
-    }
-  },
-
-  list_directory: async (args, cwd) => {
-    const dirPath = (args.path as string) ?? cwd
-    if (!dirPath) throw new Error("Missing required argument: path")
-
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true })
-    return entries
-      .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name))
-      .join("\n")
-  },
 }
 
 // ---------------------------------------------------------------------------
@@ -583,7 +302,7 @@ class MCPBridgeServer {
 
     log("info", `Tool call: ${toolName}`, JSON.stringify(toolArgs).slice(0, 200))
 
-    // Check if tool is defined
+    // Verify tool is defined (kiro-cli shouldn't call undefined tools, but be safe)
     const toolDef = this.tools.find((t) => t.name === toolName)
     if (!toolDef) {
       return {
@@ -593,69 +312,8 @@ class MCPBridgeServer {
       }
     }
 
-    // Find executor via name mapping
-    // First check if the tool should be delegated to the host runtime via IPC
-    if (DELEGATED_TOOLS.has(toolName)) {
-      return this.delegateToIPC(request.id, toolName, toolArgs)
-    }
-
-    // Then check if the tool is known-unavailable
-    if (UNAVAILABLE_TOOLS.has(toolName)) {
-      return {
-        jsonrpc: "2.0",
-        id: request.id,
-        result: {
-          content: [
-            {
-              type: "text",
-              text: `Tool "${toolName}" is not available in the MCP bridge. It is handled by the host agent.`,
-            },
-          ],
-          isError: true,
-        } satisfies MCPToolResult,
-      }
-    }
-
-    // Map the tool name to an executor name
-    const executorName = TOOL_NAME_TO_EXECUTOR[toolName] ?? toolName
-    const executor = EXECUTORS[executorName]
-    if (!executor) {
-      return {
-        jsonrpc: "2.0",
-        id: request.id,
-        result: {
-          content: [
-            {
-              type: "text",
-              text: `Tool "${toolName}" is defined but has no built-in executor. Execution not supported.`,
-            },
-          ],
-          isError: true,
-        } satisfies MCPToolResult,
-      }
-    }
-
-    try {
-      const result = await executor(toolArgs, this.cwd)
-      return {
-        jsonrpc: "2.0",
-        id: request.id,
-        result: {
-          content: [{ type: "text", text: result }],
-        } satisfies MCPToolResult,
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      log("warn", `Tool ${toolName} failed:`, message)
-      return {
-        jsonrpc: "2.0",
-        id: request.id,
-        result: {
-          content: [{ type: "text", text: `Error: ${message}` }],
-          isError: true,
-        } satisfies MCPToolResult,
-      }
-    }
+    // ALL tools are delegated to the harness via IPC
+    return this.delegateToIPC(request.id, toolName, toolArgs)
   }
 
   /** Update the tool list (e.g. when the tools file changes). */
@@ -708,7 +366,7 @@ class MCPBridgeServer {
     })
   }
 
-  /** Delegate a tool call to the host runtime via IPC HTTP. */
+  /** Delegate a tool call to the harness via IPC HTTP (POST /tool/pending). */
   private async delegateToIPC(
     requestId: number | string,
     toolName: string,
@@ -722,8 +380,7 @@ class MCPBridgeServer {
           content: [
             {
               type: "text",
-              text: `Tool "${toolName}" requires the opencode runtime but IPC is not configured. ` +
-                `This tool cannot be executed in the standalone MCP bridge.`,
+              text: `Tool "${toolName}" cannot be executed: IPC not configured.`,
             },
           ],
           isError: true,
@@ -743,7 +400,7 @@ class MCPBridgeServer {
               content: [
                 {
                   type: "text",
-                  text: `Tool "${toolName}" requires the opencode runtime but the IPC server is not responding. ` +
+                  text: `Tool "${toolName}" requires the harness runtime but the IPC server is not responding. ` +
                     `The server may have crashed or not started yet.`,
                 },
               ],
@@ -754,16 +411,11 @@ class MCPBridgeServer {
         this.ipcHealthy = true
       }
 
-      const toolTimeout = 300_000 // 5 minutes for delegated tools
+      // POST to /tool/pending — this will BLOCK until the harness executes the tool
       const response = await httpPost(
-        `http://127.0.0.1:${this.ipcPort}/tool/execute`,
-        {
-          toolName,
-          toolCallId: `${requestId}`,
-          args,
-          timeout: toolTimeout,
-        },
-        toolTimeout + 10_000, // HTTP timeout is 10s longer
+        `http://127.0.0.1:${this.ipcPort}/tool/pending`,
+        { callId: `${requestId}`, toolName, args },
+        310_000, // HTTP timeout: 10s longer than IPC hold timeout
       )
 
       if (response.status === "success") {

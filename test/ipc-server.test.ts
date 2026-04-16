@@ -1,10 +1,10 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test"
+import { describe, test, expect, afterEach } from "bun:test"
 import {
   createIPCServer,
   type IPCServer,
-  type ToolExecutorFn,
-  type ToolExecuteRequest,
   type ToolExecuteResponse,
+  type PendingToolCall,
+  type ToolCallHandler,
 } from "../src/ipc-server"
 
 // ---------------------------------------------------------------------------
@@ -44,11 +44,6 @@ describe("IPCServer", () => {
   let server: IPCServer
   let port: number
 
-  // Default executor that echoes the tool name and args
-  const echoExecutor: ToolExecutorFn = async (request) => {
-    return `Executed ${request.toolName} with args: ${JSON.stringify(request.args)}`
-  }
-
   afterEach(async () => {
     if (server) {
       await server.stop()
@@ -61,7 +56,7 @@ describe("IPCServer", () => {
 
   describe("start()", () => {
     test("starts on a random port and returns the port number", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+      server = createIPCServer()
       port = await server.start()
 
       expect(port).toBeGreaterThan(0)
@@ -70,7 +65,7 @@ describe("IPCServer", () => {
     })
 
     test("throws if started twice", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+      server = createIPCServer()
       await server.start()
 
       expect(server.start()).rejects.toThrow("already running")
@@ -79,7 +74,7 @@ describe("IPCServer", () => {
 
   describe("stop()", () => {
     test("cleans up and resets port to null", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+      server = createIPCServer()
       port = await server.start()
 
       expect(server.getPort()).toBe(port)
@@ -90,36 +85,25 @@ describe("IPCServer", () => {
     })
 
     test("is safe to call when not started", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+      server = createIPCServer()
       // Should not throw
       await server.stop()
     })
 
-    test("aborts in-flight calls on stop", async () => {
-      let receivedSignal: AbortSignal | null = null
-
-      const slowExecutor: ToolExecutorFn = async (_request, signal) => {
-        receivedSignal = signal
-        // Wait indefinitely (will be aborted)
-        return new Promise((resolve, reject) => {
-          const onAbort = () => reject(new Error("Aborted"))
-          if (signal.aborted) {
-            reject(new Error("Aborted"))
-            return
-          }
-          signal.addEventListener("abort", onAbort, { once: true })
-        })
-      }
-
-      server = createIPCServer({ toolExecutor: slowExecutor })
+    test("resolves pending calls with error on stop", async () => {
+      server = createIPCServer()
       port = await server.start()
 
-      // Start a tool call (don't await it)
-      const callPromise = httpRequest(port, "POST", "/tool/execute", {
-        toolName: "slow_tool",
-        toolCallId: "call-1",
-        args: {},
-        timeout: 60_000,
+      // Register a handler so the call gets stored
+      server.setToolCallHandler(() => {
+        // Don't resolve — let it stay pending
+      })
+
+      // Start a pending tool call (don't await it)
+      const callPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-1",
+        toolName: "bash",
+        args: { command: "ls" },
       })
 
       // Give the request time to reach the server
@@ -127,16 +111,14 @@ describe("IPCServer", () => {
 
       expect(server.getPendingCount()).toBe(1)
 
-      // Stop the server — should abort the in-flight call
+      // Stop the server — should resolve the pending call with error
       await server.stop()
 
       expect(server.getPendingCount()).toBe(0)
 
       // The HTTP request should complete (with an error response or connection error)
-      // Since the server is closing, the response may be an abort/cancel error
       try {
         const result = await callPromise
-        // If we get a response, it should indicate cancellation/timeout
         const body = result.body as ToolExecuteResponse
         expect(body.status).toBe("error")
       } catch {
@@ -151,7 +133,7 @@ describe("IPCServer", () => {
 
   describe("GET /health", () => {
     test("returns status ok with uptime and pending count", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+      server = createIPCServer()
       port = await server.start()
 
       const { status, body } = await httpRequest(port, "GET", "/health")
@@ -165,53 +147,100 @@ describe("IPCServer", () => {
   })
 
   // -------------------------------------------------------------------------
-  // POST /tool/execute
+  // POST /tool/pending + POST /tool/result — Hold-and-wait pattern
   // -------------------------------------------------------------------------
 
-  describe("POST /tool/execute", () => {
-    test("executes a tool and returns success result", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+  describe("POST /tool/pending + /tool/result", () => {
+    test("holds response until result is sent via /tool/result", async () => {
+      server = createIPCServer()
       port = await server.start()
 
-      const { status, body } = await httpRequest(port, "POST", "/tool/execute", {
-        toolName: "task",
-        toolCallId: "call-1",
-        args: { description: "test task" },
+      // Register handler to capture the tool call
+      let receivedCall: PendingToolCall | null = null
+      server.setToolCallHandler((call) => {
+        receivedCall = call
       })
 
-      expect(status).toBe(200)
-      const result = body as ToolExecuteResponse
-      expect(result.status).toBe("success")
-      expect(result.result).toContain("Executed task")
-      expect(result.result).toContain("test task")
-    })
-
-    test("returns error when executor throws", async () => {
-      const failingExecutor: ToolExecutorFn = async () => {
-        throw new Error("Tool execution failed: something went wrong")
-      }
-
-      server = createIPCServer({ toolExecutor: failingExecutor })
-      port = await server.start()
-
-      const { status, body } = await httpRequest(port, "POST", "/tool/execute", {
-        toolName: "broken_tool",
-        toolCallId: "call-2",
-        args: {},
+      // Start a pending call (don't await — it blocks)
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-1",
+        toolName: "bash",
+        args: { command: "echo hello" },
       })
 
-      expect(status).toBe(200)
-      const result = body as ToolExecuteResponse
-      expect(result.status).toBe("error")
-      expect(result.error).toContain("something went wrong")
-      expect(result.code).toBe("TOOL_EXECUTION_FAILED")
+      // Wait for the call to be registered
+      await new Promise((r) => setTimeout(r, 50))
+
+      expect(server.getPendingCount()).toBe(1)
+      expect(receivedCall).not.toBeNull()
+      expect(receivedCall!.callId).toBe("call-1")
+      expect(receivedCall!.toolName).toBe("bash")
+      expect(receivedCall!.args).toEqual({ command: "echo hello" })
+
+      // Send the result
+      const resultResponse = await httpRequest(port, "POST", "/tool/result", {
+        callId: "call-1",
+        result: "hello\n",
+        isError: false,
+      })
+
+      expect(resultResponse.status).toBe(200)
+      expect((resultResponse.body as { status: string }).status).toBe("ok")
+
+      // The pending call should now resolve
+      const pendingResult = await pendingPromise
+      expect(pendingResult.status).toBe(200)
+      const body = pendingResult.body as ToolExecuteResponse
+      expect(body.status).toBe("success")
+      expect(body.result).toBe("hello\n")
+
+      expect(server.getPendingCount()).toBe(0)
     })
 
-    test("returns INVALID_REQUEST for malformed JSON", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+    test("returns error result when isError is true", async () => {
+      server = createIPCServer()
       port = await server.start()
 
-      const response = await fetch(`http://127.0.0.1:${port}/tool/execute`, {
+      server.setToolCallHandler(() => {})
+
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-err",
+        toolName: "bash",
+        args: { command: "false" },
+      })
+
+      await new Promise((r) => setTimeout(r, 50))
+
+      await httpRequest(port, "POST", "/tool/result", {
+        callId: "call-err",
+        result: "Command failed with exit code 1",
+        isError: true,
+      })
+
+      const pendingResult = await pendingPromise
+      const body = pendingResult.body as ToolExecuteResponse
+      expect(body.status).toBe("error")
+      expect(body.error).toBe("Command failed with exit code 1")
+    })
+
+    test("returns 404 for /tool/result with unknown callId", async () => {
+      server = createIPCServer()
+      port = await server.start()
+
+      const { status, body } = await httpRequest(port, "POST", "/tool/result", {
+        callId: "nonexistent",
+        result: "some result",
+      })
+
+      expect(status).toBe(404)
+      expect((body as { code: string }).code).toBe("NOT_FOUND")
+    })
+
+    test("returns INVALID_REQUEST for malformed JSON on /tool/pending", async () => {
+      server = createIPCServer()
+      port = await server.start()
+
+      const response = await fetch(`http://127.0.0.1:${port}/tool/pending`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "not valid json{{{",
@@ -219,141 +248,167 @@ describe("IPCServer", () => {
 
       expect(response.status).toBe(400)
       const result = (await response.json()) as ToolExecuteResponse
-      expect(result.status).toBe("error")
       expect(result.code).toBe("INVALID_REQUEST")
     })
 
-    test("returns INVALID_REQUEST for missing required fields", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+    test("returns INVALID_REQUEST for missing required fields on /tool/pending", async () => {
+      server = createIPCServer()
       port = await server.start()
 
-      const { status, body } = await httpRequest(port, "POST", "/tool/execute", {
+      const { status, body } = await httpRequest(port, "POST", "/tool/pending", {
         args: {},
       })
 
       expect(status).toBe(400)
-      const result = body as ToolExecuteResponse
-      expect(result.status).toBe("error")
-      expect(result.code).toBe("INVALID_REQUEST")
+      expect((body as { code: string }).code).toBe("INVALID_REQUEST")
     })
 
-    test("passes sessionId and args to executor", async () => {
-      let receivedRequest: ToolExecuteRequest | null = null
-
-      const captureExecutor: ToolExecutorFn = async (request) => {
-        receivedRequest = request
-        return "ok"
-      }
-
-      server = createIPCServer({ toolExecutor: captureExecutor })
+    test("handles concurrent pending calls", async () => {
+      server = createIPCServer()
       port = await server.start()
 
-      await httpRequest(port, "POST", "/tool/execute", {
-        toolName: "question",
-        toolCallId: "call-3",
-        args: { prompt: "Are you sure?" },
-        sessionId: "sess-abc",
-        timeout: 60_000,
+      const receivedCalls: PendingToolCall[] = []
+      server.setToolCallHandler((call) => {
+        receivedCalls.push(call)
       })
 
-      expect(receivedRequest).not.toBeNull()
-      expect(receivedRequest!.toolName).toBe("question")
-      expect(receivedRequest!.toolCallId).toBe("call-3")
-      expect(receivedRequest!.args).toEqual({ prompt: "Are you sure?" })
-      expect(receivedRequest!.sessionId).toBe("sess-abc")
-      expect(receivedRequest!.timeout).toBe(60_000)
-    })
+      // Start 3 concurrent pending calls
+      const promises = [
+        httpRequest(port, "POST", "/tool/pending", {
+          callId: "call-a",
+          toolName: "bash",
+          args: { command: "echo a" },
+        }),
+        httpRequest(port, "POST", "/tool/pending", {
+          callId: "call-b",
+          toolName: "read_file",
+          args: { filePath: "/tmp/test" },
+        }),
+        httpRequest(port, "POST", "/tool/pending", {
+          callId: "call-c",
+          toolName: "glob",
+          args: { pattern: "*.ts" },
+        }),
+      ]
 
-    test("provides AbortSignal to executor", async () => {
-      let receivedSignal: AbortSignal | null = null
+      await new Promise((r) => setTimeout(r, 50))
+      expect(server.getPendingCount()).toBe(3)
+      expect(receivedCalls).toHaveLength(3)
 
-      const signalExecutor: ToolExecutorFn = async (_request, signal) => {
-        receivedSignal = signal
-        return "done"
+      // Resolve all
+      await httpRequest(port, "POST", "/tool/result", { callId: "call-a", result: "a" })
+      await httpRequest(port, "POST", "/tool/result", { callId: "call-b", result: "b" })
+      await httpRequest(port, "POST", "/tool/result", { callId: "call-c", result: "c" })
+
+      const results = await Promise.all(promises)
+      for (const r of results) {
+        expect((r.body as ToolExecuteResponse).status).toBe("success")
       }
 
-      server = createIPCServer({ toolExecutor: signalExecutor })
+      expect(server.getPendingCount()).toBe(0)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // resolveToolResult() — in-process resolution
+  // -------------------------------------------------------------------------
+
+  describe("resolveToolResult()", () => {
+    test("resolves a pending call directly (in-process)", async () => {
+      server = createIPCServer()
       port = await server.start()
 
-      await httpRequest(port, "POST", "/tool/execute", {
-        toolName: "task",
-        toolCallId: "call-4",
+      server.setToolCallHandler(() => {})
+
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-direct",
+        toolName: "bash",
         args: {},
       })
 
-      expect(receivedSignal).not.toBeNull()
-      expect(receivedSignal!.aborted).toBe(false)
-    })
+      await new Promise((r) => setTimeout(r, 50))
+      expect(server.getPendingCount()).toBe(1)
 
-    test("handles timeout by aborting the signal", async () => {
-      const slowExecutor: ToolExecutorFn = async (_request, signal) => {
-        return new Promise((resolve, reject) => {
-          const timer = setTimeout(() => resolve("done"), 10_000)
-          signal.addEventListener("abort", () => {
-            clearTimeout(timer)
-            reject(new Error("Aborted"))
-          }, { once: true })
-        })
-      }
-
-      server = createIPCServer({ toolExecutor: slowExecutor })
-      port = await server.start()
-
-      const { status, body } = await httpRequest(port, "POST", "/tool/execute", {
-        toolName: "slow_tool",
-        toolCallId: "call-5",
-        args: {},
-        timeout: 100, // Very short timeout
+      // Resolve directly via the in-process method
+      server.resolveToolResult({
+        callId: "call-direct",
+        result: "direct result",
+        isError: false,
       })
 
-      expect(status).toBe(200)
-      const result = body as ToolExecuteResponse
-      expect(result.status).toBe("error")
-      expect(result.code).toBe("TOOL_TIMEOUT")
+      const result = await pendingPromise
+      const body = result.body as ToolExecuteResponse
+      expect(body.status).toBe("success")
+      expect(body.result).toBe("direct result")
     })
 
-    test("handles concurrent tool calls", async () => {
-      let concurrentCount = 0
-      let maxConcurrent = 0
+    test("silently ignores unknown callId", () => {
+      server = createIPCServer()
+      // Should not throw
+      server.resolveToolResult({
+        callId: "nonexistent",
+        result: "whatever",
+      })
+    })
+  })
 
-      const concurrentExecutor: ToolExecutorFn = async (request) => {
-        concurrentCount++
-        maxConcurrent = Math.max(maxConcurrent, concurrentCount)
-        await new Promise((r) => setTimeout(r, 50))
-        concurrentCount--
-        return `Result for ${request.toolCallId}`
-      }
+  // -------------------------------------------------------------------------
+  // setToolCallHandler() — callback and buffering
+  // -------------------------------------------------------------------------
 
-      server = createIPCServer({ toolExecutor: concurrentExecutor })
+  describe("setToolCallHandler()", () => {
+    test("notifies handler when a pending call arrives", async () => {
+      server = createIPCServer()
       port = await server.start()
 
-      // Send 3 concurrent requests
-      const results = await Promise.all([
-        httpRequest(port, "POST", "/tool/execute", {
-          toolName: "task",
-          toolCallId: "call-a",
-          args: {},
-        }),
-        httpRequest(port, "POST", "/tool/execute", {
-          toolName: "task",
-          toolCallId: "call-b",
-          args: {},
-        }),
-        httpRequest(port, "POST", "/tool/execute", {
-          toolName: "task",
-          toolCallId: "call-c",
-          args: {},
-        }),
-      ])
+      const calls: PendingToolCall[] = []
+      server.setToolCallHandler((call) => {
+        calls.push(call)
+      })
 
-      // All should succeed
-      for (const { body } of results) {
-        const result = body as ToolExecuteResponse
-        expect(result.status).toBe("success")
-      }
+      // Start a pending call
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-notify",
+        toolName: "bash",
+        args: { command: "ls" },
+      })
 
-      // Should have been concurrent
-      expect(maxConcurrent).toBeGreaterThanOrEqual(2)
+      await new Promise((r) => setTimeout(r, 50))
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0].callId).toBe("call-notify")
+      expect(calls[0].toolName).toBe("bash")
+
+      // Clean up
+      server.resolveToolResult({ callId: "call-notify", result: "done" })
+      await pendingPromise
+    })
+
+    test("buffers calls that arrive before handler is registered", async () => {
+      server = createIPCServer()
+      port = await server.start()
+
+      // Start a pending call WITHOUT a handler registered
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-buffered",
+        toolName: "bash",
+        args: { command: "ls" },
+      })
+
+      await new Promise((r) => setTimeout(r, 50))
+
+      // Now register the handler — should flush the buffered call
+      const calls: PendingToolCall[] = []
+      server.setToolCallHandler((call) => {
+        calls.push(call)
+      })
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0].callId).toBe("call-buffered")
+
+      // Clean up
+      server.resolveToolResult({ callId: "call-buffered", result: "done" })
+      await pendingPromise
     })
   })
 
@@ -362,65 +417,51 @@ describe("IPCServer", () => {
   // -------------------------------------------------------------------------
 
   describe("POST /tool/cancel", () => {
-    test("cancels an in-flight tool call", async () => {
-      let abortedViaSignal = false
-
-      const cancellableExecutor: ToolExecutorFn = async (_request, signal) => {
-        return new Promise((resolve, reject) => {
-          const timer = setTimeout(() => resolve("done"), 10_000)
-          signal.addEventListener("abort", () => {
-            clearTimeout(timer)
-            abortedViaSignal = true
-            reject(new Error("Cancelled"))
-          }, { once: true })
-        })
-      }
-
-      server = createIPCServer({ toolExecutor: cancellableExecutor })
+    test("cancels a pending tool call", async () => {
+      server = createIPCServer()
       port = await server.start()
 
-      // Start a long-running tool call
-      const executePromise = httpRequest(port, "POST", "/tool/execute", {
-        toolName: "task",
-        toolCallId: "call-cancel-1",
+      server.setToolCallHandler(() => {})
+
+      // Start a pending call
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-cancel-1",
+        toolName: "bash",
         args: {},
-        timeout: 60_000,
       })
 
-      // Wait for the call to be registered
       await new Promise((r) => setTimeout(r, 50))
       expect(server.getPendingCount()).toBe(1)
 
       // Cancel it
       const cancelResult = await httpRequest(port, "POST", "/tool/cancel", {
-        toolCallId: "call-cancel-1",
+        callId: "call-cancel-1",
       })
 
       expect((cancelResult.body as { cancelled: boolean }).cancelled).toBe(true)
 
-      // The execute request should complete with a cancellation error
-      const executeResult = await executePromise
-      const body = executeResult.body as ToolExecuteResponse
+      // The pending call should resolve with a cancellation error
+      const pendingResult = await pendingPromise
+      const body = pendingResult.body as ToolExecuteResponse
       expect(body.status).toBe("error")
       expect(body.code).toBe("TOOL_CANCELLED")
 
-      // The signal should have been aborted
-      expect(abortedViaSignal).toBe(true)
+      expect(server.getPendingCount()).toBe(0)
     })
 
-    test("returns cancelled: false for unknown toolCallId", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+    test("returns cancelled: false for unknown callId", async () => {
+      server = createIPCServer()
       port = await server.start()
 
       const { body } = await httpRequest(port, "POST", "/tool/cancel", {
-        toolCallId: "nonexistent",
+        callId: "nonexistent",
       })
 
       expect((body as { cancelled: boolean }).cancelled).toBe(false)
     })
 
-    test("returns error for missing toolCallId", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+    test("returns error for missing callId", async () => {
+      server = createIPCServer()
       port = await server.start()
 
       const { status } = await httpRequest(port, "POST", "/tool/cancel", {})
@@ -435,7 +476,7 @@ describe("IPCServer", () => {
 
   describe("unknown routes", () => {
     test("returns 404 for unknown paths", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+      server = createIPCServer()
       port = await server.start()
 
       const { status } = await httpRequest(port, "GET", "/unknown")
@@ -443,10 +484,10 @@ describe("IPCServer", () => {
     })
 
     test("returns 404 for wrong method on known path", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+      server = createIPCServer()
       port = await server.start()
 
-      const { status } = await httpRequest(port, "GET", "/tool/execute")
+      const { status } = await httpRequest(port, "GET", "/tool/pending")
       expect(status).toBe(404)
     })
   })
@@ -456,29 +497,23 @@ describe("IPCServer", () => {
   // -------------------------------------------------------------------------
 
   describe("getPendingCount()", () => {
-    test("returns 0 when no calls are in flight", async () => {
-      server = createIPCServer({ toolExecutor: echoExecutor })
+    test("returns 0 when no calls are pending", async () => {
+      server = createIPCServer()
       port = await server.start()
 
       expect(server.getPendingCount()).toBe(0)
     })
 
-    test("tracks in-flight calls", async () => {
-      let resolveCall: (() => void) | null = null
-
-      const blockingExecutor: ToolExecutorFn = async () => {
-        return new Promise<string>((resolve) => {
-          resolveCall = () => resolve("done")
-        })
-      }
-
-      server = createIPCServer({ toolExecutor: blockingExecutor })
+    test("tracks pending calls", async () => {
+      server = createIPCServer()
       port = await server.start()
 
-      // Start a call (don't await)
-      const callPromise = httpRequest(port, "POST", "/tool/execute", {
-        toolName: "task",
-        toolCallId: "call-pending",
+      server.setToolCallHandler(() => {})
+
+      // Start a pending call (don't await)
+      const callPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-pending",
+        toolName: "bash",
         args: {},
       })
 
@@ -487,7 +522,7 @@ describe("IPCServer", () => {
       expect(server.getPendingCount()).toBe(1)
 
       // Resolve the call
-      resolveCall!()
+      server.resolveToolResult({ callId: "call-pending", result: "done" })
       await callPromise
 
       expect(server.getPendingCount()).toBe(0)

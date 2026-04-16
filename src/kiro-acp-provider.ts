@@ -1,7 +1,6 @@
 import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { ACPClient, type ACPClientOptions, type PermissionRequest, type PermissionDecision } from "./acp-client"
 import { KiroACPLanguageModel } from "./kiro-acp-model"
-import type { ToolExecutorFn } from "./ipc-server"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,8 +28,6 @@ export interface KiroACPProviderSettings {
   sessionId?: string
   /** Model's max context window in tokens (from models.dev). Default: 1_000_000. */
   contextWindow?: number
-  /** Tool executor for delegated tool calls from the MCP bridge. */
-  toolExecutor?: ToolExecutorFn
 }
 
 /** The KiroACP provider interface. */
@@ -60,6 +57,11 @@ export interface KiroACPProvider {
  * Create a KiroACP provider that manages a single kiro-cli process
  * and creates LanguageModelV3 instances backed by ACP.
  *
+ * All tool calls flow through the standard AI SDK contract:
+ * - The model emits `tool-call` parts and finishes with `finishReason: "tool-calls"`
+ * - The harness executes tools through its normal pipeline
+ * - The harness calls `doStream()` again with tool results
+ *
  * Usage:
  * ```ts
  * import { createKiroAcp } from "kiro-acp-ai-provider"
@@ -83,7 +85,6 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
     onPermission: settings.onPermission,
     env: settings.env,
     clientInfo: settings.clientInfo,
-    toolExecutor: settings.toolExecutor,
   }
 
   // Create the ACP client lazily — it will be started on first model use

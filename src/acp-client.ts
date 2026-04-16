@@ -6,7 +6,7 @@ import { mkdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { generateAgentConfig, writeAgentConfig } from "./agent-config"
 import { getDefaultTools } from "./mcp-bridge-tools"
-import { createIPCServer, type IPCServer, type ToolExecutorFn } from "./ipc-server"
+import { createIPCServer, type IPCServer } from "./ipc-server"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -105,8 +105,6 @@ export interface ACPClientOptions {
   onExtension?: (method: string, params: Record<string, unknown>) => void
   /** Client info sent during initialize. */
   clientInfo?: { name: string; version: string; title?: string }
-  /** Tool executor for delegated tool calls from the MCP bridge. */
-  toolExecutor?: ToolExecutorFn
 }
 
 /** Options for sending a prompt. */
@@ -220,15 +218,11 @@ export class ACPClient {
   async start(): Promise<InitializeResult> {
     if (this.running) throw new ACPConnectionError("Client is already running")
 
-    // Start IPC server if a tool executor is provided.
+    // Start IPC server for tool call synchronization.
     // This must happen BEFORE setupAgentConfig so we have the port number
     // to write into the tools file.
-    if (this.options.toolExecutor) {
-      this.ipcServer = createIPCServer({
-        toolExecutor: this.options.toolExecutor,
-      })
-      this.ipcPort = await this.ipcServer.start()
-    }
+    this.ipcServer = createIPCServer()
+    this.ipcPort = await this.ipcServer.start()
 
     // Generate agent config before spawning kiro-cli so it can find the
     // .kiro/agents/<agent>.json file with MCP bridge configuration.
@@ -498,6 +492,19 @@ export class ACPClient {
   /** Get the IPC server port (if running). */
   getIpcPort(): number | null {
     return this.ipcPort
+  }
+
+  /** Get the IPC server instance (for direct in-process communication). */
+  getIPCServer(): IPCServer | null {
+    return this.ipcServer
+  }
+
+  /**
+   * Replace the prompt callback for a session.
+   * Used by the adapter during resumption to re-wire update handling.
+   */
+  setPromptCallback(sessionId: string, callback: (update: SessionUpdate) => void): void {
+    this.promptCallbacks.set(sessionId, callback)
   }
 
   // -------------------------------------------------------------------------

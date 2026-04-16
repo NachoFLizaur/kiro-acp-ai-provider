@@ -47,7 +47,8 @@ export {
   createIPCServer,
   type IPCServer,
   type IPCServerOptions,
-  type ToolExecutorFn,
-  type ToolExecuteRequest,
+  type PendingToolCall,
+  type ToolCallHandler,
+  type ToolResultRequest,
   type ToolExecuteResponse,
 } from "./ipc-server"
