@@ -11,11 +11,9 @@ import type {
   LanguageModelV3Usage,
   LanguageModelV3Prompt,
 } from "@ai-sdk/provider"
-import { writeFileSync, readFileSync, mkdirSync } from "node:fs"
-import { createHash } from "node:crypto"
-import { join } from "node:path"
-import { tmpdir } from "node:os"
+import { writeFileSync } from "node:fs"
 import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
+import { persistSession, loadPersistedSession } from "./session-storage"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
@@ -71,7 +69,7 @@ function parseToolCallNotification(update: Record<string, unknown>): {
   const toolCallId = update.toolCallId as string | undefined
   const rawInput = update.rawInput as Record<string, unknown> | undefined
 
-  // Extract tool name from title: "Running: @opencode-tools/bash" → "bash"
+  // Extract tool name from title: "Running: @<server>/bash" → "bash"
   let toolName: string | undefined
   const title = update.title as string | undefined
   if (title) {
@@ -259,6 +257,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private totalCredits = 0
   /** Tracks the last set of tool names written, for change detection. */
   private lastToolNames = ""
+  /** Session affinity ID for routing to the correct persisted session file. */
+  private currentAffinityId: string | undefined
 
   /**
    * Per-session state for ongoing kiro-cli prompts paused waiting for tool results.
@@ -372,7 +372,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           if (this.currentModelId === null) {
             this.currentModelId = loaded.models.currentModelId
           }
-          this.persistSessionId(loaded.sessionId)
+          persistSession(this.client.getCwd(), loaded.sessionId, this.currentAffinityId)
           return loaded
         } catch {
           // Fall through to persisted session or create new
@@ -380,16 +380,23 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       }
 
       // Try loading from persisted session file
-      const persisted = await this.tryLoadPersistedSession()
+      const persisted = loadPersistedSession(this.client.getCwd(), this.currentAffinityId)
       if (persisted) {
-        this.sessions.push(persisted)
-        this.busySessions.add(persisted.sessionId)
-        if (this.currentModelId === null) {
-          this.currentModelId = persisted.models?.currentModelId ?? null
+        try {
+          const session = await this.client.loadSession(persisted.kiroSessionId)
+          if (session?.sessionId) {
+            await this.ensureSessionMode(session)
+            this.sessions.push(session)
+            this.busySessions.add(session.sessionId)
+            if (this.currentModelId === null) {
+              this.currentModelId = session.models?.currentModelId ?? null
+            }
+            persistSession(this.client.getCwd(), session.sessionId, this.currentAffinityId)
+            return session
+          }
+        } catch {
+          // Fall through to create new session
         }
-        // Re-persist to refresh the timestamp
-        this.persistSessionId(persisted.sessionId)
-        return persisted
       }
     }
 
@@ -403,7 +410,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     // Persist the primary session ID (first session only)
     if (this.sessions.length === 1) {
-      this.persistSessionId(session.sessionId)
+      persistSession(this.client.getCwd(), session.sessionId, this.currentAffinityId)
     }
 
     return session
@@ -421,7 +428,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     // Refresh persisted timestamp for the primary session
     if (this.sessions[0]?.sessionId === sessionId) {
-      this.persistSessionId(sessionId)
+      persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
     }
   }
 
@@ -459,69 +466,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   // -------------------------------------------------------------------------
-  // Session persistence (across process restarts)
+  // Session persistence — delegated to session-storage module
   // -------------------------------------------------------------------------
 
-  /**
-   * Get the path to the session persistence file.
-   *
-   * Uses the same cwd-hash scheme as the tools file for consistency:
-   * `{tmpdir}/kiro-acp/session-{cwdHash}.json`
-   */
-  private getSessionFilePath(): string {
-    const cwdHash = createHash("md5").update(this.client.getCwd()).digest("hex").slice(0, 8)
-    return join(tmpdir(), "kiro-acp", `session-${cwdHash}.json`)
-  }
-
-  /**
-   * Persist the primary session ID to disk so it can be resumed after restart.
-   *
-   * This is best-effort — failures are silently ignored. The file is only
-   * written for the first session (index 0); subagent sessions are transient.
-   */
-  private persistSessionId(sessionId: string): void {
-    try {
-      const dir = join(tmpdir(), "kiro-acp")
-      mkdirSync(dir, { recursive: true })
-      const data = JSON.stringify({
-        sessionId,
-        timestamp: Date.now(),
-        modelId: this.modelId,
-      })
-      writeFileSync(this.getSessionFilePath(), data)
-    } catch {
-      // Best-effort — ignore write failures
-    }
-  }
-
-  /**
-   * Try to load a previously persisted session from disk.
-   *
-   * Returns the loaded ACPSession if successful, or null if:
-   * - No persisted session file exists
-   * - The persisted session is older than 24 hours
-   * - The `session/load` RPC call fails (session expired server-side)
-   *
-   * On failure, falls through silently so the caller can create a new session.
-   */
-  private async tryLoadPersistedSession(): Promise<ACPSession | null> {
-    try {
-      const raw = readFileSync(this.getSessionFilePath(), "utf-8")
-      const data = JSON.parse(raw) as { sessionId: string; timestamp: number }
-
-      // Don't try to load very old sessions (> 24 hours)
-      if (Date.now() - data.timestamp > 24 * 60 * 60 * 1000) return null
-
-      const session = await this.client.loadSession(data.sessionId)
-
-      // Validate the loaded session has the expected shape
-      if (!session?.sessionId) return null
-
-      await this.ensureSessionMode(session)
-      return session
-    } catch {
-      return null
-    }
+  /** Set the session affinity ID for routing to the correct persisted session file. */
+  setAffinityId(affinityId: string | undefined): void {
+    this.currentAffinityId = affinityId
   }
 
   // -------------------------------------------------------------------------
@@ -535,7 +485,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
   /**
    * Inject conversation context into the current session.
-   * Used when session/load fails and we need to rehydrate from opencode's history.
+   * Used when session/load fails and we need to rehydrate from the consumer's history.
    */
   async injectContext(summary: string): Promise<void> {
     const session = await this.acquireSession()
@@ -659,6 +609,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   async doStream(
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3StreamResult> {
+    // Extract session affinity from consumer-provided headers (optional).
+    // When present, routes to a dedicated persisted session file per affinity ID.
+    // When absent, falls back to _default.json.
+    const affinityId = typeof options.headers?.["x-session-affinity"] === "string"
+      ? options.headers["x-session-affinity"]
+      : undefined
+    this.setAffinityId(affinityId)
+
     // Check for tool results in the prompt
     const toolResults = this.extractToolResults(options.prompt)
 

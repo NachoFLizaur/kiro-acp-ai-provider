@@ -1,5 +1,6 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test"
 import { ACPClient, KiroACPError, KiroACPConnectionError, type ACPClientOptions } from "../src/acp-client"
+import { generateAgentConfig, type AgentConfigOptions } from "../src/agent-config"
 
 // ---------------------------------------------------------------------------
 // We can't easily spawn a real kiro-cli in tests, so we test the internal
@@ -406,7 +407,7 @@ describe("ACPClient", () => {
           method: "_kiro.dev/commands/available",
           params: {
             tools: [
-              { name: "bash", source: "mcp:opencode-tools", description: "Run command" },
+              { name: "bash", source: "mcp:kiro-acp-tools", description: "Run command" },
             ],
           },
         }),
@@ -414,7 +415,7 @@ describe("ACPClient", () => {
 
       expect(listener).toHaveBeenCalledTimes(1)
       expect(listener).toHaveBeenCalledWith([
-        { name: "bash", source: "mcp:opencode-tools", description: "Run command" },
+        { name: "bash", source: "mcp:kiro-acp-tools", description: "Run command" },
       ])
     })
 
@@ -430,8 +431,8 @@ describe("ACPClient", () => {
           method: "_kiro.dev/commands/available",
           params: {
             tools: [
-              { name: "bash", source: "mcp:opencode-tools", description: "Run command" },
-              { name: "task", source: "mcp:opencode-tools", description: "Launch subagent" },
+              { name: "bash", source: "mcp:kiro-acp-tools", description: "Run command" },
+              { name: "task", source: "mcp:kiro-acp-tools", description: "Launch subagent" },
             ],
           },
         }),
@@ -645,5 +646,56 @@ describe("ACPClient", () => {
       const tools = await promise
       expect(tools).toHaveLength(1)
     })
+  })
+})
+
+describe("generateAgentConfig consumer-agnostic", () => {
+  const baseOptions: AgentConfigOptions = {
+    mcpBridgePath: "/path/to/bridge.js",
+    toolsFilePath: "/path/to/tools.json",
+    cwd: "/project",
+  }
+
+  test("generateAgentConfig uses dynamic MCP server name", () => {
+    const config = generateAgentConfig({ ...baseOptions, name: "my-editor" })
+
+    expect(config.mcpServers).toBeDefined()
+    const mcpServers = config.mcpServers as Record<string, unknown>
+    expect(mcpServers["my-editor-tools"]).toBeDefined()
+  })
+
+  test("generateAgentConfig defaults to kiro-acp", () => {
+    const config = generateAgentConfig({ ...baseOptions, name: undefined })
+
+    expect(config.name).toBe("kiro-acp")
+  })
+
+  test("generateAgentConfig default MCP server is kiro-acp-tools", () => {
+    const config = generateAgentConfig({ ...baseOptions, name: undefined })
+
+    const mcpServers = config.mcpServers as Record<string, unknown>
+    expect(mcpServers["kiro-acp-tools"]).toBeDefined()
+  })
+
+  test("generateAgentConfig system prompt is consumer-agnostic", () => {
+    const config = generateAgentConfig(baseOptions)
+
+    const prompt = config.prompt as string
+    expect(prompt.toLowerCase()).not.toContain("opencode")
+  })
+
+  test("no opencode references in source files", async () => {
+    // Use Bun.spawn to run ripgrep (or grep) over src/
+    const proc = Bun.spawn(["grep", "-ri", "opencode", "src/"], {
+      cwd: "/Users/nflizaur/Documents/5-coding/open-source/kiro-acp-ai-provider",
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+
+    const stdout = await new Response(proc.stdout).text()
+    await proc.exited
+
+    // grep returns exit code 1 when no matches found — that's what we want
+    expect(stdout.trim()).toBe("")
   })
 })

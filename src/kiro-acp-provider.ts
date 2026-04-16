@@ -12,7 +12,7 @@ export interface KiroACPProviderSettings {
   cwd?: string
   /** Default model ID to use when none is specified. */
   model?: string
-  /** Custom agent name passed via --agent flag (e.g. "opencode"). */
+  /** Custom agent name passed via --agent flag (e.g. "my-editor"). */
   agent?: string
   /** Pass --trust-all-tools to kiro-cli. */
   trustAllTools?: boolean

@@ -97,7 +97,7 @@ export interface SessionMetadata {
 export interface ACPClientOptions {
   /** Working directory for kiro-cli. */
   cwd: string
-  /** Custom agent name passed via --agent flag (e.g. "opencode"). */
+  /** Custom agent name passed via --agent flag (e.g. "my-editor"). */
   agent?: string
   /** Pass --trust-all-tools to kiro-cli. */
   trustAllTools?: boolean
@@ -501,7 +501,7 @@ export class ACPClient {
     return this.options.cwd
   }
 
-  /** Get the custom agent name (e.g. "opencode") if configured. */
+  /** Get the custom agent name (e.g. "my-editor") if configured. */
   getAgentName(): string | undefined {
     return this.options.agent
   }
@@ -750,7 +750,7 @@ export class ACPClient {
     // Strategy 3: Walk up from cwd looking for node_modules with our package.
     // When cwd is a user project (e.g. ~/my-app) that doesn't have this package
     // installed, the bridge won't be in cwd/node_modules. But the tool that
-    // spawned us (e.g. opencode) has it in its own node_modules somewhere up
+    // spawned us (e.g. the host application) has it in its own node_modules somewhere up
     // the directory tree.
     let searchDir = this.options.cwd
     for (let i = 0; i < 10; i++) {
@@ -785,8 +785,8 @@ export class ACPClient {
     }
 
     // Strategy 4: Search relative to the binary/executable path.
-    // When running as a compiled binary (e.g. opencode at
-    // opencode/packages/opencode/dist/bin/opencode), the package's node_modules
+    // When running as a compiled binary (e.g. the consumer at
+    // packages/consumer/dist/bin/consumer), the package's node_modules
     // may be several directories up from the binary location.
     const binDir = dirname(process.argv[0] || "")
     if (binDir) {
