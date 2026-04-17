@@ -676,4 +676,48 @@ describe("generateAgentConfig consumer-agnostic", () => {
     const mcpServers = config.mcpServers as Record<string, unknown>
     expect(mcpServers["kiro-acp-tools"]).toBeDefined()
   })
+
+  test("generateAgentConfig includes stream suffix from tools file path", () => {
+    const config = generateAgentConfig({
+      ...baseOptions,
+      name: "my-editor",
+      toolsFilePath: "/tmp/kiro-acp/tools-504d74e4-760ededf.json",
+    })
+
+    const mcpServers = config.mcpServers as Record<string, unknown>
+    // Server name should include the session/instance suffix
+    expect(mcpServers["my-editor-tools-760ededf"]).toBeDefined()
+    // tools and allowedTools should reference the unique server name
+    expect(config.tools).toEqual(["@my-editor-tools-760ededf"])
+    expect(config.allowedTools).toEqual(["@my-editor-tools-760ededf"])
+  })
+
+  test("generateAgentConfig uses default name with stream suffix", () => {
+    const config = generateAgentConfig({
+      ...baseOptions,
+      name: undefined,
+      toolsFilePath: "/tmp/kiro-acp/tools-abcd1234-deadbeef.json",
+    })
+
+    const mcpServers = config.mcpServers as Record<string, unknown>
+    expect(mcpServers["kiro-acp-tools-deadbeef"]).toBeDefined()
+    expect(config.tools).toEqual(["@kiro-acp-tools-deadbeef"])
+  })
+
+  test("generateAgentConfig produces unique server names for different sessions", () => {
+    const config1 = generateAgentConfig({
+      ...baseOptions,
+      toolsFilePath: "/tmp/kiro-acp/tools-504d74e4-aaaaaaaa.json",
+    })
+    const config2 = generateAgentConfig({
+      ...baseOptions,
+      toolsFilePath: "/tmp/kiro-acp/tools-504d74e4-bbbbbbbb.json",
+    })
+
+    const servers1 = Object.keys(config1.mcpServers as Record<string, unknown>)
+    const servers2 = Object.keys(config2.mcpServers as Record<string, unknown>)
+    expect(servers1[0]).not.toBe(servers2[0])
+    expect(servers1[0]).toBe("kiro-acp-tools-aaaaaaaa")
+    expect(servers2[0]).toBe("kiro-acp-tools-bbbbbbbb")
+  })
 })

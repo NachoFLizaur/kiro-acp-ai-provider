@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync } from "node:fs"
-import { join, dirname } from "node:path"
+import { join, dirname, basename } from "node:path"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -35,7 +35,18 @@ export interface AgentConfigOptions {
  * - Use a minimal custom prompt
  */
 export function generateAgentConfig(options: AgentConfigOptions): Record<string, unknown> {
-  const mcpServerName = `${(options.name ?? "kiro-acp")}-tools`
+  // Extract a unique suffix from the tools file path to make the MCP server
+  // name unique per session. The tools file is named like:
+  //   tools-{cwdHash}-{instanceOrSessionId}.json
+  // We extract the last segment before .json (the instance/session ID) and
+  // append it to the server name. This prevents kiro-cli from merging tools
+  // across MCP servers when multiple sessions share the same workspace.
+  const toolsBaseName = basename(options.toolsFilePath, ".json") // e.g. "tools-504d74e4-760ededf"
+  const segments = toolsBaseName.split("-")
+  const streamSuffix = segments.length >= 3 ? segments[segments.length - 1] : ""
+  const mcpServerName = streamSuffix
+    ? `${(options.name ?? "kiro-acp")}-tools-${streamSuffix}`
+    : `${(options.name ?? "kiro-acp")}-tools`
   const mcpServerRef = `@${mcpServerName}`
 
   return {

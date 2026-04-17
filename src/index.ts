@@ -26,6 +26,7 @@ export {
   createKiroAcp,
   type KiroACPProvider,
   type KiroACPProviderSettings,
+  type KiroACPModelOverrides,
 } from "./kiro-acp-provider"
 
 // Agent Config

@@ -30,12 +30,18 @@ export interface KiroACPProviderSettings {
   contextWindow?: number
 }
 
+/** Per-model overrides accepted by `languageModel()`. */
+export interface KiroACPModelOverrides {
+  /** Override the provider-level context window for this model instance. */
+  contextWindow?: number
+}
+
 /** The KiroACP provider interface. */
 export interface KiroACPProvider {
   /** Create a language model for the given model ID. */
-  (modelId: string): LanguageModelV3
+  (modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3
   /** Create a language model for the given model ID. */
-  languageModel(modelId: string): LanguageModelV3
+  languageModel(modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3
 
   /** Gracefully shut down the kiro-cli process. */
   shutdown(): Promise<void>
@@ -95,19 +101,19 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
   // provide the session ID and inject context.
   let lastModel: KiroACPLanguageModel | null = null
 
-  const createModel = (modelId: string): LanguageModelV3 => {
+  const createModel = (modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3 => {
     const model = new KiroACPLanguageModel(modelId, {
       client,
       sessionId: settings.sessionId,
-      contextWindow: settings.contextWindow,
+      contextWindow: overrides?.contextWindow ?? settings.contextWindow,
     })
     lastModel = model
     return model
   }
 
   // The provider function itself creates a model
-  const provider = ((modelId: string): LanguageModelV3 => {
-    return createModel(modelId)
+  const provider = ((modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3 => {
+    return createModel(modelId, overrides)
   }) as KiroACPProvider
 
   // Attach methods
