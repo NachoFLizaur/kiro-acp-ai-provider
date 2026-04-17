@@ -456,7 +456,10 @@ export class ACPClient {
       // mcpServers is required by the ACP protocol.
       mcpServers: [],
     })
-    return result as ACPSession
+    const session = result as ACPSession
+    // session/load may not include sessionId in the response — inject it
+    if (!session.sessionId) session.sessionId = sessionId
+    return session
   }
 
   // -------------------------------------------------------------------------
