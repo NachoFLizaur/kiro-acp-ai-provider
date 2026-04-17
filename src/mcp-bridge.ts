@@ -2,21 +2,11 @@
 // MCP Bridge Server — Standalone script spawned by kiro-cli
 // ---------------------------------------------------------------------------
 //
-// Usage:
-//   bun /path/to/mcp-bridge.js --tools /path/to/tools.json [--cwd /path]
+// Usage: node mcp-bridge.js --tools /path/to/tools.json [--cwd /path]
 //
-// This file is configured as an MCP server in the kiro agent config.
-// It reads tool definitions from a JSON file and serves them via the MCP
-// protocol over newline-delimited JSON-RPC on stdio.
-//
-// All tool calls are delegated to the harness via IPC. The bridge does NOT
-// execute any tools locally — it acts as a pure relay between kiro-cli and
-// the harness's tool execution pipeline.
-//
-// Communication:
-//   stdin  ← JSON-RPC requests from kiro-cli (one JSON object per line)
-//   stdout → JSON-RPC responses to kiro-cli (one JSON object per line)
-//   stderr → Debug logging (does not interfere with the protocol)
+// Reads tool definitions from a JSON file and serves them via MCP protocol
+// over newline-delimited JSON-RPC on stdio. All tool calls are delegated
+// to the harness via IPC — the bridge does NOT execute tools locally.
 // ---------------------------------------------------------------------------
 
 import { createInterface } from "node:readline"
@@ -25,14 +15,11 @@ import * as http from "node:http"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { ToolExecuteResponse } from "./ipc-server"
 
-// Per-process unique prefix to avoid callId collisions when multiple bridge
-// processes send to the same IPC server. Each process gets a random 6-char ID,
-// producing callIds like "a3f7k2-1", "a3f7k2-2", etc.
+// Per-process unique prefix to avoid callId collisions across bridge processes
 const BRIDGE_ID = Math.random().toString(36).slice(2, 8)
 
-// Monotonic counter combined with BRIDGE_ID to form globally unique callIds.
-// Using the JSON-RPC request ID as callId is unsafe because kiro-cli's request
-// IDs reset per session — concurrent sessions can produce colliding IDs.
+// Monotonic counter — kiro-cli's request IDs reset per session so they're
+// unsafe as callIds for concurrent sessions
 let globalCallCounter = 0
 
 // ---------------------------------------------------------------------------
@@ -192,9 +179,7 @@ class MCPBridgeServer {
     this.ipcPort = ipcPort
   }
 
-  /** Handle an incoming JSON-RPC message and return a response (or null for notifications). */
   async handleMessage(msg: JsonRpcMessage): Promise<JsonRpcResponse | null> {
-    // Notification (no id) — no response needed
     if (!("id" in msg) || msg.id === undefined) {
       this.handleNotification(msg as JsonRpcNotification)
       return null
@@ -269,7 +254,7 @@ class MCPBridgeServer {
   }
 
   private handleToolsList(request: JsonRpcRequest): JsonRpcResponse {
-    // Always re-read from file to pick up dynamic tool changes
+    // Re-read from file to pick up dynamic tool changes
     try {
       const raw = fs.readFileSync(this.toolsPath, "utf-8")
       const parsed = JSON.parse(raw) as MCPToolsFile
@@ -281,7 +266,6 @@ class MCPBridgeServer {
       }
     } catch (err) {
       log("warn", `Failed to re-read tools file on tools/list: ${err}`)
-      // Fall through — serve whatever tools we have cached
     }
 
     return {
@@ -312,7 +296,6 @@ class MCPBridgeServer {
 
     log("info", `Tool call: ${toolName}`, JSON.stringify(toolArgs).slice(0, 200))
 
-    // Verify tool is defined (kiro-cli shouldn't call undefined tools, but be safe)
     const toolDef = this.tools.find((t) => t.name === toolName)
     if (!toolDef) {
       return {
@@ -322,18 +305,15 @@ class MCPBridgeServer {
       }
     }
 
-    // ALL tools are delegated to the harness via IPC
     return this.delegateToIPC(request.id, toolName, toolArgs)
   }
 
-  /** Update the tool list (e.g. when the tools file changes). */
   updateTools(tools: MCPToolDefinition[], ipcPort?: number): void {
     this.tools = tools
     if (ipcPort !== undefined) {
       this.ipcPort = ipcPort
     }
     log("info", `Updated tool list: ${tools.length} tool(s)${ipcPort ? ` (ipcPort: ${ipcPort})` : ""}`)
-    // Emit tools/list_changed notification
     sendNotification("notifications/tools/list_changed", {})
   }
 
@@ -341,7 +321,6 @@ class MCPBridgeServer {
   // IPC delegation
   // -------------------------------------------------------------------------
 
-  /** Check if the IPC server is reachable. */
   private async checkHealth(): Promise<boolean> {
     if (!this.ipcPort) return false
 
@@ -376,7 +355,6 @@ class MCPBridgeServer {
     })
   }
 
-  /** Delegate a tool call to the harness via IPC HTTP (POST /tool/pending). */
   private async delegateToIPC(
     requestId: number | string,
     toolName: string,
@@ -399,7 +377,6 @@ class MCPBridgeServer {
     }
 
     try {
-      // Check health if we haven't confirmed it yet
       if (!this.ipcHealthy) {
         const healthy = await this.checkHealth()
         if (!healthy) {
@@ -421,11 +398,11 @@ class MCPBridgeServer {
         this.ipcHealthy = true
       }
 
-      // POST to /tool/pending — this will BLOCK until the harness executes the tool
+      // Blocks until the harness executes the tool
       const response = await httpPost(
         `http://127.0.0.1:${this.ipcPort}/tool/pending`,
         { callId: `${BRIDGE_ID}-${++globalCallCounter}`, toolName, args },
-        310_000, // HTTP timeout: 10s longer than IPC hold timeout
+        310_000,
       )
 
       if (response.status === "success") {
@@ -447,7 +424,7 @@ class MCPBridgeServer {
         }
       }
     } catch (err) {
-      this.ipcHealthy = false // Reset health cache on failure
+      this.ipcHealthy = false
       const message = err instanceof Error ? err.message : String(err)
       log("error", `IPC delegation failed for ${toolName}:`, message)
       return {
@@ -486,7 +463,6 @@ function watchToolsFile(toolsPath: string, server: MCPBridgeServer): void {
     let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
     fs.watch(toolsPath, () => {
-      // Debounce rapid changes
       if (debounceTimer) clearTimeout(debounceTimer)
       debounceTimer = setTimeout(() => {
         try {
@@ -517,16 +493,13 @@ async function main(): Promise<void> {
   log("info", `Starting MCP bridge server (cwd: ${cwd})`)
   log("info", `Tools file: ${toolsPath}`)
 
-  // Load initial tool definitions
   const toolsFile = loadToolsFile(toolsPath)
   const effectiveCwd = toolsFile.cwd ?? cwd
 
   const server = new MCPBridgeServer(toolsFile.tools, effectiveCwd, toolsPath, toolsFile.ipcPort)
 
-  // Watch for tool file changes
   watchToolsFile(toolsPath, server)
 
-  // Set up line-by-line reading from stdin
   const rl = createInterface({ input: process.stdin })
 
   rl.on("line", async (line: string) => {
@@ -547,13 +520,11 @@ async function main(): Promise<void> {
     }
   })
 
-  // Exit cleanly when stdin closes
   rl.on("close", () => {
     log("info", "stdin closed, shutting down")
     process.exit(0)
   })
 
-  // Handle process signals
   process.on("SIGTERM", () => {
     log("info", "Received SIGTERM, shutting down")
     process.exit(0)
