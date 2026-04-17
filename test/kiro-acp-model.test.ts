@@ -49,6 +49,13 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
         models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
       } satisfies ACPSession),
     ),
+    createSessionWithToolsPath: mock(() =>
+      Promise.resolve({
+        sessionId: "sess-1",
+        modes: { currentModeId: "agent", availableModes: [] },
+        models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+      } satisfies ACPSession),
+    ),
     loadSession: mock(() => Promise.resolve({} as ACPSession)),
     prompt: mock(() => Promise.resolve({ stopReason: "end_turn" })),
     setModel: mock(() => Promise.resolve()),
@@ -66,6 +73,9 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     getLaneRouter: mock(() => mockLaneRouter),
     setPromptCallback: mock(() => {}),
     waitForToolsReady: mock(() => Promise.resolve()),
+    getOrCreateToolsFilePath: mock(() => "/tmp/tools.json"),
+    createSessionToolsFilePath: mock((id: string) => `/tmp/kiro-acp/tools-test-${id}.json`),
+    removeSessionToolsFile: mock(() => {}),
     ...overrides,
   } as unknown as ACPClient
 }
@@ -138,7 +148,7 @@ describe("KiroACPLanguageModel", () => {
       expect(client.createSession).toHaveBeenCalledTimes(1)
     })
 
-    test("reuses session across multiple doStream calls", async () => {
+    test("creates a new session for each doStream call (no reuse)", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -163,8 +173,8 @@ describe("KiroACPLanguageModel", () => {
       )
       await collectStream(r2.stream)
 
-      // Session should only be created once
-      expect(client.createSession).toHaveBeenCalledTimes(1)
+      // Each doStream should create its own session — no reuse
+      expect(client.createSession).toHaveBeenCalledTimes(2)
       expect(client.start).toHaveBeenCalledTimes(1)
     })
 
@@ -1099,7 +1109,7 @@ describe("KiroACPLanguageModel", () => {
       const toolsFile = join(toolsDir, "tools.json")
 
       const client = createMockClient({
-        getOrCreateToolsFilePath: mock(() => toolsFile),
+        createSessionToolsFilePath: mock(() => toolsFile),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -1184,7 +1194,7 @@ describe("KiroACPLanguageModel", () => {
       const toolsFile = join(toolsDir, "tools.json")
 
       const client = createMockClient({
-        getOrCreateToolsFilePath: mock(() => toolsFile),
+        createSessionToolsFilePath: mock(() => toolsFile),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -1237,7 +1247,7 @@ describe("KiroACPLanguageModel", () => {
       const toolsFile = join(toolsDir, "tools.json")
 
       const client = createMockClient({
-        getOrCreateToolsFilePath: mock(() => toolsFile),
+        createSessionToolsFilePath: mock(() => toolsFile),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
             sessionUpdate: "agent_message_chunk",
@@ -1265,7 +1275,7 @@ describe("KiroACPLanguageModel", () => {
       const toolsFile = join(toolsDir, "tools.json")
 
       const client = createMockClient({
-        getOrCreateToolsFilePath: mock(() => toolsFile),
+        createSessionToolsFilePath: mock(() => toolsFile),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -1314,7 +1324,7 @@ describe("KiroACPLanguageModel", () => {
       const toolsFile = join(toolsDir, "tools.json")
 
       const client = createMockClient({
-        getOrCreateToolsFilePath: mock(() => toolsFile),
+        createSessionToolsFilePath: mock(() => toolsFile),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -1353,16 +1363,19 @@ describe("KiroACPLanguageModel", () => {
       expect(written.tools[0].description).toBe("")
     })
 
-    test("skips writing when tools have not changed (change detection)", async () => {
+    test("writes a new tools file for each doStream call (no reuse)", async () => {
       const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
       mkdirSync(toolsDir, { recursive: true })
-      const toolsFile = join(toolsDir, "tools.json")
 
-      let writeCount = 0
-      const originalGetOrCreate = mock(() => toolsFile)
+      let callCount = 0
+      const toolsFiles: string[] = []
 
       const client = createMockClient({
-        getOrCreateToolsFilePath: originalGetOrCreate,
+        createSessionToolsFilePath: mock((id: string) => {
+          const path = join(toolsDir, `tools-${id}.json`)
+          toolsFiles.push(path)
+          return path
+        }),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -1390,7 +1403,7 @@ describe("KiroACPLanguageModel", () => {
         },
       ]
 
-      // First call — should write
+      // First call — writes tools file
       const r1 = await model.doStream(
         makeCallOptions(
           [{ role: "user", content: [{ type: "text", text: "hello" }] }],
@@ -1398,13 +1411,8 @@ describe("KiroACPLanguageModel", () => {
         ),
       )
       await collectStream(r1.stream)
-      expect(existsSync(toolsFile)).toBe(true)
-      const mtime1 = Bun.file(toolsFile).lastModified
 
-      // Small delay to ensure mtime would differ if file were rewritten
-      await new Promise(r => setTimeout(r, 50))
-
-      // Second call with same tools — should NOT rewrite
+      // Second call with same tools — still writes a NEW tools file
       const r2 = await model.doStream(
         makeCallOptions(
           [{ role: "user", content: [{ type: "text", text: "hello again" }] }],
@@ -1412,20 +1420,20 @@ describe("KiroACPLanguageModel", () => {
         ),
       )
       await collectStream(r2.stream)
-      const mtime2 = Bun.file(toolsFile).lastModified
 
-      // File should not have been rewritten (same mtime)
-      expect(mtime2).toBe(mtime1)
+      // Each doStream should create its own tools file (different paths)
+      expect(toolsFiles).toHaveLength(2)
+      expect(toolsFiles[0]).not.toBe(toolsFiles[1])
     })
 
-    test("calls waitForToolsReady when tools change mid-session", async () => {
+    test("does not call waitForToolsReady since each doStream creates a new session", async () => {
       const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
       mkdirSync(toolsDir, { recursive: true })
-      const toolsFile = join(toolsDir, "tools.json")
 
+      let fileCount = 0
       const client = createMockClient({
         isRunning: mock(() => true),
-        getOrCreateToolsFilePath: mock(() => toolsFile),
+        createSessionToolsFilePath: mock((id: string) => join(toolsDir, `tools-${id}.json`)),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
@@ -1451,7 +1459,7 @@ describe("KiroACPLanguageModel", () => {
         },
       ]
 
-      // First call — writes tools, client already running
+      // First call
       const r1 = await model.doStream(
         makeCallOptions(
           [{ role: "user", content: [{ type: "text", text: "hello" }] }],
@@ -1460,16 +1468,8 @@ describe("KiroACPLanguageModel", () => {
       )
       await collectStream(r1.stream)
 
-      // waitForToolsReady should have been called (tools changed + client running)
-      expect(client.waitForToolsReady).toHaveBeenCalledWith({
-        timeoutMs: 3000,
-        expectedTools: ["bash"],
-      })
-
-      // Reset mock to check second call
-      ;(client.waitForToolsReady as ReturnType<typeof mock>).mockClear()
-
-      // Second call with different tools — should trigger waitForToolsReady again
+      // Second call with different tools — each gets a new session,
+      // so no waitForToolsReady is needed (tools are written before session creation)
       const tools2: LanguageModelV3FunctionTool[] = [
         ...tools1,
         {
@@ -1492,10 +1492,9 @@ describe("KiroACPLanguageModel", () => {
       )
       await collectStream(r2.stream)
 
-      expect(client.waitForToolsReady).toHaveBeenCalledWith({
-        timeoutMs: 3000,
-        expectedTools: ["bash", "read"],
-      })
+      // waitForToolsReady should NOT be called — each doStream creates a new
+      // session with tools written before creation, so the bridge reads them on spawn
+      expect(client.waitForToolsReady).not.toHaveBeenCalled()
     })
 
     test("does not call waitForToolsReady when tools change but client is not running", async () => {
@@ -1505,7 +1504,7 @@ describe("KiroACPLanguageModel", () => {
 
       const client = createMockClient({
         isRunning: mock(() => false),
-        getOrCreateToolsFilePath: mock(() => toolsFile),
+        createSessionToolsFilePath: mock(() => toolsFile),
         getCwd: mock(() => "/tmp/project"),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({

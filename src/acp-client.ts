@@ -1,9 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process"
 import { createInterface, type Interface as ReadlineInterface } from "node:readline"
-import { createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { generateAgentConfig, writeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
@@ -216,6 +216,34 @@ export class ACPClient {
   private availableTools: AvailableTool[] = []
   private toolsReadyListeners = new Set<(tools: AvailableTool[]) => void>()
 
+  /**
+   * Per-instance unique ID used to isolate the tools file from other
+   * concurrent ACPClient instances (e.g. parent agent vs child subagent).
+   *
+   * Without this, all clients sharing the same cwd would read/write the
+   * same `tools-{cwdHash}.json` file, causing a child subagent's smaller
+   * tool set to overwrite the parent's tools — making kiro-cli's model
+   * lose access to tools like `task` and `bash`.
+   */
+  private readonly instanceId = randomBytes(4).toString("hex")
+
+  /**
+   * Tracks all per-session tools file paths created via `createSessionToolsFilePath()`.
+   * These are cleaned up when `stop()` is called.
+   */
+  private readonly sessionToolsFiles = new Set<string>()
+
+  /**
+   * Mutex for serializing agent config rewrites + session creation.
+   *
+   * When multiple model instances try to create sessions concurrently,
+   * each needs to: (1) rewrite the agent config with its tools path,
+   * (2) call createSession(). These two steps must be atomic — otherwise
+   * model A rewrites the config, model B rewrites it again, then model A
+   * creates a session that reads model B's config.
+   */
+  private sessionCreationLock: Promise<void> = Promise.resolve()
+
   constructor(options: ACPClientOptions) {
     this.options = options
   }
@@ -224,8 +252,17 @@ export class ACPClient {
   // Lifecycle
   // -------------------------------------------------------------------------
 
-  /** Spawn kiro-cli acp and perform the initialize handshake. */
-  async start(): Promise<InitializeResult> {
+  /**
+   * Spawn kiro-cli acp and perform the initialize handshake.
+   *
+   * @param toolsFilePath - Optional path to a POPULATED tools file. When
+   *   provided, the agent config will point to this file from the start,
+   *   ensuring the MCP bridge sees the full tool set on its first query.
+   *   Without this, a placeholder with 0 tools is used (the agent config
+   *   will be rewritten by `createSessionWithToolsPath()` before any
+   *   session is created, so the placeholder is never read by a bridge).
+   */
+  async start(toolsFilePath?: string): Promise<InitializeResult> {
     if (this.running) throw new KiroACPConnectionError("Client is already running")
 
     // Start IPC server for tool call synchronization.
@@ -236,8 +273,11 @@ export class ACPClient {
 
     // Generate agent config before spawning kiro-cli so it can find the
     // .kiro/agents/<agent>.json file with MCP bridge configuration.
+    // When a toolsFilePath is provided (from the model's writeToolsFile),
+    // the agent config points directly to the populated file — no empty
+    // placeholder is created.
     if (this.options.agent) {
-      this.setupAgentConfig()
+      this.setupAgentConfig(toolsFilePath)
     }
 
     const args = ["acp"]
@@ -369,6 +409,27 @@ export class ACPClient {
       this.ipcServer = null
       this.ipcPort = null
     }
+
+    // Clean up the per-instance tools file so temp dir doesn't accumulate
+    // stale files from previous sessions.
+    if (this.toolsFilePath) {
+      try {
+        unlinkSync(this.toolsFilePath)
+      } catch {
+        // File may already be gone — ignore
+      }
+      this.toolsFilePath = null
+    }
+
+    // Clean up per-session tools files
+    for (const filePath of this.sessionToolsFiles) {
+      try {
+        unlinkSync(filePath)
+      } catch {
+        // File may already be gone — ignore
+      }
+    }
+    this.sessionToolsFiles.clear()
   }
 
   // -------------------------------------------------------------------------
@@ -520,19 +581,20 @@ export class ACPClient {
   }
 
   /**
-   * Get or create the tools file path deterministically.
+   * Get or create the tools file path for this client instance.
    *
-   * This allows the adapter to write tool definitions BEFORE `start()` is
-   * called (and before `setupAgentConfig()` runs), so that when kiro-cli
-   * spawns the MCP bridge and queries `tools/list`, the full tool set is
-   * already on disk.
+   * Each ACPClient instance gets its own tools file to prevent concurrent
+   * sessions (e.g. parent agent + child subagent) from overwriting each
+   * other's tool definitions. The path includes both a cwd hash (for
+   * project isolation) and a per-instance ID (for session isolation):
    *
-   * The path is stable across restarts for the same project directory:
-   * `{tmpdir}/kiro-acp/tools-{cwdHash}.json`. This avoids the stale-path
-   * problem that occurred when using `process.pid` — on restart, the PID
-   * changes but the agent config still referenced the old file. Using a
-   * hash of `cwd` ensures the same project always maps to the same file,
-   * while different projects running simultaneously get separate files.
+   *   `{tmpdir}/kiro-acp/tools-{cwdHash}-{instanceId}.json`
+   *
+   * This replaces the previous `tools-{cwdHash}.json` scheme which was
+   * shared across all sessions for the same cwd, causing a child subagent
+   * to overwrite the parent's tools file.
+   *
+   * The file is cleaned up when `stop()` is called.
    */
   getOrCreateToolsFilePath(): string {
     if (this.toolsFilePath) return this.toolsFilePath
@@ -540,8 +602,89 @@ export class ACPClient {
     const toolsDir = join(tmpdir(), "kiro-acp")
     mkdirSync(toolsDir, { recursive: true })
     const cwdHash = createHash("md5").update(this.options.cwd).digest("hex").slice(0, 8)
-    this.toolsFilePath = join(toolsDir, `tools-${cwdHash}.json`)
+    this.toolsFilePath = join(toolsDir, `tools-${cwdHash}-${this.instanceId}.json`)
     return this.toolsFilePath
+  }
+
+  /**
+   * Create a unique tools file path for a specific ACP session.
+   *
+   * Each ACP session gets its own tools file so that concurrent sessions
+   * (e.g. parent agent + child subagent) don't overwrite each other's
+   * tool definitions. The path includes the client's cwd hash and a
+   * session-specific unique ID:
+   *
+   *   `{tmpdir}/kiro-acp/tools-{cwdHash}-{sessionUniqueId}.json`
+   *
+   * The file is tracked and cleaned up when `stop()` is called or when
+   * `removeSessionToolsFile()` is called for individual cleanup.
+   */
+  createSessionToolsFilePath(sessionUniqueId: string): string {
+    const toolsDir = join(tmpdir(), "kiro-acp")
+    mkdirSync(toolsDir, { recursive: true })
+    const cwdHash = createHash("md5").update(this.options.cwd).digest("hex").slice(0, 8)
+    const filePath = join(toolsDir, `tools-${cwdHash}-${sessionUniqueId}.json`)
+    this.sessionToolsFiles.add(filePath)
+    return filePath
+  }
+
+  /**
+   * Remove a session tools file from tracking and delete from disk.
+   * Called when a session is released/destroyed.
+   */
+  removeSessionToolsFile(filePath: string): void {
+    this.sessionToolsFiles.delete(filePath)
+    try {
+      unlinkSync(filePath)
+    } catch {
+      // File may already be gone — ignore
+    }
+  }
+
+  /**
+   * Rewrite the agent config to point to a different tools file path,
+   * then create a new session. The two operations are atomic (protected
+   * by a mutex) to prevent concurrent model instances from interfering.
+   *
+   * This is the key mechanism for per-session tool isolation:
+   * 1. Rewrite `.kiro/agents/<agent>.json` with the new tools path
+   * 2. Call `session/new` — kiro-cli spawns a new MCP bridge that reads
+   *    the updated config and uses the model-specific tools file
+   * 3. The previously spawned bridges are unaffected (they were spawned
+   *    with their own `--tools` path from the config at their spawn time)
+   *
+   * @returns The new ACP session.
+   */
+  async createSessionWithToolsPath(toolsFilePath: string): Promise<ACPSession> {
+    // Serialize: wait for any in-flight session creation to complete
+    const previousLock = this.sessionCreationLock
+    let releaseLock: () => void
+    this.sessionCreationLock = new Promise<void>((resolve) => {
+      releaseLock = resolve
+    })
+
+    try {
+      await previousLock
+
+      // Rewrite agent config to point to this model's tools file
+      if (this.options.agent) {
+        const bridgePath = this.resolveBridgePath()
+        const config = generateAgentConfig({
+          name: this.options.agent,
+          mcpBridgePath: bridgePath,
+          toolsFilePath,
+          cwd: this.options.cwd,
+          prompt: this.options.agentPrompt,
+        })
+        writeAgentConfig(this.options.cwd, this.options.agent, config)
+      }
+
+      // Create the session — kiro-cli will spawn a new MCP bridge
+      // that reads the updated agent config
+      return await this.createSession()
+    } finally {
+      releaseLock!()
+    }
   }
 
   /** Get the IPC server port (if running). */
@@ -630,11 +773,15 @@ export class ACPClient {
    * Generate and write the agent config file so kiro-cli can discover the
    * MCP bridge server and tool definitions.
    *
-   * Writes:
-   * 1. A tools JSON file to a temp directory
-   * 2. The agent config to `{cwd}/.kiro/agents/{agent}.json`
+   * @param populatedToolsFilePath - Optional path to a tools file that has
+   *   ALREADY been populated with the model's tools. When provided, the
+   *   agent config points directly to this file and the IPC port is injected
+   *   if missing. When absent, a placeholder tools file with 0 tools is
+   *   created — this is safe because `createSessionWithToolsPath()` will
+   *   rewrite the agent config to point to the model's populated file
+   *   BEFORE any session (and thus any MCP bridge) is created.
    */
-  private setupAgentConfig(): void {
+  private setupAgentConfig(populatedToolsFilePath?: string): void {
     // Resolve the bridge path on the real filesystem.
     // When this package is compiled into a Bun binary (bun build --compile),
     // import.meta.url resolves to a virtual path like /$bunfs/root/... which
@@ -643,34 +790,39 @@ export class ACPClient {
     // file in node_modules.
     const bridgePath = this.resolveBridgePath()
 
-    // Get or create the tools file path. If the adapter already wrote tools
-    // (via writeToolsFile before start), this reuses that path and we only
-    // inject the IPC port. Otherwise, write an empty tools array as a
-    // placeholder — the real tools will be written by writeToolsFile() in
-    // doStream() BEFORE the first prompt is sent to kiro.
+    // Determine which tools file to use in the agent config.
     //
-    // We intentionally do NOT seed default tools here. Seeding defaults
-    // (e.g. list_directory, read_file) caused stale tool definitions to
-    // persist in the tools file and get merged into the harness's real
-    // tools, making the model try to call tools the harness doesn't support.
-    const toolsFile = this.getOrCreateToolsFilePath()
-    try {
-      // Check if the file already exists (adapter wrote tools before start)
-      const existing = readFileSync(toolsFile, "utf-8")
-      const parsed = JSON.parse(existing) as { tools?: unknown[]; ipcPort?: number }
-      if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) {
-        throw new Error("empty or invalid tools file")
+    // When a populated tools file path is provided (from the model's
+    // writeToolsFile), use it directly — this ensures the MCP bridge sees
+    // the full tool set from the very first `tools/list` query.
+    //
+    // When no path is provided, create a placeholder. The placeholder will
+    // never be read by an MCP bridge because `createSessionWithToolsPath()`
+    // rewrites the agent config before any session is created.
+    let toolsFile: string
+    if (populatedToolsFilePath) {
+      toolsFile = populatedToolsFilePath
+      // Ensure ipcPort is present. The model may have written tools before
+      // start() was called (when ipcPort was still null). Now that the IPC
+      // server is running, inject the port so the MCP bridge can delegate.
+      if (this.ipcPort != null) {
+        try {
+          const existing = readFileSync(toolsFile, "utf-8")
+          const parsed = JSON.parse(existing) as { ipcPort?: number }
+          if (parsed.ipcPort !== this.ipcPort) {
+            ;(parsed as Record<string, unknown>).ipcPort = this.ipcPort
+            writeFileSync(toolsFile, JSON.stringify(parsed, null, 2))
+          }
+        } catch {
+          // File read/parse failed — will be handled by writeToolsFile later
+        }
       }
-      // File exists with tools — don't overwrite.
-      // But DO ensure ipcPort is present. The adapter may have written tools
-      // before start() was called (when ipcPort was still null). Now that the
-      // IPC server is running, inject the port so the MCP bridge can delegate.
-      if (this.ipcPort != null && parsed.ipcPort !== this.ipcPort) {
-        parsed.ipcPort = this.ipcPort
-        writeFileSync(toolsFile, JSON.stringify(parsed, null, 2))
-      }
-    } catch {
-      // File doesn't exist or is invalid — write empty placeholder
+    } else {
+      // No populated tools file — create a placeholder.
+      // This is safe: createSessionWithToolsPath() will rewrite the agent
+      // config to point to the model's populated file before any session
+      // (and thus any MCP bridge) is created.
+      toolsFile = this.getOrCreateToolsFilePath()
       const toolsData = {
         tools: [],
         cwd: this.options.cwd,
