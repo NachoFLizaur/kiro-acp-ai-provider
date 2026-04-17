@@ -15,6 +15,15 @@ export interface AgentConfigOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Sanitize a name for safe use in file paths. */
+function sanitizeName(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_")
+}
+
+// ---------------------------------------------------------------------------
 // Config generation
 // ---------------------------------------------------------------------------
 
@@ -61,11 +70,12 @@ export function writeAgentConfig(
   name: string,
   config: Record<string, unknown>,
 ): string {
+  const safeName = sanitizeName(name)
   const agentsDir = join(dir, ".kiro", "agents")
-  const filePath = join(agentsDir, `${name}.json`)
+  const filePath = join(agentsDir, `${safeName}.json`)
 
   mkdirSync(dirname(filePath), { recursive: true })
-  writeFileSync(filePath, JSON.stringify(config, null, 2) + "\n", "utf-8")
+  writeFileSync(filePath, JSON.stringify(config, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 })
 
   return filePath
 }

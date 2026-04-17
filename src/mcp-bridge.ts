@@ -12,11 +12,12 @@
 import { createInterface } from "node:readline"
 import * as fs from "node:fs"
 import * as http from "node:http"
+import { randomBytes } from "node:crypto"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { ToolExecuteResponse } from "./ipc-server"
 
 // Per-process unique prefix to avoid callId collisions across bridge processes
-const BRIDGE_ID = Math.random().toString(36).slice(2, 8)
+const BRIDGE_ID = randomBytes(4).toString("hex")
 
 // Monotonic counter — kiro-cli's request IDs reset per session so they're
 // unsafe as callIds for concurrent sessions
@@ -117,10 +118,18 @@ function loadToolsFile(toolsPath: string): MCPToolsFile {
 // HTTP client for IPC delegation
 // ---------------------------------------------------------------------------
 
-function httpPost(url: string, body: unknown, timeoutMs: number = 310_000): Promise<ToolExecuteResponse> {
+function httpPost(url: string, body: unknown, timeoutMs: number = 310_000, authToken?: string): Promise<ToolExecuteResponse> {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body)
     const parsed = new URL(url)
+
+    const headers: Record<string, string | number> = {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(data),
+    }
+    if (authToken) {
+      headers["Authorization"] = `Bearer ${authToken}`
+    }
 
     const req = http.request(
       {
@@ -128,10 +137,7 @@ function httpPost(url: string, body: unknown, timeoutMs: number = 310_000): Prom
         port: parsed.port,
         path: parsed.pathname,
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(data),
-        },
+        headers,
         timeout: timeoutMs,
       },
       (res) => {
@@ -169,14 +175,16 @@ class MCPBridgeServer {
   private readonly cwd: string
   private readonly toolsPath: string
   private ipcPort: number | undefined
+  private ipcSecret: string | undefined
   private ipcHealthy = false
   private initialized = false
 
-  constructor(tools: MCPToolDefinition[], cwd: string, toolsPath: string, ipcPort?: number) {
+  constructor(tools: MCPToolDefinition[], cwd: string, toolsPath: string, ipcPort?: number, ipcSecret?: string) {
     this.tools = tools
     this.cwd = cwd
     this.toolsPath = toolsPath
     this.ipcPort = ipcPort
+    this.ipcSecret = ipcSecret
   }
 
   async handleMessage(msg: JsonRpcMessage): Promise<JsonRpcResponse | null> {
@@ -264,6 +272,9 @@ class MCPBridgeServer {
       if (parsed.ipcPort !== undefined) {
         this.ipcPort = parsed.ipcPort
       }
+      if (parsed.ipcSecret !== undefined) {
+        this.ipcSecret = parsed.ipcSecret
+      }
     } catch (err) {
       log("warn", `Failed to re-read tools file on tools/list: ${err}`)
     }
@@ -308,10 +319,13 @@ class MCPBridgeServer {
     return this.delegateToIPC(request.id, toolName, toolArgs)
   }
 
-  updateTools(tools: MCPToolDefinition[], ipcPort?: number): void {
+  updateTools(tools: MCPToolDefinition[], ipcPort?: number, ipcSecret?: string): void {
     this.tools = tools
     if (ipcPort !== undefined) {
       this.ipcPort = ipcPort
+    }
+    if (ipcSecret !== undefined) {
+      this.ipcSecret = ipcSecret
     }
     log("info", `Updated tool list: ${tools.length} tool(s)${ipcPort ? ` (ipcPort: ${ipcPort})` : ""}`)
     sendNotification("notifications/tools/list_changed", {})
@@ -403,6 +417,7 @@ class MCPBridgeServer {
         `http://127.0.0.1:${this.ipcPort}/tool/pending`,
         { callId: `${BRIDGE_ID}-${++globalCallCounter}`, toolName, args },
         310_000,
+        this.ipcSecret,
       )
 
       if (response.status === "success") {
@@ -469,7 +484,7 @@ function watchToolsFile(toolsPath: string, server: MCPBridgeServer): void {
           const raw = fs.readFileSync(toolsPath, "utf-8")
           const parsed = JSON.parse(raw) as MCPToolsFile
           if (Array.isArray(parsed.tools)) {
-            server.updateTools(parsed.tools, parsed.ipcPort)
+            server.updateTools(parsed.tools, parsed.ipcPort, parsed.ipcSecret)
           }
         } catch (err) {
           log("warn", `Failed to reload tools file: ${err}`)
@@ -496,7 +511,7 @@ async function main(): Promise<void> {
   const toolsFile = loadToolsFile(toolsPath)
   const effectiveCwd = toolsFile.cwd ?? cwd
 
-  const server = new MCPBridgeServer(toolsFile.tools, effectiveCwd, toolsPath, toolsFile.ipcPort)
+  const server = new MCPBridgeServer(toolsFile.tools, effectiveCwd, toolsPath, toolsFile.ipcPort, toolsFile.ipcSecret)
 
   watchToolsFile(toolsPath, server)
 

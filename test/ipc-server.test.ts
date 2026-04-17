@@ -17,11 +17,15 @@ async function httpRequest(
   method: string,
   path: string,
   body?: unknown,
+  authToken?: string,
 ): Promise<{ status: number; body: unknown }> {
   const url = `http://127.0.0.1:${port}${path}`
+  const headers: Record<string, string> = {}
+  if (body) headers["Content-Type"] = "application/json"
+  if (authToken) headers["Authorization"] = `Bearer ${authToken}`
   const options: RequestInit = {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   }
 
@@ -43,6 +47,7 @@ async function httpRequest(
 describe("IPCServer", () => {
   let server: IPCServer
   let port: number
+  let secret: string
 
   afterEach(async () => {
     if (server) {
@@ -93,6 +98,7 @@ describe("IPCServer", () => {
     test("resolves pending calls with error on stop", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       // Register a lane so the call gets routed
       const router = server.getLaneRouter()
@@ -105,7 +111,7 @@ describe("IPCServer", () => {
         callId: "call-1",
         toolName: "bash",
         args: { command: "ls" },
-      })
+      }, secret)
 
       // Give the request time to reach the server
       await new Promise((r) => setTimeout(r, 50))
@@ -125,6 +131,55 @@ describe("IPCServer", () => {
       } catch {
         // Connection error is also acceptable — server closed
       }
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Authentication
+  // -------------------------------------------------------------------------
+
+  describe("authentication", () => {
+    test("returns 401 for requests without Authorization header", async () => {
+      server = createIPCServer()
+      port = await server.start()
+
+      const { status } = await httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-1",
+        toolName: "bash",
+        args: {},
+      })
+
+      expect(status).toBe(401)
+    })
+
+    test("returns 401 for requests with invalid token", async () => {
+      server = createIPCServer()
+      port = await server.start()
+
+      const { status } = await httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-1",
+        toolName: "bash",
+        args: {},
+      }, "wrong-token")
+
+      expect(status).toBe(401)
+    })
+
+    test("health endpoint does not require authentication", async () => {
+      server = createIPCServer()
+      port = await server.start()
+
+      const { status } = await httpRequest(port, "GET", "/health")
+      expect(status).toBe(200)
+    })
+
+    test("getSecret() returns a non-empty hex string", () => {
+      server = createIPCServer()
+      secret = server.getSecret()
+
+      expect(secret).toBeTruthy()
+      expect(secret).toMatch(/^[a-f0-9]+$/)
+      expect(secret.length).toBe(64) // 32 bytes = 64 hex chars
     })
   })
 
@@ -155,6 +210,7 @@ describe("IPCServer", () => {
     test("holds response until result is sent via /tool/result", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       // Register a lane to capture the tool call
       let receivedCall: PendingToolCall | null = null
@@ -168,7 +224,7 @@ describe("IPCServer", () => {
         callId: "call-1",
         toolName: "bash",
         args: { command: "echo hello" },
-      })
+      }, secret)
 
       // Wait for the call to be registered
       await new Promise((r) => setTimeout(r, 50))
@@ -184,7 +240,7 @@ describe("IPCServer", () => {
         callId: "call-1",
         result: "hello\n",
         isError: false,
-      })
+      }, secret)
 
       expect(resultResponse.status).toBe(200)
       expect((resultResponse.body as { status: string }).status).toBe("ok")
@@ -202,6 +258,7 @@ describe("IPCServer", () => {
     test("returns error result when isError is true", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       server.getLaneRouter().register("sess-1", () => {})
 
@@ -209,7 +266,7 @@ describe("IPCServer", () => {
         callId: "call-err",
         toolName: "bash",
         args: { command: "false" },
-      })
+      }, secret)
 
       await new Promise((r) => setTimeout(r, 50))
 
@@ -217,7 +274,7 @@ describe("IPCServer", () => {
         callId: "call-err",
         result: "Command failed with exit code 1",
         isError: true,
-      })
+      }, secret)
 
       const pendingResult = await pendingPromise
       const body = pendingResult.body as ToolExecuteResponse
@@ -228,11 +285,12 @@ describe("IPCServer", () => {
     test("returns 404 for /tool/result with unknown callId", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       const { status, body } = await httpRequest(port, "POST", "/tool/result", {
         callId: "nonexistent",
         result: "some result",
-      })
+      }, secret)
 
       expect(status).toBe(404)
       expect((body as { code: string }).code).toBe("NOT_FOUND")
@@ -241,10 +299,14 @@ describe("IPCServer", () => {
     test("returns INVALID_REQUEST for malformed JSON on /tool/pending", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       const response = await fetch(`http://127.0.0.1:${port}/tool/pending`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${secret}`,
+        },
         body: "not valid json{{{",
       })
 
@@ -256,10 +318,11 @@ describe("IPCServer", () => {
     test("returns INVALID_REQUEST for missing required fields on /tool/pending", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       const { status, body } = await httpRequest(port, "POST", "/tool/pending", {
         args: {},
-      })
+      }, secret)
 
       expect(status).toBe(400)
       expect((body as { code: string }).code).toBe("INVALID_REQUEST")
@@ -268,6 +331,7 @@ describe("IPCServer", () => {
     test("handles concurrent pending calls", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       const receivedCalls: PendingToolCall[] = []
       server.getLaneRouter().register("sess-1", (call) => {
@@ -280,17 +344,17 @@ describe("IPCServer", () => {
           callId: "call-a",
           toolName: "bash",
           args: { command: "echo a" },
-        }),
+        }, secret),
         httpRequest(port, "POST", "/tool/pending", {
           callId: "call-b",
           toolName: "read_file",
           args: { filePath: "/tmp/test" },
-        }),
+        }, secret),
         httpRequest(port, "POST", "/tool/pending", {
           callId: "call-c",
           toolName: "glob",
           args: { pattern: "*.ts" },
-        }),
+        }, secret),
       ]
 
       await new Promise((r) => setTimeout(r, 50))
@@ -298,9 +362,9 @@ describe("IPCServer", () => {
       expect(receivedCalls).toHaveLength(3)
 
       // Resolve all
-      await httpRequest(port, "POST", "/tool/result", { callId: "call-a", result: "a" })
-      await httpRequest(port, "POST", "/tool/result", { callId: "call-b", result: "b" })
-      await httpRequest(port, "POST", "/tool/result", { callId: "call-c", result: "c" })
+      await httpRequest(port, "POST", "/tool/result", { callId: "call-a", result: "a" }, secret)
+      await httpRequest(port, "POST", "/tool/result", { callId: "call-b", result: "b" }, secret)
+      await httpRequest(port, "POST", "/tool/result", { callId: "call-c", result: "c" }, secret)
 
       const results = await Promise.all(promises)
       for (const r of results) {
@@ -319,6 +383,7 @@ describe("IPCServer", () => {
     test("resolves a pending call directly (in-process)", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       server.getLaneRouter().register("sess-1", () => {})
 
@@ -326,7 +391,7 @@ describe("IPCServer", () => {
         callId: "call-direct",
         toolName: "bash",
         args: {},
-      })
+      }, secret)
 
       await new Promise((r) => setTimeout(r, 50))
       expect(server.getPendingCount()).toBe(1)
@@ -362,6 +427,7 @@ describe("IPCServer", () => {
     test("notifies lane handler when a pending call arrives", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       const calls: PendingToolCall[] = []
       server.getLaneRouter().register("sess-1", (call) => {
@@ -373,7 +439,7 @@ describe("IPCServer", () => {
         callId: "call-notify",
         toolName: "bash",
         args: { command: "ls" },
-      })
+      }, secret)
 
       await new Promise((r) => setTimeout(r, 50))
 
@@ -389,13 +455,14 @@ describe("IPCServer", () => {
     test("buffers calls that arrive before a lane is registered", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       // Start a pending call WITHOUT a lane registered
       const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
         callId: "call-buffered",
         toolName: "bash",
         args: { command: "ls" },
-      })
+      }, secret)
 
       await new Promise((r) => setTimeout(r, 50))
 
@@ -422,6 +489,7 @@ describe("IPCServer", () => {
     test("cancels a pending tool call", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       server.getLaneRouter().register("sess-1", () => {})
 
@@ -430,7 +498,7 @@ describe("IPCServer", () => {
         callId: "call-cancel-1",
         toolName: "bash",
         args: {},
-      })
+      }, secret)
 
       await new Promise((r) => setTimeout(r, 50))
       expect(server.getPendingCount()).toBe(1)
@@ -438,7 +506,7 @@ describe("IPCServer", () => {
       // Cancel it
       const cancelResult = await httpRequest(port, "POST", "/tool/cancel", {
         callId: "call-cancel-1",
-      })
+      }, secret)
 
       expect((cancelResult.body as { cancelled: boolean }).cancelled).toBe(true)
 
@@ -454,10 +522,11 @@ describe("IPCServer", () => {
     test("returns cancelled: false for unknown callId", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       const { body } = await httpRequest(port, "POST", "/tool/cancel", {
         callId: "nonexistent",
-      })
+      }, secret)
 
       expect((body as { cancelled: boolean }).cancelled).toBe(false)
     })
@@ -465,31 +534,43 @@ describe("IPCServer", () => {
     test("returns error for missing callId", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
-      const { status } = await httpRequest(port, "POST", "/tool/cancel", {})
+      const { status } = await httpRequest(port, "POST", "/tool/cancel", {}, secret)
 
       expect(status).toBe(400)
     })
   })
 
   // -------------------------------------------------------------------------
-  // 404 for unknown routes
+  // 404 for unknown routes (with valid auth)
   // -------------------------------------------------------------------------
 
   describe("unknown routes", () => {
-    test("returns 404 for unknown paths", async () => {
+    test("returns 401 for unknown paths without auth", async () => {
       server = createIPCServer()
       port = await server.start()
 
       const { status } = await httpRequest(port, "GET", "/unknown")
+      expect(status).toBe(401)
+    })
+
+    test("returns 404 for unknown paths with valid auth", async () => {
+      server = createIPCServer()
+      port = await server.start()
+      secret = server.getSecret()
+
+      const { status } = await httpRequest(port, "POST", "/unknown", {}, secret)
       expect(status).toBe(404)
     })
 
     test("returns 404 for wrong method on known path", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
-      const { status } = await httpRequest(port, "GET", "/tool/pending")
+      // GET /tool/pending with auth — should be 404 (wrong method)
+      const { status } = await httpRequest(port, "GET", "/tool/pending", undefined, secret)
       expect(status).toBe(404)
     })
   })
@@ -509,6 +590,7 @@ describe("IPCServer", () => {
     test("tracks pending calls", async () => {
       server = createIPCServer()
       port = await server.start()
+      secret = server.getSecret()
 
       server.getLaneRouter().register("sess-1", () => {})
 
@@ -517,7 +599,7 @@ describe("IPCServer", () => {
         callId: "call-pending",
         toolName: "bash",
         args: {},
-      })
+      }, secret)
 
       // Wait for it to be registered
       await new Promise((r) => setTimeout(r, 50))

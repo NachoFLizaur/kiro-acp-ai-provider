@@ -11,6 +11,7 @@
 
 import * as http from "node:http"
 import type * as net from "node:net"
+import { randomBytes } from "node:crypto"
 import { LaneRouter } from "./lane-router"
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,7 @@ export interface IPCServer {
   start(): Promise<number>
   stop(): Promise<void>
   getPort(): number | null
+  getSecret(): string
   getPendingCount(): number
   getLaneRouter(): LaneRouter
   resolveToolResult(request: ToolResultRequest): void
@@ -56,7 +58,16 @@ export interface IPCServer {
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
-    req.on("data", (chunk: Buffer) => chunks.push(chunk))
+    let totalSize = 0
+    req.on("data", (chunk: Buffer) => {
+      totalSize += chunk.length
+      if (totalSize > MAX_BODY_SIZE) {
+        req.destroy()
+        reject(new Error("PAYLOAD_TOO_LARGE"))
+        return
+      }
+      chunks.push(chunk)
+    })
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")))
     req.on("error", reject)
   })
@@ -83,6 +94,8 @@ interface PendingCallEntry {
 }
 
 const PENDING_CALL_TIMEOUT_MS = 300_000
+const MAX_BODY_SIZE = 10 * 1024 * 1024 // 10 MB
+const MAX_PENDING_CALLS = 1_000
 
 class IPCServerImpl implements IPCServer {
   private server: http.Server | null = null
@@ -91,9 +104,11 @@ class IPCServerImpl implements IPCServer {
   private startTime: number = 0
   private readonly pendingCalls = new Map<string, PendingCallEntry>()
   private readonly laneRouter = new LaneRouter()
+  private readonly secret: string
 
   constructor(options: IPCServerOptions = {}) {
     this.host = options.host ?? "127.0.0.1"
+    this.secret = randomBytes(32).toString("hex")
   }
 
   async start(): Promise<number> {
@@ -103,9 +118,13 @@ class IPCServerImpl implements IPCServer {
 
     this.startTime = Date.now()
     this.server = http.createServer((req, res) => {
-      this.handleRequest(req, res).catch(() => {
+      this.handleRequest(req, res).catch((err) => {
         if (!res.headersSent) {
-          respond(res, 500, { error: "Internal server error" })
+          if (err instanceof Error && err.message === "PAYLOAD_TOO_LARGE") {
+            respond(res, 413, { error: "Payload too large" })
+          } else {
+            respond(res, 500, { error: "Internal server error" })
+          }
         }
       })
     })
@@ -145,6 +164,10 @@ class IPCServerImpl implements IPCServer {
     return this.port
   }
 
+  getSecret(): string {
+    return this.secret
+  }
+
   getPendingCount(): number {
     return this.pendingCalls.size
   }
@@ -175,9 +198,18 @@ class IPCServerImpl implements IPCServer {
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<void> {
+    // Health endpoint is unauthenticated
     if (req.method === "GET" && req.url === "/health") {
       return this.handleHealth(res)
     }
+
+    // Validate Bearer token on all other endpoints
+    const authHeader = req.headers.authorization
+    if (!authHeader || authHeader !== `Bearer ${this.secret}`) {
+      respond(res, 401, { error: "Unauthorized" })
+      return
+    }
+
     if (req.method === "POST" && req.url === "/tool/pending") {
       return this.handleToolPending(req, res)
     }
@@ -234,6 +266,16 @@ class IPCServerImpl implements IPCServer {
     }
 
     const { callId, toolName, args = {} } = body
+
+    // Reject if too many pending calls (Fix 5: prevent resource exhaustion)
+    if (this.pendingCalls.size >= MAX_PENDING_CALLS) {
+      respond(res, 503, {
+        status: "error",
+        error: "Too many pending tool calls",
+        code: "TOO_MANY_PENDING",
+      })
+      return
+    }
 
     const resultPromise = new Promise<ToolExecuteResponse>((resolve, reject) => {
       const timer = setTimeout(() => {

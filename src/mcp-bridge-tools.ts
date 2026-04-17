@@ -19,5 +19,6 @@ export interface MCPToolsFile {
   tools: MCPToolDefinition[]
   cwd?: string
   ipcPort?: number
+  ipcSecret?: string
 }
 

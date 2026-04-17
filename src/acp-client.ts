@@ -233,7 +233,10 @@ export class ACPClient {
     }
 
     const args = ["acp"]
-    if (this.options.agent) args.push("--agent", this.options.agent)
+    if (this.options.agent) {
+      const sanitizedAgent = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_")
+      args.push("--agent", sanitizedAgent)
+    }
     if (this.options.trustAllTools) args.push("--trust-all-tools")
 
     this.process = spawn("kiro-cli", args, {
@@ -304,7 +307,11 @@ export class ACPClient {
       INITIALIZE_TIMEOUT_MS,
     )
 
-    return result as InitializeResult
+    const initResult = result as InitializeResult
+    if (!initResult || typeof initResult !== "object" || !("agentInfo" in initResult)) {
+      throw new KiroACPError("Invalid response from initialize: missing agentInfo", -1)
+    }
+    return initResult
   }
 
   async stop(): Promise<void> {
@@ -375,7 +382,11 @@ export class ACPClient {
       // Required by ACP protocol. MCP servers are configured via agent config file.
       mcpServers: [],
     })
-    return result as ACPSession
+    const session = result as ACPSession
+    if (!session || typeof session !== "object" || typeof session.sessionId !== "string") {
+      throw new KiroACPError("Invalid response from session/new: missing sessionId", -1)
+    }
+    return session
   }
 
   async loadSession(sessionId: string): Promise<ACPSession> {
@@ -385,6 +396,9 @@ export class ACPClient {
       mcpServers: [],
     })
     const session = result as ACPSession
+    if (!session || typeof session !== "object") {
+      throw new KiroACPError("Invalid response from session/load: expected object", -1)
+    }
     if (!session.sessionId) session.sessionId = sessionId
     return session
   }
@@ -418,7 +432,11 @@ export class ACPClient {
         { sessionId, prompt },
         0,
       )
-      return result as { stopReason: string }
+      const promptResult = result as { stopReason: string }
+      if (!promptResult || typeof promptResult !== "object" || typeof promptResult.stopReason !== "string") {
+        throw new KiroACPError("Invalid response from session/prompt: missing stopReason", -1)
+      }
+      return promptResult
     } finally {
       this.promptCallbacks.delete(sessionId)
       if (signal && abortHandler) {
@@ -452,7 +470,11 @@ export class ACPClient {
       sessionId,
       command: { command, args },
     })
-    return result as CommandResult
+    const commandResult = result as CommandResult
+    if (!commandResult || typeof commandResult !== "object" || typeof commandResult.success !== "boolean") {
+      throw new KiroACPError("Invalid response from commands/execute: missing success field", -1)
+    }
+    return commandResult
   }
 
   // -------------------------------------------------------------------------
@@ -568,6 +590,10 @@ export class ACPClient {
     return this.ipcPort
   }
 
+  getIpcSecret(): string | null {
+    return this.ipcServer?.getSecret() ?? null
+  }
+
   getIPCServer(): IPCServer | null {
     return this.ipcServer
   }
@@ -645,14 +671,16 @@ export class ACPClient {
     let toolsFile: string
     if (populatedToolsFilePath) {
       toolsFile = populatedToolsFilePath
-      // Inject ipcPort if the model wrote tools before start() was called
+      // Inject ipcPort and ipcSecret if the model wrote tools before start() was called
       if (this.ipcPort != null) {
         try {
           const existing = readFileSync(toolsFile, "utf-8")
-          const parsed = JSON.parse(existing) as { ipcPort?: number }
-          if (parsed.ipcPort !== this.ipcPort) {
+          const parsed = JSON.parse(existing) as { ipcPort?: number; ipcSecret?: string }
+          const secret = this.ipcServer?.getSecret()
+          if (parsed.ipcPort !== this.ipcPort || (secret && parsed.ipcSecret !== secret)) {
             ;(parsed as Record<string, unknown>).ipcPort = this.ipcPort
-            writeFileSync(toolsFile, JSON.stringify(parsed, null, 2))
+            if (secret) (parsed as Record<string, unknown>).ipcSecret = secret
+            writeFileSync(toolsFile, JSON.stringify(parsed, null, 2), { mode: 0o600 })
           }
         } catch {
           // Will be handled by writeToolsFile later
@@ -660,12 +688,14 @@ export class ACPClient {
       }
     } else {
       toolsFile = this.getOrCreateToolsFilePath()
+      const secret = this.ipcServer?.getSecret()
       const toolsData = {
         tools: [],
         cwd: this.options.cwd,
         ...(this.ipcPort != null ? { ipcPort: this.ipcPort } : {}),
+        ...(secret ? { ipcSecret: secret } : {}),
       }
-      writeFileSync(toolsFile, JSON.stringify(toolsData, null, 2))
+      writeFileSync(toolsFile, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
     }
 
     const config = generateAgentConfig({

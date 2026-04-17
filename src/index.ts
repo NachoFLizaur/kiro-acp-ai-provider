@@ -53,12 +53,6 @@ export {
   type ToolExecuteResponse,
 } from "./ipc-server"
 
-// Lane Router
-export {
-  LaneRouter,
-  type PendingCorrelation,
-} from "./lane-router"
-
 // Utilities
 export { verifyAuth, type AuthStatus } from "./kiro-auth"
 export { listModels, type ListModelsOptions } from "./kiro-models"

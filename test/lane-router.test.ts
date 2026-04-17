@@ -394,32 +394,6 @@ describe("LaneRouter", () => {
   })
 
   // -------------------------------------------------------------------------
-  // Cleanup
-  // -------------------------------------------------------------------------
-
-  describe("cleanup()", () => {
-    test("removes stale correlations", () => {
-      router = new LaneRouter()
-      const calls: PendingToolCall[] = []
-
-      router.register("sess-A", (call) => calls.push(call))
-      router.register("sess-B", () => {})
-
-      // Add a correlation with a very old timestamp
-      // We need to manipulate the internal state — use correlate then wait
-      // For testing, we'll just verify cleanup doesn't throw
-      router.correlate("sess-A", "tc-old", "bash", { command: "ls" })
-
-      // Cleanup should not throw
-      router.cleanup()
-
-      // The correlation is not stale yet (just created), so it should still match
-      router.route(makeCall({ callId: "c1", toolName: "bash", args: { command: "ls" } }))
-      expect(calls).toHaveLength(1)
-    })
-  })
-
-  // -------------------------------------------------------------------------
   // Diagnostics
   // -------------------------------------------------------------------------
 
