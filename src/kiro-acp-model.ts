@@ -235,12 +235,15 @@ const TOOL_CALL_DEBOUNCE_MS = 100
  *   streams. The only reuse is within a single doStream lifecycle: the
  *   multi-turn tool-call loop (startFreshPrompt → tool results →
  *   resumeWithToolResults) stays on the same session.
- * - When a doStream() stream completes (all turns done, stream closed),
- *   the ACP session is destroyed and its tools file is cleaned up.
- * - Session persistence via affinity: when `x-session-affinity` is set,
- *   the kiro session ID is persisted to disk and resumed on the next
- *   doStream() with the same affinity ID. Subagent calls (no affinity)
- *   always create fresh sessions and don't persist.
+ * - Session lifecycle depends on affinity:
+ *   - **With affinity** (`x-session-affinity` header): The kiro session
+ *     is kept alive in kiro-cli when doStream() completes. The session
+ *     ID is persisted to disk and the session is resumed (via loadSession)
+ *     on the next doStream() with the same affinity ID. Only the tools
+ *     file is cleaned up (recreated on next doStream).
+ *   - **Without affinity** (subagent calls): The session is fully cleaned
+ *     up when doStream() completes — tools file removed. These are
+ *     one-shot sessions that won't be resumed.
  * - System prompts from the AI SDK are injected into the user message
  *   wrapped in `<system_instructions>` tags.
  * - Tool calls are emitted as standard AI SDK tool-call parts (no
@@ -381,16 +384,20 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       if (this.config.sessionId) {
         try {
           const loaded = await this.client.loadSession(this.config.sessionId)
+          // session/load succeeded — use the known session ID (loadSession
+          // already injects it, but be defensive)
+          const sessionId = loaded.sessionId || this.config.sessionId
+          if (!loaded.sessionId) loaded.sessionId = sessionId
           await this.ensureSessionMode(loaded)
           if (this.currentModelId === null) {
             this.currentModelId = loaded.models.currentModelId
           }
           if (toolsFilePath) {
-            this.sessionToolsFiles.set(loaded.sessionId, { filePath: toolsFilePath, toolNames })
+            this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
           }
-          persistSession(this.client.getCwd(), loaded.sessionId, this.currentAffinityId)
+          persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
           return loaded
-        } catch {
+        } catch (err) {
           // Fall through to persisted session or create new
         }
       }
@@ -400,18 +407,22 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       if (persisted) {
         try {
           const session = await this.client.loadSession(persisted.kiroSessionId)
-          if (session?.sessionId) {
+          // session/load succeeded — use the known session ID (loadSession
+          // already injects it, but be defensive)
+          const sessionId = session.sessionId || persisted.kiroSessionId
+          if (!session.sessionId) session.sessionId = sessionId
+          if (session) {
             await this.ensureSessionMode(session)
             if (this.currentModelId === null) {
               this.currentModelId = session.models?.currentModelId ?? null
             }
             if (toolsFilePath) {
-              this.sessionToolsFiles.set(session.sessionId, { filePath: toolsFilePath, toolNames })
+              this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
             }
-            persistSession(this.client.getCwd(), session.sessionId, this.currentAffinityId)
+            persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
             return session
           }
-        } catch {
+        } catch (err: unknown) {
           // Fall through to create new session
         }
       }
@@ -443,20 +454,31 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   /**
-   * Destroy a session and clean up its tools file.
+   * Clean up a session when a doStream() lifecycle completes.
    *
-   * Called when a doStream() lifecycle completes (all turns done, stream
-   * closed) or on error. If affinity is set, persists the session ID
-   * before cleanup so it can be resumed on the next doStream().
+   * Behavior depends on whether the session has affinity:
+   *
+   * - **With affinity** (parent session): The kiro session is kept alive
+   *   in kiro-cli so it can be resumed on the next doStream() with the
+   *   same affinity ID. The session mapping is persisted to disk and the
+   *   tools file is cleaned up (it will be recreated on the next doStream).
+   *
+   * - **Without affinity** (subagent session): The session is fully
+   *   cleaned up — tools file removed. These are one-shot sessions
+   *   that won't be resumed.
    */
-  private destroySession(sessionId: string): void {
-    // Persist session ID for affinity-based resumption before cleanup
+  private cleanupAfterStream(sessionId: string): void {
     if (this.currentAffinityId) {
+      // Parent session: persist mapping for future resumption, clean up
+      // only the tools file (it will be recreated on next doStream).
+      // The kiro session stays alive in kiro-cli with its full history.
       persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
+      this.cleanupSessionToolsFile(sessionId)
+    } else {
+      // Subagent session: full cleanup — tools file removed.
+      // These are one-shot sessions that won't be resumed.
+      this.cleanupSessionToolsFile(sessionId)
     }
-
-    // Clean up the session's tools file from disk
-    this.cleanupSessionToolsFile(sessionId)
   }
 
   /**
@@ -530,7 +552,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         onUpdate: () => {}, // Consume but ignore the acknowledgment response
       })
     } finally {
-      this.destroySession(session.sessionId)
+      this.cleanupAfterStream(session.sessionId)
     }
   }
 
@@ -917,7 +939,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
           this.pendingTurns.delete(sessionId)
           laneRouter?.unregister(sessionId)
-          this.destroySession(sessionId)
+          this.cleanupAfterStream(sessionId)
           streamClosed = true
           try {
             await writer.close()
@@ -953,10 +975,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           options.abortSignal.removeEventListener("abort", userAbortHandler)
         }
 
-        // Destroy session and clean up tools file — this doStream lifecycle is complete.
+        // Clean up session — this doStream lifecycle is complete.
+        // For affinity sessions: persist mapping, keep kiro session alive.
+        // For subagent sessions: full cleanup.
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
-        this.destroySession(sessionId)
+        this.cleanupAfterStream(sessionId)
         streamClosed = true
         await writer.close()
       })
@@ -965,7 +989,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         // closed (e.g., paused for tool calls when timeout fires)
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
-        this.destroySession(sessionId)
+        this.cleanupAfterStream(sessionId)
 
         // If stream was already closed (delivered tool-calls to consumer),
         // don't emit another error — the consumer already has their response
@@ -1197,7 +1221,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
           this.pendingTurns.delete(sessionId)
           laneRouter?.unregister(sessionId)
-          this.destroySession(sessionId)
+          this.cleanupAfterStream(sessionId)
           streamClosed = true
           try {
             await writer.close()
@@ -1232,10 +1256,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           options.abortSignal.removeEventListener("abort", userAbortHandler)
         }
 
-        // Destroy session and clean up tools file — this doStream lifecycle is complete.
+        // Clean up session — this doStream lifecycle is complete.
+        // For affinity sessions: persist mapping, keep kiro session alive.
+        // For subagent sessions: full cleanup.
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
-        this.destroySession(sessionId)
+        this.cleanupAfterStream(sessionId)
         streamClosed = true
         await writer.close()
       })
@@ -1244,7 +1270,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         // closed (e.g., paused for tool calls when timeout fires)
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
-        this.destroySession(sessionId)
+        this.cleanupAfterStream(sessionId)
 
         // If stream was already closed (delivered tool-calls to consumer),
         // don't emit another error — the consumer already has their response
