@@ -11,7 +11,8 @@ import type {
   LanguageModelV3Usage,
   LanguageModelV3Prompt,
 } from "@ai-sdk/provider"
-import { writeFileSync } from "node:fs"
+import { readFileSync, writeFileSync, unlinkSync } from "node:fs"
+import { randomBytes } from "node:crypto"
 import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
 import { persistSession, loadPersistedSession } from "./session-storage"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
@@ -227,11 +228,17 @@ const TOOL_CALL_DEBOUNCE_MS = 100
  * Agent Client Protocol (ACP).
  *
  * Key design decisions:
- * - ACP sessions are pooled: when a `doStream()` call arrives while the
- *   current session is busy (e.g. parent waiting for a tool result while
- *   a subagent fires a nested prompt), a new session is created
- *   automatically. This avoids the deadlock that kiro-cli's single-
- *   session prompt lock would otherwise cause.
+ * - Every doStream() call creates a BRAND NEW ACP session with its own
+ *   tools file. There is no session pooling or reuse between concurrent
+ *   streams. The only reuse is within a single doStream lifecycle: the
+ *   multi-turn tool-call loop (startFreshPrompt → tool results →
+ *   resumeWithToolResults) stays on the same session.
+ * - When a doStream() stream completes (all turns done, stream closed),
+ *   the ACP session is destroyed and its tools file is cleaned up.
+ * - Session persistence via affinity: when `x-session-affinity` is set,
+ *   the kiro session ID is persisted to disk and resumed on the next
+ *   doStream() with the same affinity ID. Subagent calls (no affinity)
+ *   always create fresh sessions and don't persist.
  * - System prompts from the AI SDK are injected into the user message
  *   wrapped in `<system_instructions>` tags.
  * - Tool calls are emitted as standard AI SDK tool-call parts (no
@@ -248,17 +255,25 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
   private readonly client: ACPClient
   private readonly config: KiroACPModelConfig
-  /** All ACP sessions created by this model instance. */
-  private sessions: ACPSession[] = []
-  /** Session IDs that currently have an in-flight prompt. */
-  private busySessions = new Set<string>()
   private currentModelId: string | null = null
   private initPromise: Promise<void> | null = null
   private totalCredits = 0
-  /** Tracks the last set of tool names written, for change detection. */
-  private lastToolNames = ""
   /** Session affinity ID for routing to the correct persisted session file. */
   private currentAffinityId: string | undefined
+
+  /**
+   * Per-session tools file paths. Each ACP session gets its own tools file
+   * so that concurrent sessions (e.g. parent agent + child subagent) don't
+   * overwrite each other's tool definitions.
+   *
+   * When a new session is created, a unique tools file is written BEFORE
+   * `createSessionWithToolsPath()` is called, ensuring the MCP bridge
+   * reads the correct tool set on spawn. Cleaned up when the session is
+   * destroyed on stream completion.
+   *
+   * Map<sessionId, { filePath: string, toolNames: string }>
+   */
+  private sessionToolsFiles = new Map<string, { filePath: string; toolNames: string }>()
 
   /**
    * Per-session state for ongoing kiro-cli prompts paused waiting for tool results.
@@ -284,14 +299,18 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   // -------------------------------------------------------------------------
-  // Session pool
+  // Session creation — one session per doStream() lifecycle
   // -------------------------------------------------------------------------
 
   /**
    * Ensure the ACP client is started. Safe to call multiple times — only
    * initializes once. If initialization fails, subsequent calls will retry.
+   *
+   * @param toolsFilePath - Optional path to a POPULATED tools file. Passed
+   *   to `client.start()` so the initial agent config points to the correct
+   *   file, avoiding the race where the MCP bridge reads an empty placeholder.
    */
-  private async ensureClient(): Promise<void> {
+  private async ensureClient(toolsFilePath?: string): Promise<void> {
     if (this.client.isRunning()) return
 
     if (this.initPromise) {
@@ -299,7 +318,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       return
     }
 
-    this.initPromise = this.client.start().then(() => {})
+    this.initPromise = this.client.start(toolsFilePath).then(() => {})
 
     try {
       await this.initPromise
@@ -310,67 +329,62 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   /**
-   * Acquire a free ACP session from the pool, or create a new one.
+   * Create a new ACP session for this doStream() call.
    *
-   * When tools are provided, they are written to the tools file BEFORE
-   * starting the client. This ensures kiro-cli's MCP bridge sees the full
-   * tool set on its first `tools/list` query, avoiding the race condition
-   * where the system prompt is built with only default tools.
+   * Every doStream() call gets a BRAND NEW session with its own tools file.
+   * There is no session pooling or reuse between different doStream() calls.
    *
-   * When a `doStream()` call arrives while the current session is busy
-   * (e.g. parent waiting for a tool result while a subagent fires a
-   * nested prompt), a new session is created automatically. This avoids
-   * the deadlock that kiro-cli's single-session prompt lock would cause.
+   * Per-session tool isolation:
+   * - A unique tools file is written BEFORE the session is created.
+   * - The file path is passed to `createSessionWithToolsPath()`, which
+   *   atomically rewrites the agent config so the newly spawned MCP bridge
+   *   reads from the correct file.
+   * - The mapping is stored in `sessionToolsFiles` for cleanup on
+   *   stream completion.
    *
-   * For the very first session, if `config.sessionId` was provided we
-   * attempt to load it via `session/load`. If that fails we fall through
-   * to creating a fresh session.
+   * Session persistence with affinity:
+   * - If `currentAffinityId` is set AND a persisted kiro session ID exists,
+   *   the session is resumed (loaded) instead of created from scratch.
+   *   A new tools file is still written for the resumed session.
+   * - If no affinity or no persisted session, a fresh session is created.
+   * - Subagent calls (no affinity) always create fresh sessions.
    */
   private async acquireSession(
     tools?: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
   ): Promise<ACPSession> {
-    // Write tools BEFORE starting the client so the MCP bridge has them
-    // from the very first `tools/list` query.
+    // Write tools to a per-session tools file BEFORE creating the session
+    // so the MCP bridge has them from the very first `tools/list` query.
+    let toolsFilePath: string | undefined
+    let toolNames = ""
     if (tools && tools.length > 0) {
-      const toolsChanged = this.writeToolsFile(tools)
-
-      if (this.client.isRunning() && toolsChanged) {
-        // Mid-session tool change — wait for kiro-cli to process the
-        // tools/list_changed notification and send _kiro.dev/commands/available.
-        const toolNames = tools
-          .filter((t): t is LanguageModelV3FunctionTool => t.type === "function")
-          .map((t) => t.name)
-        await this.client.waitForToolsReady({
-          timeoutMs: 3000,
-          expectedTools: toolNames,
-        })
-      }
-      // If client not running yet, no delay needed — kiro will read on startup
+      const streamId = randomBytes(4).toString("hex")
+      toolsFilePath = this.client.createSessionToolsFilePath(streamId)
+      toolNames = this.writeToolsToFile(toolsFilePath, tools)
     }
 
-    await this.ensureClient()
+    await this.ensureClient(toolsFilePath)
 
-    // Find a session that isn't currently in a prompt
-    const free = this.sessions.find(s => !this.busySessions.has(s.sessionId))
-    if (free) {
-      this.busySessions.add(free.sessionId)
-      return free
+    // If tools were written before the client started (ipcPort was null),
+    // re-inject the ipcPort now that the IPC server is running. The MCP
+    // bridge needs the port to delegate tool calls to the harness.
+    if (toolsFilePath && this.client.getIpcPort() != null) {
+      this.ensureIpcPortInToolsFile(toolsFilePath)
     }
 
-    // No free session — create a new one.
-    // For the first session, try loading an existing one:
-    // 1. From config.sessionId (explicit, e.g. passed by the harness)
-    // 2. From the persisted session file (automatic, survives restarts)
-    if (this.sessions.length === 0) {
-      // Try explicit sessionId first
+    // Try loading an existing session from persistence (affinity-based).
+    // Only attempt when affinity is set — subagent calls (no affinity)
+    // always create fresh sessions.
+    if (this.currentAffinityId) {
+      // Try explicit sessionId first (from config)
       if (this.config.sessionId) {
         try {
           const loaded = await this.client.loadSession(this.config.sessionId)
           await this.ensureSessionMode(loaded)
-          this.sessions.push(loaded)
-          this.busySessions.add(loaded.sessionId)
           if (this.currentModelId === null) {
             this.currentModelId = loaded.models.currentModelId
+          }
+          if (toolsFilePath) {
+            this.sessionToolsFiles.set(loaded.sessionId, { filePath: toolsFilePath, toolNames })
           }
           persistSession(this.client.getCwd(), loaded.sessionId, this.currentAffinityId)
           return loaded
@@ -386,10 +400,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           const session = await this.client.loadSession(persisted.kiroSessionId)
           if (session?.sessionId) {
             await this.ensureSessionMode(session)
-            this.sessions.push(session)
-            this.busySessions.add(session.sessionId)
             if (this.currentModelId === null) {
               this.currentModelId = session.models?.currentModelId ?? null
+            }
+            if (toolsFilePath) {
+              this.sessionToolsFiles.set(session.sessionId, { filePath: toolsFilePath, toolNames })
             }
             persistSession(this.client.getCwd(), session.sessionId, this.currentAffinityId)
             return session
@@ -400,16 +415,25 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       }
     }
 
-    const session = await this.client.createSession()
+    // Create a new session with this stream's tools file path.
+    // `createSessionWithToolsPath()` atomically rewrites the agent config
+    // to point to this session's tools file before calling `session/new`,
+    // ensuring the newly spawned MCP bridge reads from the correct file.
+    const session = toolsFilePath
+      ? await this.client.createSessionWithToolsPath(toolsFilePath)
+      : await this.client.createSession()
     await this.ensureSessionMode(session)
-    this.sessions.push(session)
-    this.busySessions.add(session.sessionId)
     if (this.currentModelId === null) {
       this.currentModelId = session.models.currentModelId
     }
 
-    // Persist the primary session ID (first session only)
-    if (this.sessions.length === 1) {
+    // Store the session → tools file mapping
+    if (toolsFilePath) {
+      this.sessionToolsFiles.set(session.sessionId, { filePath: toolsFilePath, toolNames })
+    }
+
+    // Persist the session ID if affinity is set (for resumption across restarts)
+    if (this.currentAffinityId) {
       persistSession(this.client.getCwd(), session.sessionId, this.currentAffinityId)
     }
 
@@ -417,19 +441,20 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   /**
-   * Release a session back to the pool so it can be reused.
+   * Destroy a session and clean up its tools file.
    *
-   * If this is the primary session (first in the pool), re-persist the
-   * session ID to refresh the timestamp. This keeps the file current so
-   * the 24-hour TTL doesn't expire during long-running sessions.
+   * Called when a doStream() lifecycle completes (all turns done, stream
+   * closed) or on error. If affinity is set, persists the session ID
+   * before cleanup so it can be resumed on the next doStream().
    */
-  private releaseSession(sessionId: string): void {
-    this.busySessions.delete(sessionId)
-
-    // Refresh persisted timestamp for the primary session
-    if (this.sessions[0]?.sessionId === sessionId) {
+  private destroySession(sessionId: string): void {
+    // Persist session ID for affinity-based resumption before cleanup
+    if (this.currentAffinityId) {
       persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
     }
+
+    // Clean up the session's tools file from disk
+    this.cleanupSessionToolsFile(sessionId)
   }
 
   /**
@@ -478,13 +503,16 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   // Session rehydration
   // -------------------------------------------------------------------------
 
-  /** Get the primary (first) ACP session ID (for persistence across restarts). */
+  /** Get the primary ACP session ID (for persistence across restarts). */
   getSessionId(): string | null {
-    return this.sessions[0]?.sessionId ?? null
+    // With per-stream sessions, return the first pending turn's session
+    // or null if no active session exists.
+    const firstPending = this.pendingTurns.keys().next()
+    return firstPending.done ? null : firstPending.value
   }
 
   /**
-   * Inject conversation context into the current session.
+   * Inject conversation context into a new session.
    * Used when session/load fails and we need to rehydrate from the consumer's history.
    */
   async injectContext(summary: string): Promise<void> {
@@ -500,45 +528,29 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         onUpdate: () => {}, // Consume but ignore the acknowledgment response
       })
     } finally {
-      this.releaseSession(session.sessionId)
+      this.destroySession(session.sessionId)
     }
   }
 
   // -------------------------------------------------------------------------
-  // Dynamic tool synchronization
+  // Dynamic tool synchronization — per-session tools files
   // -------------------------------------------------------------------------
 
   /**
-   * Write tool definitions from the AI SDK to the MCP bridge tools file.
+   * Write tool definitions to a specific tools file path.
    *
-   * Converts LanguageModelV3 tool definitions to MCP format and **replaces**
-   * the entire tools file contents. Each `doStream()` call writes its
-   * session's complete tool set.
+   * Converts LanguageModelV3 tool definitions to MCP format and writes
+   * the complete tool set to the given file. Only function tools are
+   * synced — provider tools are skipped since they are handled by the
+   * provider itself, not the MCP bridge.
    *
-   * This replacement approach is correct because:
-   * - Writes happen BEFORE prompts are sent to kiro-cli
-   * - Only one session is actively prompting at a time per bridge
-   *   (parent pauses while child runs, then parent resumes and re-writes)
-   * - The flow is: parent writes [task, bash, read] → child writes [bash]
-   *   → child finishes → parent writes [task, bash, read] → parent continues
-   *
-   * The previous merge/superset approach caused stale default tools
-   * (e.g. list_directory, read_file) to persist across runs, making the
-   * model try to call tools the harness doesn't support.
-   *
-   * Only function tools are synced — provider tools are skipped since they
-   * are handled by the provider itself, not the MCP bridge.
-   *
-   * @returns `true` if the tools file was actually written (tools changed),
-   *          `false` if the tools are the same as last time (no write needed).
+   * @returns The sorted tool names string (for change detection).
    */
-  private writeToolsFile(
+  private writeToolsToFile(
+    toolsFilePath: string,
     tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
-  ): boolean {
-    // Use getOrCreateToolsFilePath so the path exists even before start()
-    const toolsFilePath = this.client.getOrCreateToolsFilePath()
-
-    // Convert current session's AI SDK function tools to MCP format
+  ): string {
+    // Convert AI SDK function tools to MCP format
     const newTools: MCPToolDefinition[] = tools
       .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
       .map((tool) => ({
@@ -547,10 +559,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         inputSchema: tool.inputSchema as MCPToolDefinition["inputSchema"],
       }))
 
-    // Check if the tool set actually changed from what we last wrote
-    const newNames = newTools.map(t => t.name).sort().join(",")
-    if (newNames === this.lastToolNames) return false
-    this.lastToolNames = newNames
+    const toolNames = newTools.map(t => t.name).sort().join(",")
+
+    console.error(`[kiro-acp-diag] writeToolsToFile writing ${newTools.length} tools to ${toolsFilePath}: ${newTools.map(t => t.name).join(", ")}`)
 
     // Write to tools file (the bridge watches this and sends list_changed)
     const ipcPort = this.client.getIpcPort()
@@ -560,7 +571,44 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       ...(ipcPort != null ? { ipcPort } : {}),
     }
     writeFileSync(toolsFilePath, JSON.stringify(toolsData, null, 2))
-    return true
+    return toolNames
+  }
+
+  /**
+   * Ensure a session's tools file has the IPC port.
+   *
+   * When tools are written before `ensureClient()`, the IPC server hasn't
+   * started yet and the port is null. This method re-reads the tools file
+   * and injects the port if missing.
+   */
+  private ensureIpcPortInToolsFile(toolsFilePath: string): void {
+    const ipcPort = this.client.getIpcPort()
+    if (ipcPort == null) return
+
+    try {
+      const raw = readFileSync(toolsFilePath, "utf-8")
+      const parsed = JSON.parse(raw) as MCPToolsFile
+      if (parsed.ipcPort === ipcPort) return // Already has correct port
+
+      parsed.ipcPort = ipcPort
+      writeFileSync(toolsFilePath, JSON.stringify(parsed, null, 2))
+    } catch {
+      // File doesn't exist or is invalid — will be written on next writeToolsToFile()
+    }
+  }
+
+  /**
+   * Clean up a session's tools file from disk and remove from the map.
+   *
+   * Called when a session is destroyed or no longer needed. Also removes
+   * the file from the client's tracking set.
+   */
+  private cleanupSessionToolsFile(sessionId: string): void {
+    const entry = this.sessionToolsFiles.get(sessionId)
+    if (!entry) return
+
+    this.sessionToolsFiles.delete(sessionId)
+    this.client.removeSessionToolsFile(entry.filePath)
   }
 
   // -------------------------------------------------------------------------
@@ -609,6 +657,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   async doStream(
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3StreamResult> {
+    console.error(`[kiro-acp-diag] doStream received ${options.tools?.length ?? 0} tools: ${options.tools?.map(t => t.type === "function" ? t.name : t.type).join(", ") ?? "none"}`)
+
     // Extract session affinity from consumer-provided headers (optional).
     // When present, routes to a dedicated persisted session file per affinity ID.
     // When absent, falls back to _default.json.
@@ -869,7 +919,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
           this.pendingTurns.delete(sessionId)
           laneRouter?.unregister(sessionId)
-          this.releaseSession(sessionId)
+          this.destroySession(sessionId)
           streamClosed = true
           try {
             await writer.close()
@@ -905,11 +955,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           options.abortSignal.removeEventListener("abort", userAbortHandler)
         }
 
-        // Release session BEFORE closing the stream so the next doStream()
-        // call (triggered by the consumer reading the finish part) can reuse it.
+        // Destroy session and clean up tools file — this doStream lifecycle is complete.
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
-        this.releaseSession(sessionId)
+        this.destroySession(sessionId)
         streamClosed = true
         await writer.close()
       })
@@ -918,7 +967,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         // closed (e.g., paused for tool calls when timeout fires)
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
-        this.releaseSession(sessionId)
+        this.destroySession(sessionId)
 
         // If stream was already closed (delivered tool-calls to consumer),
         // don't emit another error — the consumer already has their response
@@ -1150,7 +1199,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
           this.pendingTurns.delete(sessionId)
           laneRouter?.unregister(sessionId)
-          this.releaseSession(sessionId)
+          this.destroySession(sessionId)
           streamClosed = true
           try {
             await writer.close()
@@ -1185,9 +1234,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           options.abortSignal.removeEventListener("abort", userAbortHandler)
         }
 
+        // Destroy session and clean up tools file — this doStream lifecycle is complete.
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
-        this.releaseSession(sessionId)
+        this.destroySession(sessionId)
         streamClosed = true
         await writer.close()
       })
@@ -1196,7 +1246,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         // closed (e.g., paused for tool calls when timeout fires)
         this.pendingTurns.delete(sessionId)
         laneRouter?.unregister(sessionId)
-        this.releaseSession(sessionId)
+        this.destroySession(sessionId)
 
         // If stream was already closed (delivered tool-calls to consumer),
         // don't emit another error — the consumer already has their response
