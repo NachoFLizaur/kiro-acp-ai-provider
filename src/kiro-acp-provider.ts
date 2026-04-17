@@ -6,52 +6,31 @@ import { KiroACPLanguageModel } from "./kiro-acp-model"
 // Types
 // ---------------------------------------------------------------------------
 
-/** Settings for creating a KiroACP provider. */
 export interface KiroACPProviderSettings {
-  /** Working directory for kiro-cli. Defaults to process.cwd(). */
   cwd?: string
-  /** Default model ID to use when none is specified. */
   model?: string
-  /** Custom agent name passed via --agent flag (e.g. "my-editor"). */
   agent?: string
-  /** Pass --trust-all-tools to kiro-cli. */
   trustAllTools?: boolean
-  /** Custom system prompt for the agent config. Overrides the default prompt. */
   agentPrompt?: string
-  /** Custom permission handler for tool call approvals. */
   onPermission?: (request: PermissionRequest) => PermissionDecision
-  /** Extra environment variables for the kiro-cli subprocess. */
   env?: Record<string, string>
-  /** Client info sent during the ACP initialize handshake. */
   clientInfo?: { name: string; version: string; title?: string }
-  /** Resume an existing ACP session instead of creating new. */
   sessionId?: string
-  /** Model's max context window in tokens (from models.dev). Default: 1_000_000. */
+  /** Max context window in tokens. Default: 1_000_000. */
   contextWindow?: number
 }
 
-/** Per-model overrides accepted by `languageModel()`. */
 export interface KiroACPModelOverrides {
-  /** Override the provider-level context window for this model instance. */
   contextWindow?: number
 }
 
-/** The KiroACP provider interface. */
 export interface KiroACPProvider {
-  /** Create a language model for the given model ID. */
   (modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3
-  /** Create a language model for the given model ID. */
   languageModel(modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3
-
-  /** Gracefully shut down the kiro-cli process. */
   shutdown(): Promise<void>
-  /** Get the underlying ACP client (for advanced usage). */
   getClient(): ACPClient
-  /** Get the current ACP session ID for persistence. */
   getSessionId(): string | null
-  /** Inject context summary for session rehydration. */
   injectContext(summary: string): Promise<void>
-  /** Get total credits consumed across all turns in this session. */
   getTotalCredits(): number
 }
 
@@ -60,25 +39,12 @@ export interface KiroACPProvider {
 // ---------------------------------------------------------------------------
 
 /**
- * Create a KiroACP provider that manages a single kiro-cli process
- * and creates LanguageModelV3 instances backed by ACP.
+ * Create a KiroACP provider backed by a single kiro-cli process.
  *
- * All tool calls flow through the standard AI SDK contract:
- * - The model emits `tool-call` parts and finishes with `finishReason: "tool-calls"`
- * - The harness executes tools through its normal pipeline
- * - The harness calls `doStream()` again with tool results
- *
- * Usage:
  * ```ts
- * import { createKiroAcp } from "kiro-acp-ai-provider"
- *
  * const kiro = createKiroAcp({ cwd: "/path/to/project" })
- * const model = kiro("claude-sonnet-4-20250514")
- *
- * // Use with AI SDK
+ * const model = kiro("claude-sonnet-4.6")
  * const result = await generateText({ model, prompt: "Hello!" })
- *
- * // Clean up when done
  * await kiro.shutdown()
  * ```
  */
@@ -93,12 +59,7 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
     clientInfo: settings.clientInfo,
   }
 
-  // Create the ACP client lazily — it will be started on first model use
   const client = new ACPClient(clientOptions)
-
-  // Track the most recently created model instance for session access.
-  // Since all models share the same client and session, any instance can
-  // provide the session ID and inject context.
   let lastModel: KiroACPLanguageModel | null = null
 
   const createModel = (modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3 => {
@@ -111,12 +72,10 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
     return model
   }
 
-  // The provider function itself creates a model
   const provider = ((modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3 => {
     return createModel(modelId, overrides)
   }) as KiroACPProvider
 
-  // Attach methods
   provider.languageModel = createModel
 
   provider.shutdown = async (): Promise<void> => {

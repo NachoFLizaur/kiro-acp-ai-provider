@@ -2,17 +2,11 @@
 // IPC Server — HTTP server for tool call synchronization with MCP bridge
 // ---------------------------------------------------------------------------
 //
-// Runs in the harness process (via kiro-acp-ai-provider library).
-// The MCP bridge subprocess sends HTTP requests to register pending tool calls.
-// The adapter resolves them when the harness has executed the tool.
-//
 // Protocol:
 //   POST /tool/pending  — MCP bridge registers a tool call, response held open
 //   POST /tool/result   — Adapter sends tool result, unblocks held response
 //   POST /tool/cancel   — Rejects a pending tool call
 //   GET  /health        — Health check
-//
-// Uses Node.js `http` module for cross-runtime compatibility (Node + Bun).
 // ---------------------------------------------------------------------------
 
 import * as http from "node:http"
@@ -23,21 +17,18 @@ import { LaneRouter } from "./lane-router"
 // Types
 // ---------------------------------------------------------------------------
 
-/** A tool call pending execution by the harness. */
 export interface PendingToolCall {
   callId: string
   toolName: string
   args: Record<string, unknown>
 }
 
-/** Request body for POST /tool/result. */
 export interface ToolResultRequest {
   callId: string
   result: string
   isError?: boolean
 }
 
-/** Response body for tool-related endpoints. */
 export interface ToolExecuteResponse {
   status: "success" | "error" | "ok"
   result?: string
@@ -45,25 +36,16 @@ export interface ToolExecuteResponse {
   code?: string
 }
 
-/** Options for creating an IPC server. */
 export interface IPCServerOptions {
-  /** Hostname to bind to. Default: "127.0.0.1". */
   host?: string
 }
 
-/** Public interface for the IPC server. */
 export interface IPCServer {
-  /** Start the server. Returns the assigned port. */
   start(): Promise<number>
-  /** Stop the server and reject all pending calls. */
   stop(): Promise<void>
-  /** Get the port the server is listening on. */
   getPort(): number | null
-  /** Get the number of pending tool calls. */
   getPendingCount(): number
-  /** Get the lane router for per-session tool call routing. */
   getLaneRouter(): LaneRouter
-  /** Resolve a pending tool call with a result (in-process, used by adapter). */
   resolveToolResult(request: ToolResultRequest): void
 }
 
@@ -71,7 +53,6 @@ export interface IPCServer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Read the full request body as a string. */
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -81,7 +62,6 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   })
 }
 
-/** Send a JSON response. */
 function respond(res: http.ServerResponse, statusCode: number, body: unknown): void {
   const json = JSON.stringify(body)
   res.writeHead(statusCode, {
@@ -95,7 +75,6 @@ function respond(res: http.ServerResponse, statusCode: number, body: unknown): v
 // Implementation
 // ---------------------------------------------------------------------------
 
-/** Internal state for a pending tool call. */
 interface PendingCallEntry {
   resolve: (result: ToolExecuteResponse) => void
   reject: (error: Error) => void
@@ -103,7 +82,6 @@ interface PendingCallEntry {
   timer: ReturnType<typeof setTimeout>
 }
 
-/** Default timeout for pending tool calls: 5 minutes. */
 const PENDING_CALL_TIMEOUT_MS = 300_000
 
 class IPCServerImpl implements IPCServer {
@@ -111,11 +89,7 @@ class IPCServerImpl implements IPCServer {
   private port: number | null = null
   private readonly host: string
   private startTime: number = 0
-
-  /** Pending tool calls waiting for results. Key: callId. */
   private readonly pendingCalls = new Map<string, PendingCallEntry>()
-
-  /** Per-session tool call router. */
   private readonly laneRouter = new LaneRouter()
 
   constructor(options: IPCServerOptions = {}) {
@@ -147,7 +121,6 @@ class IPCServerImpl implements IPCServer {
   }
 
   async stop(): Promise<void> {
-    // Reject all pending calls
     for (const [callId, entry] of this.pendingCalls) {
       clearTimeout(entry.timer)
       entry.resolve({
@@ -159,7 +132,6 @@ class IPCServerImpl implements IPCServer {
     this.pendingCalls.clear()
     this.laneRouter.clear()
 
-    // Close the HTTP server
     if (this.server) {
       await new Promise<void>((resolve) => {
         this.server!.close(() => resolve())
@@ -184,9 +156,7 @@ class IPCServerImpl implements IPCServer {
   resolveToolResult(request: ToolResultRequest): void {
     const { callId, result, isError } = request
     const pending = this.pendingCalls.get(callId)
-    if (!pending) {
-      return // Silently ignore — call may have timed out or been cancelled
-    }
+    if (!pending) return
 
     clearTimeout(pending.timer)
     this.pendingCalls.delete(callId)
@@ -241,7 +211,6 @@ class IPCServerImpl implements IPCServer {
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<void> {
-    // Parse request body
     let body: { callId?: string; toolName?: string; args?: Record<string, unknown> }
     try {
       const raw = await readBody(req)
@@ -255,7 +224,6 @@ class IPCServerImpl implements IPCServer {
       return
     }
 
-    // Validate required fields
     if (!body.callId || !body.toolName) {
       respond(res, 400, {
         status: "error",
@@ -267,8 +235,6 @@ class IPCServerImpl implements IPCServer {
 
     const { callId, toolName, args = {} } = body
 
-    // Create a promise that will be resolved when /tool/result is called
-    // or when resolveToolResult() is called directly
     const resultPromise = new Promise<ToolExecuteResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingCalls.delete(callId)
@@ -282,11 +248,9 @@ class IPCServerImpl implements IPCServer {
       this.pendingCalls.set(callId, { resolve, reject, toolName, timer })
     })
 
-    // Notify the adapter that a tool call is pending via the lane router
     const pendingCall: PendingToolCall = { callId, toolName, args }
     this.laneRouter.route(pendingCall)
 
-    // Hold the HTTP response open until the promise resolves
     const result = await resultPromise
     respond(res, 200, result)
   }
@@ -334,7 +298,6 @@ class IPCServerImpl implements IPCServer {
     clearTimeout(pending.timer)
     this.pendingCalls.delete(body.callId)
 
-    // Resolve the held promise, which releases the MCP bridge's HTTP response
     pending.resolve({
       status: body.isError ? "error" : "success",
       ...(body.isError ? { error: body.result } : { result: body.result }),
@@ -385,7 +348,6 @@ class IPCServerImpl implements IPCServer {
 // Factory
 // ---------------------------------------------------------------------------
 
-/** Create a new IPC server instance. */
 export function createIPCServer(options: IPCServerOptions = {}): IPCServer {
   return new IPCServerImpl(options)
 }

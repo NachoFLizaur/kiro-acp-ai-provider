@@ -10,12 +10,8 @@ export interface AuthStatus {
   tokenPath?: string
 }
 
-/**
- * Check if kiro-cli is installed and authenticated.
- * Does not start kiro-cli — just checks the filesystem.
- */
+/** Check if kiro-cli is installed and authenticated (filesystem check only). */
 export function verifyAuth(): AuthStatus {
-  // Check if kiro-cli is installed
   let installed = false
   let version: string | undefined
   try {
@@ -30,11 +26,8 @@ export function verifyAuth(): AuthStatus {
     return { installed: false, authenticated: false }
   }
 
-  // Check for auth token
   const tokenPath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json")
   const hasToken = existsSync(tokenPath)
-
-  // Also check KIRO_API_KEY env var
   const hasApiKey = !!process.env.KIRO_API_KEY
 
   return {

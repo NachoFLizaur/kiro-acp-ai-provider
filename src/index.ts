@@ -38,7 +38,6 @@ export {
 
 // MCP Bridge Tools
 export {
-  getDefaultTools,
   type MCPToolDefinition,
   type MCPToolInputSchema,
   type MCPToolsFile,
