@@ -914,6 +914,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         await writer.close()
       })
       .catch(async (err: unknown) => {
+        // Always clean up session state on error, even if stream was already
+        // closed (e.g., paused for tool calls when timeout fires)
+        this.pendingTurns.delete(sessionId)
+        laneRouter?.unregister(sessionId)
+        this.releaseSession(sessionId)
+
+        // If stream was already closed (delivered tool-calls to consumer),
+        // don't emit another error — the consumer already has their response
         if (streamClosed) return
 
         // Cancel any pending debounce timer
@@ -937,9 +945,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           options.abortSignal.removeEventListener("abort", userAbortHandler)
         }
 
-        this.pendingTurns.delete(sessionId)
-        laneRouter?.unregister(sessionId)
-        this.releaseSession(sessionId)
         streamClosed = true
         try {
           await writer.close()
@@ -1187,6 +1192,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         await writer.close()
       })
       .catch(async (err: unknown) => {
+        // Always clean up session state on error, even if stream was already
+        // closed (e.g., paused for tool calls when timeout fires)
+        this.pendingTurns.delete(sessionId)
+        laneRouter?.unregister(sessionId)
+        this.releaseSession(sessionId)
+
+        // If stream was already closed (delivered tool-calls to consumer),
+        // don't emit another error — the consumer already has their response
         if (streamClosed) return
 
         if (debounceTimer) {
@@ -1203,9 +1216,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           options.abortSignal.removeEventListener("abort", userAbortHandler)
         }
 
-        this.pendingTurns.delete(sessionId)
-        laneRouter?.unregister(sessionId)
-        this.releaseSession(sessionId)
         streamClosed = true
         try {
           await writer.close()
