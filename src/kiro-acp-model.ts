@@ -11,9 +11,10 @@ import type {
   LanguageModelV3Usage,
   LanguageModelV3Prompt,
 } from "@ai-sdk/provider"
-import { readFileSync, writeFileSync, unlinkSync } from "node:fs"
+import { readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
 import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
+import { KiroACPError } from "./acp-client"
 import { persistSession, loadPersistedSession } from "./session-storage"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { PendingToolCall } from "./ipc-server"
@@ -257,7 +258,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     if (this.initPromise) {
       await this.initPromise
-      return
+      if (this.client.isRunning()) return
+      // Client died after init succeeded — clear and reinitialize
+      this.initPromise = null
     }
 
     this.initPromise = this.client.start(toolsFilePath).then(() => {})
@@ -473,7 +476,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       ...(ipcPort != null ? { ipcPort } : {}),
       ...(ipcSecret ? { ipcSecret } : {}),
     }
-    writeFileSync(toolsFilePath, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
+    const tmpPath = toolsFilePath + ".tmp"
+    writeFileSync(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
+    renameSync(tmpPath, toolsFilePath)
     return toolNames
   }
 
@@ -493,7 +498,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
       parsed.ipcPort = ipcPort
       if (ipcSecret) parsed.ipcSecret = ipcSecret
-      writeFileSync(toolsFilePath, JSON.stringify(parsed, null, 2), { mode: 0o600 })
+      const tmpPath = toolsFilePath + ".tmp"
+      writeFileSync(tmpPath, JSON.stringify(parsed, null, 2), { mode: 0o600 })
+      renameSync(tmpPath, toolsFilePath)
     } catch {
       // File doesn't exist or is invalid — will be written on next writeToolsToFile()
     }
@@ -631,13 +638,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const { readable, writable } = new TransformStream<LanguageModelV3StreamPart>()
     const writer = writable.getWriter()
 
-    const writePart = async (part: LanguageModelV3StreamPart): Promise<void> => {
+    // Chain writes sequentially to respect backpressure and preserve ordering
+    let writeChain = Promise.resolve()
+    const writePart = (part: LanguageModelV3StreamPart) => {
       if (streamClosed) return
-      try {
-        await writer.write(part)
-      } catch {
-        // Stream closed by consumer
-      }
+      writeChain = writeChain.then(() => writer.write(part)).catch(() => { streamClosed = true })
     }
 
     let bufferedToolCalls: PendingToolCall[] = []
@@ -662,19 +667,19 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
       if (reasoningStarted) {
         reasoningStarted = false
-        await writePart({ type: "reasoning-end", id: reasoningId })
+        writePart({ type: "reasoning-end", id: reasoningId })
       }
       if (textStarted) {
         textStarted = false
-        await writePart({ type: "text-end", id: textId })
+        writePart({ type: "text-end", id: textId })
       }
 
       for (const call of bufferedToolCalls) {
         const argsJson = JSON.stringify(call.args)
-        await writePart({ type: "tool-input-start", id: call.callId, toolName: call.toolName })
-        await writePart({ type: "tool-input-delta", id: call.callId, delta: argsJson })
-        await writePart({ type: "tool-input-end", id: call.callId })
-        await writePart({
+        writePart({ type: "tool-input-start", id: call.callId, toolName: call.toolName })
+        writePart({ type: "tool-input-delta", id: call.callId, delta: argsJson })
+        writePart({ type: "tool-input-end", id: call.callId })
+        writePart({
           type: "tool-call",
           toolCallId: call.callId,
           toolName: call.toolName,
@@ -689,7 +694,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       })
 
       const metadata = this.client.getMetadata(sessionId)
-      await writePart({
+      writePart({
         type: "finish",
         finishReason: { unified: "tool-calls", raw: "tool_use" },
         usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
@@ -699,6 +704,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
       streamClosed = true
       bufferedToolCalls = []
+      await writeChain
       await writer.close()
     }
 
@@ -723,24 +729,24 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           outputCharCount += text.length
           if (!textStarted) {
             textStarted = true
-            void writePart({ type: "stream-start", warnings: [] })
-            void writePart({ type: "text-start", id: textId })
+            writePart({ type: "stream-start", warnings: [] })
+            writePart({ type: "text-start", id: textId })
           }
-          void writePart({ type: "text-delta", id: textId, delta: text })
+          writePart({ type: "text-delta", id: textId, delta: text })
         }
       } else if (updateType === "agent_thought_chunk") {
         const text = (update.content as { text?: string } | undefined)?.text
         if (text) {
           if (textStarted) {
             textStarted = false
-            void writePart({ type: "text-end", id: textId })
+            writePart({ type: "text-end", id: textId })
           }
           if (!reasoningStarted) {
             reasoningStarted = true
-            void writePart({ type: "stream-start", warnings: [] })
-            void writePart({ type: "reasoning-start", id: reasoningId })
+            writePart({ type: "stream-start", warnings: [] })
+            writePart({ type: "reasoning-start", id: reasoningId })
           }
-          void writePart({ type: "reasoning-delta", id: reasoningId, delta: text })
+          writePart({ type: "reasoning-delta", id: reasoningId, delta: text })
         }
       } else if (updateType === "tool_call") {
         const { toolCallId, toolName, args: cleanArgs } = parseToolCallNotification(
@@ -769,14 +775,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           }
 
           if (reasoningStarted) {
-            await writePart({ type: "reasoning-end", id: reasoningId })
+            writePart({ type: "reasoning-end", id: reasoningId })
           }
           if (textStarted) {
-            await writePart({ type: "text-end", id: textId })
+            writePart({ type: "text-end", id: textId })
           }
 
           if (result.stopReason === "cancelled") {
-            await writePart({ type: "error", error: new Error("Request was cancelled by user") })
+            writePart({ type: "error", error: new Error("Request was cancelled by user") })
 
             removeAbortListener()
 
@@ -785,6 +791,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             this.cleanupAfterStream(sessionId)
             streamClosed = true
             try {
+              await writeChain
               await writer.close()
             } catch {
               // Already closed
@@ -797,7 +804,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             metadata?.meteringUsage?.find((m) => m.unit === "credit")?.value ?? 0
           this.totalCredits += turnCredits
 
-          await writePart({
+          writePart({
             type: "finish",
             finishReason: mapStopReason(result.stopReason),
             usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
@@ -818,6 +825,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           laneRouter?.unregister(sessionId)
           this.cleanupAfterStream(sessionId)
           streamClosed = true
+          await writeChain
           await writer.close()
         })
         .catch(async (err: unknown) => {
@@ -833,18 +841,21 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           }
 
           if (reasoningStarted) {
-            await writePart({ type: "reasoning-end", id: reasoningId })
+            writePart({ type: "reasoning-end", id: reasoningId })
           }
           if (textStarted) {
-            await writePart({ type: "text-end", id: textId })
+            writePart({ type: "text-end", id: textId })
           }
 
-          await writePart({ type: "error", error: err })
+          writePart({ type: "error", error: err instanceof KiroACPError
+            ? new Error(err.message)
+            : new Error("An internal error occurred") })
 
           removeAbortListener()
 
           streamClosed = true
           try {
+            await writeChain
             await writer.close()
           } catch {
             // Already closed

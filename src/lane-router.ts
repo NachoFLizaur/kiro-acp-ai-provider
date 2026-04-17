@@ -33,6 +33,7 @@ interface Lane {
 // ---------------------------------------------------------------------------
 
 const CORRELATION_BUFFER_TIMEOUT_MS = 2_000
+const CORRELATION_TTL_MS = 5 * 60 * 1_000 // 5 minutes
 
 // ---------------------------------------------------------------------------
 // Deep equality helpers
@@ -110,11 +111,19 @@ export class LaneRouter {
     const lane = this.lanes.get(sessionId)
     if (!lane) return
 
+    // Sweep stale correlations (older than TTL)
+    const now = Date.now()
+    for (const [id, correlation] of lane.pendingCorrelations) {
+      if (now - correlation.timestamp > CORRELATION_TTL_MS) {
+        lane.pendingCorrelations.delete(id)
+      }
+    }
+
     lane.pendingCorrelations.set(toolCallId, {
       toolCallId,
       toolName,
       args,
-      timestamp: Date.now(),
+      timestamp: now,
     })
 
     this.drainBufferedCalls()
