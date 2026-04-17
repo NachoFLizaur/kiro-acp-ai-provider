@@ -208,8 +208,10 @@ function extractPrompt(prompt: LanguageModelV3Prompt): {
     // Skip assistant and tool messages — kiro-cli has them in its session
   }
 
+  const systemPrompt = systemParts.length > 0 ? systemParts.join("\n\n") : undefined
+
   return {
-    systemPrompt: systemParts.length > 0 ? systemParts.join("\n\n") : undefined,
+    systemPrompt,
     userMessage: lastUserMessage,
   }
 }
@@ -561,8 +563,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     const toolNames = newTools.map(t => t.name).sort().join(",")
 
-    console.error(`[kiro-acp-diag] writeToolsToFile writing ${newTools.length} tools to ${toolsFilePath}: ${newTools.map(t => t.name).join(", ")}`)
-
     // Write to tools file (the bridge watches this and sends list_changed)
     const ipcPort = this.client.getIpcPort()
     const toolsData: MCPToolsFile = {
@@ -657,8 +657,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   async doStream(
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3StreamResult> {
-    console.error(`[kiro-acp-diag] doStream received ${options.tools?.length ?? 0} tools: ${options.tools?.map(t => t.type === "function" ? t.name : t.type).join(", ") ?? "none"}`)
-
     // Extract session affinity from consumer-provided headers (optional).
     // When present, routes to a dedicated persisted session file per affinity ID.
     // When absent, falls back to _default.json.
