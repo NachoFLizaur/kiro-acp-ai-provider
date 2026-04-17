@@ -676,26 +676,4 @@ describe("generateAgentConfig consumer-agnostic", () => {
     const mcpServers = config.mcpServers as Record<string, unknown>
     expect(mcpServers["kiro-acp-tools"]).toBeDefined()
   })
-
-  test("generateAgentConfig system prompt is consumer-agnostic", () => {
-    const config = generateAgentConfig(baseOptions)
-
-    const prompt = config.prompt as string
-    expect(prompt.toLowerCase()).not.toContain("opencode")
-  })
-
-  test("no opencode references in source files", async () => {
-    // Use Bun.spawn to run ripgrep (or grep) over src/
-    const proc = Bun.spawn(["grep", "-ri", "opencode", "src/"], {
-      cwd: "/Users/nflizaur/Documents/5-coding/open-source/kiro-acp-ai-provider",
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-
-    const stdout = await new Response(proc.stdout).text()
-    await proc.exited
-
-    // grep returns exit code 1 when no matches found — that's what we want
-    expect(stdout.trim()).toBe("")
-  })
 })

@@ -189,7 +189,7 @@ interface PendingRequest {
   resolve: (value: unknown) => void
   reject: (error: Error) => void
   method: string
-  timer: ReturnType<typeof setTimeout>
+  timer: ReturnType<typeof setTimeout> | null
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +277,7 @@ export class ACPClient {
               `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}`,
             ),
           )
-          clearTimeout(pending.timer)
+          clearTimeout(pending.timer ?? undefined)
           this.pending.delete(id)
         }
       }
@@ -294,7 +294,7 @@ export class ACPClient {
       this.running = false
       for (const [id, pending] of this.pending) {
         pending.reject(new KiroACPConnectionError(`Process error: ${err.message}`))
-        clearTimeout(pending.timer)
+        clearTimeout(pending.timer ?? undefined)
         this.pending.delete(id)
       }
     })
@@ -355,7 +355,7 @@ export class ACPClient {
     // Clean up any remaining pending requests (in case exit handler didn't fire)
     for (const [id, pending] of this.pending) {
       pending.reject(new KiroACPConnectionError("Client stopped"))
-      clearTimeout(pending.timer)
+      clearTimeout(pending.timer ?? undefined)
     }
     this.pending.clear()
     this.metadata.clear()
@@ -423,10 +423,13 @@ export class ACPClient {
     }
 
     try {
+      // No timeout for session/prompt — tool execution can take arbitrarily
+      // long (user interaction, long builds, etc.). The abort signal is the
+      // proper cancellation mechanism for prompts.
       const result = await this.sendRequest(
         "session/prompt",
         { sessionId, prompt },
-        DEFAULT_REQUEST_TIMEOUT_MS,
+        0,
       )
       return result as { stopReason: string }
     } finally {
@@ -849,10 +852,21 @@ export class ACPClient {
       const id = this.nextId++
       const request: JsonRpcRequest = { jsonrpc: "2.0", id, method, params }
 
-      const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new KiroACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1))
-      }, timeoutMs)
+      // timeoutMs <= 0 means no timeout (used for session/prompt where the
+      // abort signal is the proper cancellation mechanism)
+      const timer = timeoutMs > 0
+        ? setTimeout(() => {
+            this.pending.delete(id)
+            // Cancel the prompt on kiro-cli side so it releases its internal lock
+            if (method === "session/prompt") {
+              const sid = (params as Record<string, unknown>)?.sessionId as string | undefined
+              if (sid) {
+                this.sendNotification("session/cancel", { sessionId: sid })
+              }
+            }
+            reject(new KiroACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1))
+          }, timeoutMs)
+        : null
 
       this.pending.set(id, { resolve, reject, method, timer })
 
@@ -914,7 +928,7 @@ export class ACPClient {
     const pending = this.pending.get(msg.id)
     if (!pending) return
 
-    clearTimeout(pending.timer)
+    clearTimeout(pending.timer ?? undefined)
     this.pending.delete(msg.id)
 
     if (msg.error) {
