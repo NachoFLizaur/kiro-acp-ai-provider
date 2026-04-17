@@ -150,7 +150,16 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("creates a new session for each doStream call (no reuse)", async () => {
+      let running = false
       const client = createMockClient({
+        isRunning: mock(() => running),
+        start: mock(async () => {
+          running = true
+          return {
+            agentInfo: { name: "kiro-cli", version: "1.0.0" },
+            agentCapabilities: {},
+          }
+        }),
         prompt: mock(async (opts: PromptOptions) => {
           opts.onUpdate({
             sessionUpdate: "agent_message_chunk",
@@ -605,7 +614,7 @@ describe("KiroACPLanguageModel", () => {
 
       expect(errorPart).toBeDefined()
       if (errorPart?.type === "error") {
-        expect((errorPart.error as Error).message).toBe("Connection lost")
+        expect((errorPart.error as Error).message).toBe("An internal error occurred")
       }
     })
   })

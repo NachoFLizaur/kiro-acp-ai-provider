@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs"
-import { execSync } from "node:child_process"
+import { execFileSync } from "node:child_process"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -15,7 +15,7 @@ export function verifyAuth(): AuthStatus {
   let installed = false
   let version: string | undefined
   try {
-    version = execSync("kiro-cli --version", {
+    version = execFileSync("kiro-cli", ["--version"], {
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 5000,
     })

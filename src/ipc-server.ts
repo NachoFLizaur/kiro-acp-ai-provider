@@ -11,7 +11,7 @@
 
 import * as http from "node:http"
 import type * as net from "node:net"
-import { randomBytes } from "node:crypto"
+import { randomBytes, timingSafeEqual } from "node:crypto"
 import { LaneRouter } from "./lane-router"
 
 // ---------------------------------------------------------------------------
@@ -57,19 +57,20 @@ export interface IPCServer {
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
+    let settled = false
     const chunks: Buffer[] = []
     let totalSize = 0
     req.on("data", (chunk: Buffer) => {
       totalSize += chunk.length
       if (totalSize > MAX_BODY_SIZE) {
+        if (!settled) { settled = true; reject(new Error("PAYLOAD_TOO_LARGE")) }
         req.destroy()
-        reject(new Error("PAYLOAD_TOO_LARGE"))
         return
       }
       chunks.push(chunk)
     })
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")))
-    req.on("error", reject)
+    req.on("end", () => { if (!settled) { settled = true; resolve(Buffer.concat(chunks).toString("utf-8")) } })
+    req.on("error", (err) => { if (!settled) { settled = true; reject(err) } })
   })
 }
 
@@ -203,9 +204,14 @@ class IPCServerImpl implements IPCServer {
       return this.handleHealth(res)
     }
 
-    // Validate Bearer token on all other endpoints
+    // Validate Bearer token on all other endpoints (timing-safe comparison)
     const authHeader = req.headers.authorization
-    if (!authHeader || authHeader !== `Bearer ${this.secret}`) {
+    const expected = `Bearer ${this.secret}`
+    if (
+      !authHeader ||
+      authHeader.length !== expected.length ||
+      !timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected))
+    ) {
       respond(res, 401, { error: "Unauthorized" })
       return
     }

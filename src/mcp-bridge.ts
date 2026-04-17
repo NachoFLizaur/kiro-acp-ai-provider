@@ -119,6 +119,7 @@ function loadToolsFile(toolsPath: string): MCPToolsFile {
 // ---------------------------------------------------------------------------
 
 function httpPost(url: string, body: unknown, timeoutMs: number = 310_000, authToken?: string): Promise<ToolExecuteResponse> {
+  const MAX_RESPONSE_SIZE = 10 * 1024 * 1024 // 10 MB
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body)
     const parsed = new URL(url)
@@ -141,16 +142,30 @@ function httpPost(url: string, body: unknown, timeoutMs: number = 310_000, authT
         timeout: timeoutMs,
       },
       (res) => {
-        let responseData = ""
+        let settled = false
+        const chunks: Buffer[] = []
+        let size = 0
         res.on("data", (chunk: Buffer) => {
-          responseData += chunk.toString()
+          size += chunk.length
+          if (size > MAX_RESPONSE_SIZE) {
+            if (!settled) { settled = true; reject(new Error("Response too large")) }
+            res.destroy()
+            return
+          }
+          chunks.push(chunk)
         })
         res.on("end", () => {
+          if (settled) return
+          settled = true
           try {
+            const responseData = Buffer.concat(chunks).toString()
             resolve(JSON.parse(responseData) as ToolExecuteResponse)
           } catch {
-            reject(new Error(`Invalid JSON response: ${responseData.slice(0, 200)}`))
+            reject(new Error("Invalid JSON response"))
           }
+        })
+        res.on("error", (err) => {
+          if (!settled) { settled = true; reject(err) }
         })
       },
     )
@@ -222,7 +237,7 @@ class MCPBridgeServer {
         id: request.id,
         error: {
           code: -32603,
-          message: err instanceof Error ? err.message : String(err),
+          message: "Internal error",
         },
       }
     }
@@ -305,7 +320,7 @@ class MCPBridgeServer {
     const toolName = params.name
     const toolArgs = params.arguments ?? {}
 
-    log("info", `Tool call: ${toolName}`, JSON.stringify(toolArgs).slice(0, 200))
+    log("info", `Tool call: ${toolName}`, `args: [${Object.keys(toolArgs).join(", ")}]`)
 
     const toolDef = this.tools.find((t) => t.name === toolName)
     if (!toolDef) {
@@ -446,7 +461,7 @@ class MCPBridgeServer {
         jsonrpc: "2.0",
         id: requestId,
         result: {
-          content: [{ type: "text", text: `IPC delegation failed: ${message}` }],
+          content: [{ type: "text", text: "Tool execution failed" }],
           isError: true,
         } satisfies MCPToolResult,
       }
@@ -518,20 +533,24 @@ async function main(): Promise<void> {
   const rl = createInterface({ input: process.stdin })
 
   rl.on("line", async (line: string) => {
-    const trimmed = line.trim()
-    if (!trimmed) return
-
-    let msg: JsonRpcMessage
     try {
-      msg = JSON.parse(trimmed) as JsonRpcMessage
-    } catch {
-      log("warn", "Received non-JSON input:", trimmed.slice(0, 100))
-      return
-    }
+      const trimmed = line.trim()
+      if (!trimmed) return
 
-    const response = await server.handleMessage(msg)
-    if (response) {
-      sendResponse(response)
+      let msg: JsonRpcMessage
+      try {
+        msg = JSON.parse(trimmed) as JsonRpcMessage
+      } catch {
+        log("warn", "Received non-JSON input:", trimmed.slice(0, 100))
+        return
+      }
+
+      const response = await server.handleMessage(msg)
+      if (response) {
+        sendResponse(response)
+      }
+    } catch (err) {
+      log("error", "Failed to handle message", String(err))
     }
   })
 

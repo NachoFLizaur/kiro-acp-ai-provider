@@ -2,8 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process"
 import { createInterface, type Interface as ReadlineInterface } from "node:readline"
 import { createHash, randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
-import { dirname, join } from "node:path"
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs"
+import { dirname, join, isAbsolute } from "node:path"
+import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { generateAgentConfig, writeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
@@ -223,6 +223,15 @@ export class ACPClient {
    */
   async start(toolsFilePath?: string): Promise<InitializeResult> {
     if (this.running) throw new KiroACPConnectionError("Client is already running")
+
+    // Validate cwd is an absolute path to an existing directory
+    const cwd = this.options.cwd
+    if (!isAbsolute(cwd)) {
+      throw new KiroACPError(`cwd must be absolute: ${cwd}`, -1)
+    }
+    if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
+      throw new KiroACPError(`cwd is not a directory: ${cwd}`, -1)
+    }
 
     // IPC server must start BEFORE setupAgentConfig so we have the port
     this.ipcServer = createIPCServer()
@@ -525,7 +534,8 @@ export class ACPClient {
     if (this.toolsFilePath) return this.toolsFilePath
 
     const toolsDir = join(tmpdir(), "kiro-acp")
-    mkdirSync(toolsDir, { recursive: true })
+    mkdirSync(toolsDir, { recursive: true, mode: 0o700 })
+    chmodSync(toolsDir, 0o700) // Ensure correct perms even if dir pre-existed
     const cwdHash = createHash("md5").update(this.options.cwd).digest("hex").slice(0, 8)
     this.toolsFilePath = join(toolsDir, `tools-${cwdHash}-${this.instanceId}.json`)
     return this.toolsFilePath
@@ -537,7 +547,8 @@ export class ACPClient {
    */
   createSessionToolsFilePath(sessionUniqueId: string): string {
     const toolsDir = join(tmpdir(), "kiro-acp")
-    mkdirSync(toolsDir, { recursive: true })
+    mkdirSync(toolsDir, { recursive: true, mode: 0o700 })
+    chmodSync(toolsDir, 0o700) // Ensure correct perms even if dir pre-existed
     const cwdHash = createHash("md5").update(this.options.cwd).digest("hex").slice(0, 8)
     const filePath = join(toolsDir, `tools-${cwdHash}-${sessionUniqueId}.json`)
     this.sessionToolsFiles.add(filePath)
@@ -680,7 +691,9 @@ export class ACPClient {
           if (parsed.ipcPort !== this.ipcPort || (secret && parsed.ipcSecret !== secret)) {
             ;(parsed as Record<string, unknown>).ipcPort = this.ipcPort
             if (secret) (parsed as Record<string, unknown>).ipcSecret = secret
-            writeFileSync(toolsFile, JSON.stringify(parsed, null, 2), { mode: 0o600 })
+            const tmpPath = toolsFile + ".tmp"
+            writeFileSync(tmpPath, JSON.stringify(parsed, null, 2), { mode: 0o600 })
+            renameSync(tmpPath, toolsFile)
           }
         } catch {
           // Will be handled by writeToolsFile later
@@ -695,7 +708,9 @@ export class ACPClient {
         ...(this.ipcPort != null ? { ipcPort: this.ipcPort } : {}),
         ...(secret ? { ipcSecret: secret } : {}),
       }
-      writeFileSync(toolsFile, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
+      const tmpPath = toolsFile + ".tmp"
+      writeFileSync(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
+      renameSync(tmpPath, toolsFile)
     }
 
     const config = generateAgentConfig({
@@ -825,9 +840,7 @@ export class ACPClient {
       }
     }
 
-    // Strategy 5: Temp dir (from a previous run)
-    const tmpPath = join(tmpdir(), "kiro-acp", "mcp-bridge.js")
-    if (existsSync(tmpPath)) return tmpPath
+    // No fallback to shared temp directory — prevents executing potentially tampered code
 
     throw new KiroACPConnectionError(
       "Could not find mcp-bridge.js. Ensure kiro-acp-ai-provider is installed.",

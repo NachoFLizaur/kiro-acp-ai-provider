@@ -1,4 +1,4 @@
-import { writeFileSync, readFileSync, mkdirSync } from "node:fs"
+import { writeFileSync, readFileSync, mkdirSync, renameSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { join } from "node:path"
 import { homedir } from "node:os"
@@ -47,12 +47,14 @@ export function persistSession(cwd: string, sessionId: string, affinityId?: stri
   try {
     const filePath = getSessionFilePath(cwd, affinityId)
     const dir = join(filePath, "..")
-    mkdirSync(dir, { recursive: true })
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
     const data: PersistedSession = {
       kiroSessionId: sessionId,
       lastUsed: Date.now(),
     }
-    writeFileSync(filePath, JSON.stringify(data), { mode: 0o600 })
+    const tmpPath = filePath + ".tmp"
+    writeFileSync(tmpPath, JSON.stringify(data), { mode: 0o600 })
+    renameSync(tmpPath, filePath)
   } catch {
     // Best-effort
   }
