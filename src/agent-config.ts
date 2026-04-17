@@ -60,7 +60,7 @@ export function generateAgentConfig(options: AgentConfigOptions): Record<string,
     // Agent system prompt — identity-neutral meta-prompt that defers to per-request <system_instructions>
     prompt:
       options.prompt ??
-      `You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block included with each request. Always follow the latest <system_instructions> as your primary directive — they define who you are, how you behave, and what tools you should use. If no <system_instructions> are present, act as a helpful coding assistant that follows instructions precisely and uses tools proactively.`,
+      `You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block included with each request. Always follow the latest <system_instructions> as your primary directive — they define who you are, how you behave, and what tools you should use. If no <system_instructions> are present, act as a helpful coding assistant that follows instructions precisely and uses tools proactively. If a tool call fails, retry it or try alternative approaches — do not assume a tool is permanently unavailable based on a single failure.`,
     // Default model if specified
     ...(options.model ? { model: options.model } : {}),
   }
