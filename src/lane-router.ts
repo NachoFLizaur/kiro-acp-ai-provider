@@ -33,7 +33,6 @@ interface Lane {
 // ---------------------------------------------------------------------------
 
 const CORRELATION_BUFFER_TIMEOUT_MS = 2_000
-const CORRELATION_MAX_AGE_MS = 30_000
 
 // ---------------------------------------------------------------------------
 // Deep equality helpers
@@ -246,22 +245,6 @@ export class LaneRouter {
 
     if (lastLane) {
       lastLane.handler(call)
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Cleanup
-  // -------------------------------------------------------------------------
-
-  /** Discard stale correlations older than CORRELATION_MAX_AGE_MS. */
-  cleanup(): void {
-    const now = Date.now()
-    for (const [, lane] of this.lanes) {
-      for (const [id, correlation] of lane.pendingCorrelations) {
-        if (now - correlation.timestamp > CORRELATION_MAX_AGE_MS) {
-          lane.pendingCorrelations.delete(id)
-        }
-      }
     }
   }
 

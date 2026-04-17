@@ -466,12 +466,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const toolNames = newTools.map(t => t.name).sort().join(",")
 
     const ipcPort = this.client.getIpcPort()
+    const ipcSecret = this.client.getIpcSecret()
     const toolsData: MCPToolsFile = {
       tools: newTools,
       cwd: this.client.getCwd(),
       ...(ipcPort != null ? { ipcPort } : {}),
+      ...(ipcSecret ? { ipcSecret } : {}),
     }
-    writeFileSync(toolsFilePath, JSON.stringify(toolsData, null, 2))
+    writeFileSync(toolsFilePath, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
     return toolNames
   }
 
@@ -486,10 +488,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     try {
       const raw = readFileSync(toolsFilePath, "utf-8")
       const parsed = JSON.parse(raw) as MCPToolsFile
-      if (parsed.ipcPort === ipcPort) return
+      const ipcSecret = this.client.getIpcSecret()
+      if (parsed.ipcPort === ipcPort && parsed.ipcSecret === ipcSecret) return
 
       parsed.ipcPort = ipcPort
-      writeFileSync(toolsFilePath, JSON.stringify(parsed, null, 2))
+      if (ipcSecret) parsed.ipcSecret = ipcSecret
+      writeFileSync(toolsFilePath, JSON.stringify(parsed, null, 2), { mode: 0o600 })
     } catch {
       // File doesn't exist or is invalid — will be written on next writeToolsToFile()
     }
@@ -579,29 +583,50 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   // -------------------------------------------------------------------------
-  // Fresh prompt flow
+  // Shared stream infrastructure for prompt flows
   // -------------------------------------------------------------------------
 
-  private async startFreshPrompt(
-    options: LanguageModelV3CallOptions,
-  ): Promise<LanguageModelV3StreamResult> {
-    const session = await this.acquireSession(options.tools)
-    await this.ensureModel(session)
-
-    const { systemPrompt, userMessage } = extractPrompt(options.prompt)
-
-    const compositeText = systemPrompt
-      ? `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${userMessage}`
-      : userMessage
-
-    const sessionId = session.sessionId
+  /**
+   * Create the stream infrastructure shared by both fresh prompts and
+   * tool-result resumptions.
+   *
+   * Returns the readable stream, an update handler for ACP notifications,
+   * and completion/error handlers that wire up the prompt promise to the
+   * stream lifecycle.
+   */
+  private createPromptStream(params: {
+    sessionId: string
+    promptAbort: AbortController
+    initialOutputCharCount: number
+    streamSegment: number
+    options: LanguageModelV3CallOptions
+    /** Called when tool calls are flushed to save/update pending turn state. */
+    savePendingTurn: (state: {
+      pendingToolCalls: Map<string, PendingToolCall>
+      outputCharCount: number
+      nextSegment: number
+    }) => void
+  }): {
+    readable: ReadableStream<LanguageModelV3StreamPart>
+    onUpdate: (update: SessionUpdate) => void
+    onToolCall: (pendingCall: PendingToolCall) => void
+    attachPromise: (promptPromise: Promise<{ stopReason: string }>) => void
+  } {
+    const {
+      sessionId,
+      promptAbort,
+      initialOutputCharCount,
+      streamSegment,
+      options,
+      savePendingTurn,
+    } = params
 
     let textStarted = false
     let reasoningStarted = false
-    let outputCharCount = 0
+    let outputCharCount = initialOutputCharCount
     let streamClosed = false
-    const textId = "txt-0"
-    const reasoningId = "reasoning-0"
+    const textId = `txt-${streamSegment}`
+    const reasoningId = `reasoning-${streamSegment}`
 
     const { readable, writable } = new TransformStream<LanguageModelV3StreamPart>()
     const writer = writable.getWriter()
@@ -617,6 +642,20 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     let bufferedToolCalls: PendingToolCall[] = []
     let debounceTimer: ReturnType<typeof setTimeout> | null = null
+
+    let userAbortHandler: (() => void) | undefined
+    if (options.abortSignal) {
+      userAbortHandler = () => promptAbort.abort()
+      options.abortSignal.addEventListener("abort", userAbortHandler, { once: true })
+    }
+
+    const removeAbortListener = (): void => {
+      if (options.abortSignal && userAbortHandler) {
+        options.abortSignal.removeEventListener("abort", userAbortHandler)
+      }
+    }
+
+    const laneRouter = this.client.getLaneRouter()
 
     const flushToolCalls = async (): Promise<void> => {
       if (streamClosed || bufferedToolCalls.length === 0) return
@@ -643,13 +682,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         })
       }
 
-      this.pendingTurns.set(sessionId, {
-        sessionId,
-        promptPromise,
+      savePendingTurn({
         pendingToolCalls: new Map(bufferedToolCalls.map(c => [c.callId, c])),
         outputCharCount,
-        streamSegment: 1,
-        promptAbort,
+        nextSegment: streamSegment + 1,
       })
 
       const metadata = this.client.getMetadata(sessionId)
@@ -659,17 +695,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
       })
 
-      if (options.abortSignal && userAbortHandler) {
-        options.abortSignal.removeEventListener("abort", userAbortHandler)
-      }
+      removeAbortListener()
 
       streamClosed = true
       bufferedToolCalls = []
       await writer.close()
     }
 
-    const laneRouter = this.client.getLaneRouter()
-    laneRouter?.register(sessionId, (pendingCall) => {
+    const onToolCall = (pendingCall: PendingToolCall): void => {
       bufferedToolCalls.push(pendingCall)
 
       if (debounceTimer) clearTimeout(debounceTimer)
@@ -677,9 +710,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         debounceTimer = null
         void flushToolCalls()
       }, TOOL_CALL_DEBOUNCE_MS)
-    })
+    }
 
-    const handleUpdate = (update: SessionUpdate): void => {
+    const onUpdate = (update: SessionUpdate): void => {
       if (streamClosed) return
 
       const updateType = update.sessionUpdate
@@ -719,126 +752,162 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       }
     }
 
-    // Prompt-level abort controller that persists across doStream cycles.
-    // Only explicit user cancels fire this — NOT stream-close-for-tool-calls.
-    const promptAbort = new AbortController()
+    const attachPromise = (promptPromise: Promise<{ stopReason: string }>): void => {
+      promptPromise
+        .then(async (result) => {
+          if (streamClosed) return
 
-    let userAbortHandler: (() => void) | undefined
-    if (options.abortSignal) {
-      userAbortHandler = () => promptAbort.abort()
-      options.abortSignal.addEventListener("abort", userAbortHandler, { once: true })
-    }
-
-    const promptPromise = this.client.prompt({
-      sessionId,
-      prompt: [{ type: "text", text: compositeText }],
-      onUpdate: handleUpdate,
-      signal: promptAbort.signal,
-    })
-
-    promptPromise
-      .then(async (result) => {
-        if (streamClosed) return
-
-        if (debounceTimer) {
-          clearTimeout(debounceTimer)
-          debounceTimer = null
-        }
-
-        // Flush buffered tool calls that arrived during debounce window
-        if (bufferedToolCalls.length > 0) {
-          await flushToolCalls()
-          return
-        }
-
-        if (reasoningStarted) {
-          await writePart({ type: "reasoning-end", id: reasoningId })
-        }
-        if (textStarted) {
-          await writePart({ type: "text-end", id: textId })
-        }
-
-        if (result.stopReason === "cancelled") {
-          await writePart({ type: "error", error: new Error("Request was cancelled by user") })
-
-          if (options.abortSignal && userAbortHandler) {
-            options.abortSignal.removeEventListener("abort", userAbortHandler)
+          if (debounceTimer) {
+            clearTimeout(debounceTimer)
+            debounceTimer = null
           }
+
+          // Flush buffered tool calls that arrived during debounce window
+          if (bufferedToolCalls.length > 0) {
+            await flushToolCalls()
+            return
+          }
+
+          if (reasoningStarted) {
+            await writePart({ type: "reasoning-end", id: reasoningId })
+          }
+          if (textStarted) {
+            await writePart({ type: "text-end", id: textId })
+          }
+
+          if (result.stopReason === "cancelled") {
+            await writePart({ type: "error", error: new Error("Request was cancelled by user") })
+
+            removeAbortListener()
+
+            this.pendingTurns.delete(sessionId)
+            laneRouter?.unregister(sessionId)
+            this.cleanupAfterStream(sessionId)
+            streamClosed = true
+            try {
+              await writer.close()
+            } catch {
+              // Already closed
+            }
+            return
+          }
+
+          const metadata = this.client.getMetadata(sessionId)
+          const turnCredits =
+            metadata?.meteringUsage?.find((m) => m.unit === "credit")?.value ?? 0
+          this.totalCredits += turnCredits
+
+          await writePart({
+            type: "finish",
+            finishReason: mapStopReason(result.stopReason),
+            usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
+            providerMetadata: metadata
+              ? {
+                  kiro: {
+                    contextUsagePercentage: metadata.contextUsagePercentage ?? null,
+                    turnDurationMs: metadata.turnDurationMs ?? null,
+                    credits: metadata.meteringUsage?.find((m) => m.unit === "credit")?.value ?? null,
+                  },
+                }
+              : undefined,
+          })
+
+          removeAbortListener()
 
           this.pendingTurns.delete(sessionId)
           laneRouter?.unregister(sessionId)
           this.cleanupAfterStream(sessionId)
+          streamClosed = true
+          await writer.close()
+        })
+        .catch(async (err: unknown) => {
+          this.pendingTurns.delete(sessionId)
+          laneRouter?.unregister(sessionId)
+          this.cleanupAfterStream(sessionId)
+
+          if (streamClosed) return
+
+          if (debounceTimer) {
+            clearTimeout(debounceTimer)
+            debounceTimer = null
+          }
+
+          if (reasoningStarted) {
+            await writePart({ type: "reasoning-end", id: reasoningId })
+          }
+          if (textStarted) {
+            await writePart({ type: "text-end", id: textId })
+          }
+
+          await writePart({ type: "error", error: err })
+
+          removeAbortListener()
+
           streamClosed = true
           try {
             await writer.close()
           } catch {
             // Already closed
           }
-          return
-        }
-
-        const metadata = this.client.getMetadata(sessionId)
-        const turnCredits =
-          metadata?.meteringUsage?.find((m) => m.unit === "credit")?.value ?? 0
-        this.totalCredits += turnCredits
-
-        await writePart({
-          type: "finish",
-          finishReason: mapStopReason(result.stopReason),
-          usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
-          providerMetadata: metadata
-            ? {
-                kiro: {
-                  contextUsagePercentage: metadata.contextUsagePercentage ?? null,
-                  turnDurationMs: metadata.turnDurationMs ?? null,
-                  credits: metadata.meteringUsage?.find((m) => m.unit === "credit")?.value ?? null,
-                },
-              }
-            : undefined,
         })
+    }
 
-        if (options.abortSignal && userAbortHandler) {
-          options.abortSignal.removeEventListener("abort", userAbortHandler)
-        }
+    return { readable, onUpdate, onToolCall, attachPromise }
+  }
 
-        this.pendingTurns.delete(sessionId)
-        laneRouter?.unregister(sessionId)
-        this.cleanupAfterStream(sessionId)
-        streamClosed = true
-        await writer.close()
-      })
-      .catch(async (err: unknown) => {
-        this.pendingTurns.delete(sessionId)
-        laneRouter?.unregister(sessionId)
-        this.cleanupAfterStream(sessionId)
+  // -------------------------------------------------------------------------
+  // Fresh prompt flow
+  // -------------------------------------------------------------------------
 
-        if (streamClosed) return
+  private async startFreshPrompt(
+    options: LanguageModelV3CallOptions,
+  ): Promise<LanguageModelV3StreamResult> {
+    const session = await this.acquireSession(options.tools)
+    await this.ensureModel(session)
 
-        if (debounceTimer) {
-          clearTimeout(debounceTimer)
-          debounceTimer = null
-        }
+    const { systemPrompt, userMessage } = extractPrompt(options.prompt)
 
-        if (reasoningStarted) {
-          await writePart({ type: "reasoning-end", id: reasoningId })
-        }
-        if (textStarted) {
-          await writePart({ type: "text-end", id: textId })
-        }
+    const compositeText = systemPrompt
+      ? `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${userMessage}`
+      : userMessage
 
-        await writePart({ type: "error", error: err })
+    const sessionId = session.sessionId
 
-        if (options.abortSignal && userAbortHandler) {
-          options.abortSignal.removeEventListener("abort", userAbortHandler)
-        }
+    // Prompt-level abort controller that persists across doStream cycles.
+    // Only explicit user cancels fire this — NOT stream-close-for-tool-calls.
+    const promptAbort = new AbortController()
 
-        streamClosed = true
-        try {
-          await writer.close()
-        } catch {
-          // Already closed
-        }
-      })
+    const { readable, onUpdate, onToolCall, attachPromise } = this.createPromptStream({
+      sessionId,
+      promptAbort,
+      initialOutputCharCount: 0,
+      streamSegment: 0,
+      options,
+      savePendingTurn: (state) => {
+        this.pendingTurns.set(sessionId, {
+          sessionId,
+          promptPromise,
+          pendingToolCalls: state.pendingToolCalls,
+          outputCharCount: state.outputCharCount,
+          streamSegment: state.nextSegment,
+          promptAbort,
+        })
+      },
+    })
+
+    const laneRouter = this.client.getLaneRouter()
+    laneRouter?.register(sessionId, onToolCall)
+
+    // Start the prompt after stream infrastructure is ready so onUpdate
+    // can receive synchronous callbacks from client.prompt().
+    const promptPromise = this.client.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: compositeText }],
+      onUpdate,
+      signal: promptAbort.signal,
+    })
+
+    attachPromise(promptPromise)
 
     return {
       stream: readable,
@@ -861,230 +930,29 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       throw new Error(`No pending turn for session ${sessionId}`)
     }
 
-    let userAbortHandler: (() => void) | undefined
-    if (options.abortSignal) {
-      userAbortHandler = () => turn.promptAbort.abort()
-      options.abortSignal.addEventListener("abort", userAbortHandler, { once: true })
-    }
-
-    const { readable, writable } = new TransformStream<LanguageModelV3StreamPart>()
-    const writer = writable.getWriter()
-
-    let outputCharCount = turn.outputCharCount
-    let textStarted = false
-    let reasoningStarted = false
-    let streamClosed = false
-    const segment = turn.streamSegment
-    const textId = `txt-${segment}`
-    const reasoningId = `reasoning-${segment}`
-
-    const writePart = async (part: LanguageModelV3StreamPart): Promise<void> => {
-      if (streamClosed) return
-      try {
-        await writer.write(part)
-      } catch {
-        // Stream closed by consumer
-      }
-    }
-
-    let bufferedToolCalls: PendingToolCall[] = []
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null
-
-    const flushToolCalls = async (): Promise<void> => {
-      if (streamClosed || bufferedToolCalls.length === 0) return
-
-      if (reasoningStarted) {
-        reasoningStarted = false
-        await writePart({ type: "reasoning-end", id: reasoningId })
-      }
-      if (textStarted) {
-        textStarted = false
-        await writePart({ type: "text-end", id: textId })
-      }
-
-      for (const call of bufferedToolCalls) {
-        const argsJson = JSON.stringify(call.args)
-        await writePart({ type: "tool-input-start", id: call.callId, toolName: call.toolName })
-        await writePart({ type: "tool-input-delta", id: call.callId, delta: argsJson })
-        await writePart({ type: "tool-input-end", id: call.callId })
-        await writePart({
-          type: "tool-call",
-          toolCallId: call.callId,
-          toolName: call.toolName,
-          input: argsJson,
-        })
-      }
-
-      turn.pendingToolCalls = new Map(bufferedToolCalls.map(c => [c.callId, c]))
-      turn.outputCharCount = outputCharCount
-      turn.streamSegment = segment + 1
-
-      const metadata = this.client.getMetadata(sessionId)
-      await writePart({
-        type: "finish",
-        finishReason: { unified: "tool-calls", raw: "tool_use" },
-        usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
-      })
-
-      if (options.abortSignal && userAbortHandler) {
-        options.abortSignal.removeEventListener("abort", userAbortHandler)
-      }
-
-      streamClosed = true
-      bufferedToolCalls = []
-      await writer.close()
-    }
-
-    const laneRouter = this.client.getLaneRouter()
-    laneRouter?.updateHandler(sessionId, (pendingCall) => {
-      bufferedToolCalls.push(pendingCall)
-
-      if (debounceTimer) clearTimeout(debounceTimer)
-      debounceTimer = setTimeout(() => {
-        debounceTimer = null
-        void flushToolCalls()
-      }, TOOL_CALL_DEBOUNCE_MS)
+    const { readable, onUpdate, onToolCall, attachPromise } = this.createPromptStream({
+      sessionId,
+      promptAbort: turn.promptAbort,
+      initialOutputCharCount: turn.outputCharCount,
+      streamSegment: turn.streamSegment,
+      options,
+      savePendingTurn: (state) => {
+        turn.pendingToolCalls = state.pendingToolCalls
+        turn.outputCharCount = state.outputCharCount
+        turn.streamSegment = state.nextSegment
+      },
     })
 
-    const handleUpdate = (update: SessionUpdate): void => {
-      if (streamClosed) return
+    const laneRouter = this.client.getLaneRouter()
+    laneRouter?.updateHandler(sessionId, onToolCall)
 
-      const updateType = update.sessionUpdate
-
-      if (updateType === "agent_message_chunk") {
-        const text = (update.content as { text?: string } | undefined)?.text
-        if (text) {
-          outputCharCount += text.length
-          if (!textStarted) {
-            textStarted = true
-            void writePart({ type: "stream-start", warnings: [] })
-            void writePart({ type: "text-start", id: textId })
-          }
-          void writePart({ type: "text-delta", id: textId, delta: text })
-        }
-      } else if (updateType === "agent_thought_chunk") {
-        const text = (update.content as { text?: string } | undefined)?.text
-        if (text) {
-          if (textStarted) {
-            textStarted = false
-            void writePart({ type: "text-end", id: textId })
-          }
-          if (!reasoningStarted) {
-            reasoningStarted = true
-            void writePart({ type: "stream-start", warnings: [] })
-            void writePart({ type: "reasoning-start", id: reasoningId })
-          }
-          void writePart({ type: "reasoning-delta", id: reasoningId, delta: text })
-        }
-      } else if (updateType === "tool_call") {
-        const { toolCallId, toolName, args: cleanArgs } = parseToolCallNotification(
-          update as Record<string, unknown>,
-        )
-        if (toolCallId && toolName) {
-          laneRouter?.correlate(sessionId, toolCallId, toolName, cleanArgs)
-        }
-      }
-    }
-
-    this.client.setPromptCallback(sessionId, handleUpdate)
+    this.client.setPromptCallback(sessionId, onUpdate)
 
     for (const result of toolResults) {
       this.sendToolResult(result.toolCallId, result.result, false)
     }
 
-    turn.promptPromise
-      .then(async (result) => {
-        if (streamClosed) return
-
-        if (debounceTimer) {
-          clearTimeout(debounceTimer)
-          debounceTimer = null
-        }
-
-        if (bufferedToolCalls.length > 0) {
-          await flushToolCalls()
-          return
-        }
-
-        if (reasoningStarted) await writePart({ type: "reasoning-end", id: reasoningId })
-        if (textStarted) await writePart({ type: "text-end", id: textId })
-
-        if (result.stopReason === "cancelled") {
-          await writePart({ type: "error", error: new Error("Request was cancelled by user") })
-
-          if (options.abortSignal && userAbortHandler) {
-            options.abortSignal.removeEventListener("abort", userAbortHandler)
-          }
-
-          this.pendingTurns.delete(sessionId)
-          laneRouter?.unregister(sessionId)
-          this.cleanupAfterStream(sessionId)
-          streamClosed = true
-          try {
-            await writer.close()
-          } catch {
-            // Already closed
-          }
-          return
-        }
-
-        const metadata = this.client.getMetadata(sessionId)
-        const turnCredits =
-          metadata?.meteringUsage?.find((m) => m.unit === "credit")?.value ?? 0
-        this.totalCredits += turnCredits
-
-        await writePart({
-          type: "finish",
-          finishReason: mapStopReason(result.stopReason),
-          usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
-          providerMetadata: metadata
-            ? {
-                kiro: {
-                  contextUsagePercentage: metadata.contextUsagePercentage ?? null,
-                  turnDurationMs: metadata.turnDurationMs ?? null,
-                  credits: metadata.meteringUsage?.find((m) => m.unit === "credit")?.value ?? null,
-                },
-              }
-            : undefined,
-        })
-
-        if (options.abortSignal && userAbortHandler) {
-          options.abortSignal.removeEventListener("abort", userAbortHandler)
-        }
-
-        this.pendingTurns.delete(sessionId)
-        laneRouter?.unregister(sessionId)
-        this.cleanupAfterStream(sessionId)
-        streamClosed = true
-        await writer.close()
-      })
-      .catch(async (err: unknown) => {
-        this.pendingTurns.delete(sessionId)
-        laneRouter?.unregister(sessionId)
-        this.cleanupAfterStream(sessionId)
-
-        if (streamClosed) return
-
-        if (debounceTimer) {
-          clearTimeout(debounceTimer)
-          debounceTimer = null
-        }
-
-        if (reasoningStarted) await writePart({ type: "reasoning-end", id: reasoningId })
-        if (textStarted) await writePart({ type: "text-end", id: textId })
-        await writePart({ type: "error", error: err })
-
-        if (options.abortSignal && userAbortHandler) {
-          options.abortSignal.removeEventListener("abort", userAbortHandler)
-        }
-
-        streamClosed = true
-        try {
-          await writer.close()
-        } catch {
-          // Already closed
-        }
-      })
+    attachPromise(turn.promptPromise)
 
     return {
       stream: readable,

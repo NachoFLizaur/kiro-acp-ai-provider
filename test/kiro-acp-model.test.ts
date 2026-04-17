@@ -69,6 +69,7 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     getCwd: mock(() => "/tmp/test"),
     getAgentName: mock(() => undefined),
     getIpcPort: mock(() => null),
+    getIpcSecret: mock(() => null),
     getIPCServer: mock(() => createMockIPCServer()),
     getLaneRouter: mock(() => mockLaneRouter),
     setPromptCallback: mock(() => {}),

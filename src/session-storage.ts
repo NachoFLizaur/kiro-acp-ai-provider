@@ -33,7 +33,8 @@ function getSessionDir(cwd: string): string {
 }
 
 export function getSessionFilePath(cwd: string, affinityId?: string): string {
-  const fileName = affinityId ? `${affinityId}.json` : "_default.json"
+  const sanitized = affinityId ? affinityId.replace(/[^a-zA-Z0-9_-]/g, "_") : undefined
+  const fileName = sanitized ? `${sanitized}.json` : "_default.json"
   return join(getSessionDir(cwd), fileName)
 }
 
@@ -51,7 +52,7 @@ export function persistSession(cwd: string, sessionId: string, affinityId?: stri
       kiroSessionId: sessionId,
       lastUsed: Date.now(),
     }
-    writeFileSync(filePath, JSON.stringify(data))
+    writeFileSync(filePath, JSON.stringify(data), { mode: 0o600 })
   } catch {
     // Best-effort
   }
