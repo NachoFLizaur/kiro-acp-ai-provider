@@ -415,7 +415,6 @@ export class ACPClient {
   private async sendNewSession(): Promise<ACPSession> {
     const result = await this.sendRequest("session/new", {
       cwd: this.options.cwd,
-      // Required by ACP protocol. MCP servers are configured via agent config file.
       mcpServers: [],
     })
     const session = result as ACPSession
