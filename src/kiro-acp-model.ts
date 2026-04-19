@@ -15,7 +15,7 @@ import { readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
 import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
 import { KiroACPError } from "./acp-client"
-import { persistSession, loadPersistedSession } from "./session-storage"
+import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
@@ -183,6 +183,81 @@ function extractPrompt(prompt: LanguageModelV3Prompt): {
     systemPrompt,
     userMessage: lastUserMessage,
   }
+}
+
+/**
+ * Format a full conversation prompt as a single message for session replay.
+ *
+ * Used when resetting a session (revert/fork): the AI SDK prompt contains
+ * the full conversation history, but kiro-cli has no session state. We format
+ * everything as a single user message with the history as context and the
+ * last user message as the actual query.
+ */
+function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
+  const systemParts: string[] = []
+  const historyParts: string[] = []
+  let lastUserMessage = ""
+
+  for (const message of prompt) {
+    if (message.role === "system") {
+      systemParts.push(message.content)
+      continue
+    }
+
+    if (message.role === "user") {
+      // Flush previous user message to history (if any)
+      if (lastUserMessage) {
+        historyParts.push(`User: ${lastUserMessage}`)
+      }
+      const parts: string[] = []
+      for (const part of message.content) {
+        if (part.type === "text") {
+          parts.push(part.text)
+        }
+      }
+      lastUserMessage = parts.join("\n")
+      continue
+    }
+
+    if (message.role === "assistant") {
+      const parts: string[] = []
+      for (const part of message.content) {
+        if (part.type === "text") {
+          parts.push(part.text)
+        } else if (part.type === "tool-call") {
+          parts.push(`[Called tool: ${part.toolName}]`)
+        }
+      }
+      if (parts.length > 0) {
+        historyParts.push(`Assistant: ${parts.join("\n")}`)
+      }
+      continue
+    }
+
+    if (message.role === "tool") {
+      for (const part of message.content) {
+        if (part.type === "tool-result") {
+          const output = part.output.type === "text" ? part.output.value : JSON.stringify(part.output)
+          historyParts.push(`[Tool result for ${part.toolName}: ${output}]`)
+        }
+      }
+      continue
+    }
+  }
+
+  const sections: string[] = []
+
+  if (systemParts.length > 0) {
+    sections.push(`<system_instructions>\n${systemParts.join("\n\n")}\n</system_instructions>`)
+  }
+
+  if (historyParts.length > 0) {
+    sections.push(`<conversation_history>\n${historyParts.join("\n\n")}\n</conversation_history>`)
+  }
+
+  sections.push(lastUserMessage)
+
+  return sections.join("\n\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +636,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       : undefined
     this.setAffinityId(affinityId)
 
+    // Session reset: clear persisted mapping so acquireSession() creates a fresh session
+    const reset = options.headers?.["x-session-reset"] === "true"
+    if (reset && affinityId) {
+      clearPersistedSession(this.client.getCwd(), affinityId)
+    }
+
     const toolResults = this.extractToolResults(options.prompt)
 
     if (toolResults.length > 0) {
@@ -570,7 +651,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       }
     }
 
-    return this.startFreshPrompt(options)
+    return this.startFreshPrompt(options, reset)
   }
 
   // -------------------------------------------------------------------------
@@ -872,15 +953,25 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
   private async startFreshPrompt(
     options: LanguageModelV3CallOptions,
+    reset = false,
   ): Promise<LanguageModelV3StreamResult> {
     const session = await this.acquireSession(options.tools)
     await this.ensureModel(session)
 
-    const { systemPrompt, userMessage } = extractPrompt(options.prompt)
+    let compositeText: string
 
-    const compositeText = systemPrompt
-      ? `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${userMessage}`
-      : userMessage
+    const hasHistory = reset && options.prompt.some(
+      (m) => m.role === "assistant" || m.role === "tool",
+    )
+
+    if (hasHistory) {
+      compositeText = formatConversationReplay(options.prompt)
+    } else {
+      const { systemPrompt, userMessage } = extractPrompt(options.prompt)
+      compositeText = systemPrompt
+        ? `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${userMessage}`
+        : userMessage
+    }
 
     const sessionId = session.sessionId
 
