@@ -252,10 +252,10 @@ function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
   }
 
   if (historyParts.length > 0) {
-    sections.push(`<conversation_history>\n${historyParts.join("\n\n")}\n</conversation_history>`)
+    sections.push(`<context>\n${historyParts.join("\n\n")}\n</context>`)
   }
 
-  sections.push(lastUserMessage)
+  sections.push(`Resume and act on the following message.\n\n${lastUserMessage}`)
 
   return sections.join("\n\n")
 }
