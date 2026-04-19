@@ -224,9 +224,9 @@ function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
       for (const part of message.content) {
         if (part.type === "text") {
           parts.push(part.text)
-        } else if (part.type === "tool-call") {
-          parts.push(`[Called tool: ${part.toolName}]`)
         }
+        // Skip tool-call parts — including tool names primes the model
+        // to reference tools that may not be available in the new session.
       }
       if (parts.length > 0) {
         historyParts.push(`Assistant: ${parts.join("\n")}`)
@@ -234,13 +234,9 @@ function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
       continue
     }
 
+    // Skip tool-result messages entirely — they reference tool names
+    // and outputs that could mislead the model about available tools.
     if (message.role === "tool") {
-      for (const part of message.content) {
-        if (part.type === "tool-result") {
-          const output = part.output.type === "text" ? part.output.value : JSON.stringify(part.output)
-          historyParts.push(`[Tool result for ${part.toolName}: ${output}]`)
-        }
-      }
       continue
     }
   }
