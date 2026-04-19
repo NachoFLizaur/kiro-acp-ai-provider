@@ -997,12 +997,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const laneRouter = this.client.getLaneRouter()
     laneRouter?.register(sessionId, onToolCall)
 
-    // Debug: log session setup details
-    const toolCount = options.tools?.filter((t: any) => t.type === "function").length ?? 0
-    const affinitySnippet = (this.currentAffinityId ?? "none").slice(0, 12)
-    const promptSnippet = compositeText.slice(0, 200).replace(/\n/g, " ")
-    console.error(`[kiro-debug] session=${sessionId.slice(0,12)} affinity=${affinitySnippet} reset=${reset} hasHistory=${hasHistory} tools=${toolCount} mode=${session.modes?.currentModeId ?? "?"} prompt="${promptSnippet}..."`)
-
     // Start the prompt after stream infrastructure is ready so onUpdate
     // can receive synchronous callbacks from client.prompt().
     const promptPromise = this.client.prompt({
