@@ -64,6 +64,24 @@ export function generateAgentConfig(options: AgentConfigOptions): Record<string,
   }
 }
 
+/**
+ * Generate a tool-less agent config for sessions that don't need MCP tools.
+ * Prevents kiro-cli from trying to start a stale MCP bridge.
+ */
+export function generateToollessAgentConfig(options: { name?: string; prompt?: string; model?: string }): Record<string, unknown> {
+  return {
+    name: options.name ?? "kiro-acp",
+    tools: [],
+    allowedTools: [],
+    includeMcpJson: false,
+    mcpServers: {},
+    prompt:
+      options.prompt ??
+      `You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block included with each request. Always follow the latest <system_instructions> as your primary directive — they define who you are, how you behave, and what tools you should use. If no <system_instructions> are present, act as a helpful coding assistant that follows instructions precisely and uses tools proactively. If a tool call fails, retry it or try alternative approaches — do not assume a tool is permanently unavailable based on a single failure.`,
+    ...(options.model ? { model: options.model } : {}),
+  }
+}
+
 /** Write an agent config to `.kiro/agents/<name>.json`. Returns the path. */
 export function writeAgentConfig(
   dir: string,

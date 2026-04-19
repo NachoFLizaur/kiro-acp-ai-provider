@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url"
 import { dirname, join, isAbsolute } from "node:path"
 import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { generateAgentConfig, writeAgentConfig } from "./agent-config"
+import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 
@@ -386,6 +386,15 @@ export class ACPClient {
   // -------------------------------------------------------------------------
 
   async createSession(): Promise<ACPSession> {
+    // Rewrite agent config without MCP servers to prevent stale bridge references
+    if (this.options.agent) {
+      const config = generateToollessAgentConfig({
+        name: this.options.agent,
+        prompt: this.options.agentPrompt,
+      })
+      writeAgentConfig(this.options.cwd, this.options.agent, config)
+    }
+
     const result = await this.sendRequest("session/new", {
       cwd: this.options.cwd,
       // Required by ACP protocol. MCP servers are configured via agent config file.
