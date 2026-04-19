@@ -386,18 +386,30 @@ export class ACPClient {
   // -------------------------------------------------------------------------
 
   async createSession(): Promise<ACPSession> {
-    // Rewrite agent config without MCP servers to prevent stale bridge references.
-    // Only applies when called directly (not from createSessionWithToolsPath,
-    // which writes its own config with MCP servers before calling sendNewSession).
-    if (this.options.agent) {
-      const config = generateToollessAgentConfig({
-        name: this.options.agent,
-        prompt: this.options.agentPrompt,
-      })
-      writeAgentConfig(this.options.cwd, this.options.agent, config)
-    }
+    const previousLock = this.sessionCreationLock
+    let releaseLock: () => void
+    this.sessionCreationLock = new Promise<void>((resolve) => {
+      releaseLock = resolve
+    })
 
-    return this.sendNewSession()
+    try {
+      await previousLock
+
+      // Rewrite agent config without MCP servers to prevent stale bridge references.
+      // Must be inside the lock — concurrent createSessionWithToolsPath calls write
+      // the full config with MCP servers, and we must not clobber it.
+      if (this.options.agent) {
+        const config = generateToollessAgentConfig({
+          name: this.options.agent,
+          prompt: this.options.agentPrompt,
+        })
+        writeAgentConfig(this.options.cwd, this.options.agent, config)
+      }
+
+      return await this.sendNewSession()
+    } finally {
+      releaseLock!()
+    }
   }
 
   private async sendNewSession(): Promise<ACPSession> {
