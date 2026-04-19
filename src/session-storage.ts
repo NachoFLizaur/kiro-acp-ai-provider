@@ -1,4 +1,4 @@
-import { writeFileSync, readFileSync, mkdirSync, renameSync } from "node:fs"
+import { writeFileSync, readFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { join } from "node:path"
 import { homedir } from "node:os"
@@ -57,6 +57,18 @@ export function persistSession(cwd: string, sessionId: string, affinityId?: stri
     renameSync(tmpPath, filePath)
   } catch {
     // Best-effort
+  }
+}
+
+/**
+ * Remove a persisted session mapping. Best-effort — silently ignores missing files.
+ */
+export function clearPersistedSession(cwd: string, affinityId?: string): void {
+  const filePath = getSessionFilePath(cwd, affinityId)
+  try {
+    unlinkSync(filePath)
+  } catch {
+    // File doesn't exist or can't be removed — nothing to do
   }
 }
 
