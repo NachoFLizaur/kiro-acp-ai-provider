@@ -450,7 +450,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private cleanupAfterStream(sessionId: string): void {
     if (this.currentAffinityId) {
       persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
-      this.cleanupSessionToolsFile(sessionId)
+      // Keep tools file alive — the MCP bridge still references it between turns.
+      // Only ephemeral (no affinity) sessions delete their tools file.
     } else {
       this.cleanupSessionToolsFile(sessionId)
     }
