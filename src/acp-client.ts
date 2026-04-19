@@ -386,7 +386,9 @@ export class ACPClient {
   // -------------------------------------------------------------------------
 
   async createSession(): Promise<ACPSession> {
-    // Rewrite agent config without MCP servers to prevent stale bridge references
+    // Rewrite agent config without MCP servers to prevent stale bridge references.
+    // Only applies when called directly (not from createSessionWithToolsPath,
+    // which writes its own config with MCP servers before calling sendNewSession).
     if (this.options.agent) {
       const config = generateToollessAgentConfig({
         name: this.options.agent,
@@ -395,6 +397,10 @@ export class ACPClient {
       writeAgentConfig(this.options.cwd, this.options.agent, config)
     }
 
+    return this.sendNewSession()
+  }
+
+  private async sendNewSession(): Promise<ACPSession> {
     const result = await this.sendRequest("session/new", {
       cwd: this.options.cwd,
       // Required by ACP protocol. MCP servers are configured via agent config file.
@@ -600,7 +606,7 @@ export class ACPClient {
         writeAgentConfig(this.options.cwd, this.options.agent, config)
       }
 
-      return await this.createSession()
+      return await this.sendNewSession()
     } finally {
       releaseLock!()
     }
