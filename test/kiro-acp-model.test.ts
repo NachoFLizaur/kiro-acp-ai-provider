@@ -291,10 +291,10 @@ describe("KiroACPLanguageModel", () => {
       await collectStream(result.stream)
 
       expect(client.setMode).toHaveBeenCalledWith("sess-1", "test-agent")
-      expect(client.waitForToolsReady).toHaveBeenCalledWith({ timeoutMs: 3000 })
+      expect(client.waitForToolsReady).toHaveBeenCalledWith({ timeoutMs: 5000 })
     })
 
-    test("does not call waitForToolsReady when mode already matches", async () => {
+    test("skips setMode when mode already matches", async () => {
       const client = createMockClient({
         getAgentName: mock(() => "test-agent"),
         createSession: mock(() =>
@@ -320,6 +320,7 @@ describe("KiroACPLanguageModel", () => {
       )
       await collectStream(result.stream)
 
+      // Mode already matches from session creation — ensureSessionMode skips
       expect(client.setMode).not.toHaveBeenCalled()
       expect(client.waitForToolsReady).not.toHaveBeenCalled()
     })

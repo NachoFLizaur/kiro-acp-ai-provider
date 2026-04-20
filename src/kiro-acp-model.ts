@@ -302,6 +302,17 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private pendingTurns = new Map<string, PendingTurnState>()
 
+  /**
+   * Isolated ACP clients for subagent sessions (separate kiro-cli processes).
+   * Each subagent gets its own process to prevent tool leakage between parent
+   * and child sessions that would otherwise share the same kiro-cli process.
+   */
+  private subClients = new Map<string, {
+    client: ACPClient
+    model: KiroACPLanguageModel
+    timer: ReturnType<typeof setTimeout> | null
+  }>()
+
   constructor(modelId: string, config: KiroACPModelConfig) {
     this.modelId = modelId
     this.client = config.client
@@ -467,7 +478,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     if (session.modes.currentModeId !== agentName) {
       await this.client.setMode(session.sessionId, agentName)
       session.modes.currentModeId = agentName
-      await this.client.waitForToolsReady({ timeoutMs: 3000 })
+      await this.client.waitForToolsReady({ timeoutMs: 5000 })
     }
   }
 
@@ -633,6 +644,15 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       : undefined
     this.setAffinityId(affinityId)
 
+    const isChild = typeof options.headers?.["x-parent-session-id"] === "string"
+    const hasTools = (options.tools ?? []).length > 0
+
+    // Subagent with tools → use isolated client (separate kiro-cli process)
+    // to prevent tool leakage from the parent session.
+    if (isChild && hasTools && affinityId) {
+      return this.doStreamIsolated(options, affinityId)
+    }
+
     // Session reset: clear persisted mapping so acquireSession() creates a fresh session
     const reset = options.headers?.["x-session-reset"] === "true"
     if (reset && affinityId) {
@@ -649,6 +669,76 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     }
 
     return this.startFreshPrompt(options, reset)
+  }
+
+  // -------------------------------------------------------------------------
+  // Subagent isolation — separate kiro-cli process per subagent
+  // -------------------------------------------------------------------------
+
+  private static readonly SUB_CLIENT_IDLE_MS = 180_000
+
+  /**
+   * Route a subagent doStream() call to an isolated KiroACPLanguageModel
+   * backed by its own ACPClient (separate kiro-cli process).
+   *
+   * The isolated client is reused across turns for the same affinityId
+   * (tool call → tool result → continuation) and cleaned up after 60s idle.
+   */
+  private async doStreamIsolated(
+    options: LanguageModelV3CallOptions,
+    affinityId: string,
+  ): Promise<LanguageModelV3StreamResult> {
+    let entry = this.subClients.get(affinityId)
+
+    if (!entry) {
+      const client = this.client.clone()
+      const model = new KiroACPLanguageModel(this.modelId, {
+        client,
+        contextWindow: this.config.contextWindow,
+      })
+      entry = { client, model, timer: null }
+      this.subClients.set(affinityId, entry)
+    }
+
+    // Clear any pending cleanup timer — this subagent is still active
+    if (entry.timer) {
+      clearTimeout(entry.timer)
+      entry.timer = null
+    }
+
+    // Delegate to the isolated model's doStream (which won't re-enter
+    // doStreamIsolated because we strip x-parent-session-id)
+    const isolatedOptions: LanguageModelV3CallOptions = {
+      ...options,
+      headers: {
+        ...options.headers,
+        "x-parent-session-id": undefined,
+      },
+    }
+
+    const result = await entry.model.doStream(isolatedOptions)
+
+    // Schedule cleanup — shutdown isolated client after idle timeout
+    const capturedEntry = entry
+    const capturedId = affinityId
+    capturedEntry.timer = setTimeout(() => {
+      void capturedEntry.client.stop()
+      this.subClients.delete(capturedId)
+    }, KiroACPLanguageModel.SUB_CLIENT_IDLE_MS)
+
+    return result
+  }
+
+  /**
+   * Shutdown all isolated subagent clients.
+   * Call this when the parent provider is shutting down.
+   */
+  async shutdownSubClients(): Promise<void> {
+    for (const [id, entry] of this.subClients) {
+      if (entry.timer) clearTimeout(entry.timer)
+      await entry.client.stop()
+    }
+    this.subClients.clear()
   }
 
   // -------------------------------------------------------------------------
