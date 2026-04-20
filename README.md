@@ -65,6 +65,20 @@ const kiro = createKiroAcp({
 })
 ```
 
+## Session Management
+
+### Subagent Process Isolation
+
+When the provider receives an `x-parent-session-id` header (indicating a subagent/child session), it spawns a **separate kiro-cli process** for that session. This prevents tool definitions from leaking between parent and child sessions. Isolated processes are auto-cleaned after 3 minutes idle.
+
+### Session Reset (Revert / Fork)
+
+The `x-session-reset: true` header clears the persisted session and creates a fresh kiro session. The full conversation history is replayed as `<context>` text in a single message, since ACP doesn't support native fork/truncate. This enables revert-to-message and fork operations in consumers like [opencode](https://opencode.ai).
+
+### MCP Timeout
+
+On startup, the provider sets `mcp.noInteractiveTimeout` to 30 minutes via `kiro-cli settings`. The default 5 minutes is too short for long-running tool calls (e.g., subagents that run for 8+ minutes).
+
 ## Provider Methods
 
 ```typescript
@@ -117,7 +131,9 @@ Tools work through the standard AI SDK contract. The provider includes an MCP br
 - **System prompt**: Kiro's base context is always present; yours is injected via `<system_instructions>` tags
 - **No per-turn options**: Temperature, thinking toggle, etc. are controlled by kiro-cli
 - **Estimated token counts**: Input tokens estimated from context usage %, output from character count
-- **Single process**: One kiro-cli per provider instance; concurrent sessions use lane routing
+- **Process model**: One kiro-cli per provider instance (subagent sessions get their own isolated process); concurrent sessions use lane routing
+- **Revert-to-message**: Requires the consumer to signal session reset via `x-session-reset` header
+- **No ACP session/fork**: ACP doesn't support native fork/truncate, so reverts replay the conversation history as context text
 
 ## License
 
