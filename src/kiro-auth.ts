@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import { execFileSync } from "node:child_process"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -27,13 +27,23 @@ export function verifyAuth(): AuthStatus {
   }
 
   const tokenPath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json")
-  const hasToken = existsSync(tokenPath)
   const hasApiKey = !!process.env.KIRO_API_KEY
+  let hasValidToken = false
+
+  if (existsSync(tokenPath)) {
+    try {
+      const raw = JSON.parse(readFileSync(tokenPath, "utf8"))
+      const expires = raw.expiresAt ? new Date(raw.expiresAt).getTime() : 0
+      hasValidToken = !!raw.accessToken && expires > Date.now()
+    } catch {
+      // Corrupt or unreadable token file
+    }
+  }
 
   return {
     installed,
-    authenticated: hasToken || hasApiKey,
+    authenticated: hasValidToken || hasApiKey,
     version,
-    tokenPath: hasToken ? tokenPath : undefined,
+    tokenPath: hasValidToken ? tokenPath : undefined,
   }
 }
