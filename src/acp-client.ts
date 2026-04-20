@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process"
+import { spawn, execFileSync, type ChildProcess } from "node:child_process"
 import { createInterface, type Interface as ReadlineInterface } from "node:readline"
 import { createHash, randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
@@ -241,6 +241,17 @@ export class ACPClient {
       this.setupAgentConfig(toolsFilePath)
     }
 
+    // Ensure MCP tool timeout is sufficient for long-running subagent tasks.
+    // Default is 5 minutes which is too short for complex planning operations.
+    try {
+      execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", "30"], {
+        timeout: 5000,
+        stdio: "ignore",
+      })
+    } catch {
+      // Best-effort — setting may already be configured
+    }
+
     const args = ["acp"]
     if (this.options.agent) {
       const sanitizedAgent = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_")
@@ -386,30 +397,11 @@ export class ACPClient {
   // -------------------------------------------------------------------------
 
   async createSession(): Promise<ACPSession> {
-    const previousLock = this.sessionCreationLock
-    let releaseLock: () => void
-    this.sessionCreationLock = new Promise<void>((resolve) => {
-      releaseLock = resolve
-    })
-
-    try {
-      await previousLock
-
-      // Rewrite agent config without MCP servers to prevent stale bridge references.
-      // Must be inside the lock — concurrent createSessionWithToolsPath calls write
-      // the full config with MCP servers, and we must not clobber it.
-      if (this.options.agent) {
-        const config = generateToollessAgentConfig({
-          name: this.options.agent,
-          prompt: this.options.agentPrompt,
-        })
-        writeAgentConfig(this.options.cwd, this.options.agent, config)
-      }
-
-      return await this.sendNewSession()
-    } finally {
-      releaseLock!()
-    }
+    // No agent config rewrite — tools files are kept alive (not deleted
+    // on cleanup), so any existing config still references a valid bridge.
+    // Writing a toolless config here would race with createSessionWithToolsPath
+    // and clobber the MCP bridge definition for concurrent sessions.
+    return this.sendNewSession()
   }
 
   private async sendNewSession(): Promise<ACPSession> {
@@ -542,6 +534,19 @@ export class ACPClient {
 
   getAgentName(): string | undefined {
     return this.options.agent
+  }
+
+  /** Return a copy of the construction options (for cloning). */
+  getOptions(): ACPClientOptions {
+    return { ...this.options }
+  }
+
+  /**
+   * Create a new ACPClient with the same options.
+   * The returned client is NOT started — call `start()` separately.
+   */
+  clone(): ACPClient {
+    return new ACPClient(this.getOptions())
   }
 
   getAvailableTools(): AvailableTool[] {
