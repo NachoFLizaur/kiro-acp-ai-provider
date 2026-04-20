@@ -45,7 +45,7 @@ Your App → AI SDK → kiro-acp-ai-provider → kiro-cli (ACP) → AWS Models
                     MCP Bridge (per-session)
 ```
 
-The provider translates AI SDK calls into ACP messages sent to a `kiro-cli` subprocess over JSON-RPC stdio. Tool calls are relayed through an MCP bridge back to your application via IPC — the bridge does **not** execute tools, your harness does.
+The provider translates AI SDK calls into ACP messages sent to a `kiro-cli` subprocess over JSON-RPC stdio. Tool calls are relayed through an MCP bridge back to your application via IPC — the bridge does **not** execute tools, your application does.
 
 ## Configuration
 
@@ -124,7 +124,7 @@ Use `listModels()` for the current list.
 
 ## Tools
 
-Tools work through the standard AI SDK contract. The provider includes an MCP bridge that reads tool definitions from a JSON file and relays calls to your harness via IPC. Pass custom tools through the AI SDK as usual — the provider handles the MCP bridge plumbing.
+Tools work through the standard AI SDK contract. The provider includes an MCP bridge that reads tool definitions from a JSON file and relays calls to your application via IPC. Pass custom tools through the AI SDK as usual — the provider handles the MCP bridge plumbing.
 
 ## Known Limitations
 
@@ -132,8 +132,9 @@ Tools work through the standard AI SDK contract. The provider includes an MCP br
 - **No per-turn options**: Temperature, thinking toggle, etc. are controlled by kiro-cli
 - **Estimated token counts**: Input tokens estimated from context usage %, output from character count
 - **Process model**: One kiro-cli per provider instance (subagent sessions get their own isolated process); concurrent sessions use lane routing
-- **Revert-to-message**: Requires the consumer to signal session reset via `x-session-reset` header
-- **No ACP session/fork**: ACP doesn't support native fork/truncate, so reverts replay the conversation history as context text
+- **Revert-to-message**: Requires the consumer to signal session reset via `x-session-reset` header as Kiro ACP doesn't support Checkpointing.
+- **No ACP session/fork**: Kiro ACP doesn't support native fork/truncate, so reverts replay the conversation history as context text
+- **No Thinking support**: Kiro ACP doesn't support it.
 
 ## License
 
