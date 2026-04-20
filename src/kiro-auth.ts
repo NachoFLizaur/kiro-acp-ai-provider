@@ -10,7 +10,7 @@ export interface AuthStatus {
   tokenPath?: string
 }
 
-/** Check if kiro-cli is installed and authenticated (filesystem check only). */
+/** Check if kiro-cli is installed and authenticated. */
 export function verifyAuth(): AuthStatus {
   let installed = false
   let version: string | undefined
@@ -26,24 +26,25 @@ export function verifyAuth(): AuthStatus {
     return { installed: false, authenticated: false }
   }
 
-  const tokenPath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json")
-  const hasApiKey = !!process.env.KIRO_API_KEY
-  let hasValidToken = false
-
-  if (existsSync(tokenPath)) {
-    try {
-      const raw = JSON.parse(readFileSync(tokenPath, "utf8"))
-      const expires = raw.expiresAt ? new Date(raw.expiresAt).getTime() : 0
-      hasValidToken = !!raw.accessToken && expires > Date.now()
-    } catch {
-      // Corrupt or unreadable token file
-    }
+  // Check actual auth status via kiro-cli (handles refresh token automatically)
+  let authenticated = false
+  try {
+    const output = execFileSync("kiro-cli", ["whoami"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 10000,
+    }).toString()
+    authenticated = output.includes("Logged in")
+  } catch {
+    // whoami fails if not authenticated
   }
+
+  const tokenPath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json")
+  const hasToken = existsSync(tokenPath)
 
   return {
     installed,
-    authenticated: hasValidToken || hasApiKey,
+    authenticated,
     version,
-    tokenPath: hasValidToken ? tokenPath : undefined,
+    tokenPath: hasToken ? tokenPath : undefined,
   }
 }
