@@ -18,6 +18,8 @@ export interface KiroACPProviderSettings {
   sessionId?: string
   /** Max context window in tokens. Default: 1_000_000. */
   contextWindow?: number
+  /** MCP tool call timeout in minutes. Default: 30. */
+  mcpTimeout?: number
 }
 
 export interface KiroACPModelOverrides {
@@ -57,6 +59,7 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
     onPermission: settings.onPermission,
     env: settings.env,
     clientInfo: settings.clientInfo,
+    mcpTimeout: settings.mcpTimeout,
   }
 
   const client = new ACPClient(clientOptions)

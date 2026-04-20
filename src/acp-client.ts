@@ -92,6 +92,8 @@ export interface ACPClientOptions {
   onUpdate?: (sessionId: string, update: SessionUpdate) => void
   onExtension?: (method: string, params: Record<string, unknown>) => void
   clientInfo?: { name: string; version: string; title?: string }
+  /** MCP tool call timeout in minutes (default: 30). */
+  mcpTimeout?: number
 }
 
 export interface PromptOptions {
@@ -244,7 +246,7 @@ export class ACPClient {
     // Ensure MCP tool timeout is sufficient for long-running subagent tasks.
     // Default is 5 minutes which is too short for complex planning operations.
     try {
-      execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", "30"], {
+      execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
         timeout: 5000,
         stdio: "ignore",
       })
