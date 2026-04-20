@@ -116,7 +116,7 @@ Available models depend on your subscription:
 
 | Model ID | Description |
 |----------|-------------|
-| `claude-opus-4.6` | Most capable |
+| `claude-opus-4.7` | Most capable |
 | `claude-sonnet-4.6` | Balanced |
 | `claude-haiku-4.5` | Fastest |
 
