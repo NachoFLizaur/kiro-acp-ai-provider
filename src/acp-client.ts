@@ -8,6 +8,7 @@ import { tmpdir } from "node:os"
 import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
+import { verifyAuth } from "./kiro-auth"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -907,6 +908,14 @@ export class ACPClient {
                 this.sendNotification("session/cancel", { sessionId: sid })
               }
             }
+            // On initialize/session/new timeout, check if auth expired (kiro-cli hangs silently when not authenticated)
+            if (method === "initialize" || method === "session/new") {
+              const auth = verifyAuth()
+              if (!auth.authenticated) {
+                reject(new KiroACPError("Not logged in. Run 'kiro-cli login' to authenticate.", -1))
+                return
+              }
+            }
             reject(new KiroACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1))
           }, timeoutMs)
         : null
@@ -969,7 +978,8 @@ export class ACPClient {
     this.pending.delete(msg.id)
 
     if (msg.error) {
-      pending.reject(new KiroACPError(msg.error.message, msg.error.code, msg.error.data))
+      const errorMessage = msg.error.message || `JSON-RPC error (code: ${msg.error.code ?? "unknown"})`
+      pending.reject(new KiroACPError(errorMessage, msg.error.code, msg.error.data))
     } else {
       pending.resolve(msg.result)
     }
