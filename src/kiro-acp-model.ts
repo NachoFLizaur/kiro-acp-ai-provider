@@ -13,12 +13,69 @@ import type {
 } from "@ai-sdk/provider"
 import { readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
-import type { ACPClient, ACPSession, SessionUpdate } from "./acp-client"
-import { KiroACPError } from "./acp-client"
+import type { ACPClient, ACPSession, SessionUpdate, ContentBlock } from "./acp-client"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
-import type { PendingToolCall } from "./ipc-server"
+import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
+
+// ---------------------------------------------------------------------------
+// Data conversion helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert AI SDK V3 data content to a base64 string.
+ *
+ * LanguageModelV3DataContent can be:
+ * - Uint8Array → convert to base64
+ * - string → assume already base64-encoded
+ * - URL → convert URL string to base64 (data URLs decoded, http URLs passed as-is)
+ */
+function toBase64Data(data: Uint8Array | string | URL): string {
+  if (data instanceof Uint8Array) {
+    return Buffer.from(data).toString("base64")
+  }
+
+  if (data instanceof URL) {
+    // Data URLs: extract the base64 payload
+    if (data.protocol === "data:") {
+      const href = data.href
+      const base64Marker = ";base64,"
+      const markerIndex = href.indexOf(base64Marker)
+      if (markerIndex !== -1) {
+        return href.slice(markerIndex + base64Marker.length)
+      }
+      // Non-base64 data URL — extract after comma as fallback
+      const commaIndex = href.indexOf(",")
+      if (commaIndex !== -1) {
+        return href.slice(commaIndex + 1)
+      }
+    }
+    // For http/https URLs, return the URL string — the ACP server
+    // will need to fetch it. This is a best-effort fallback.
+    return data.href
+  }
+
+  // Already a string — assume base64
+  return data
+}
+
+/**
+ * Normalize an AI SDK mediaType to a concrete MIME type.
+ *
+ * AI SDK may send `image/*` as a wildcard; default to `image/jpeg`.
+ */
+function normalizeMediaType(mediaType: string): string {
+  if (mediaType === "image/*") return "image/jpeg"
+  return mediaType
+}
+
+/**
+ * Check if a media type represents an image.
+ */
+function isImageMediaType(mediaType: string): boolean {
+  return mediaType.startsWith("image/") || mediaType === "image/*"
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -150,6 +207,15 @@ function mapStopReason(stopReason: string): LanguageModelV3FinishReason {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Error message extraction
+// ---------------------------------------------------------------------------
+
+function extractErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message
+  return String(err)
+}
+
 /**
  * Extract system prompt and latest user message from a LanguageModelV3Prompt.
  *
@@ -158,22 +224,33 @@ function mapStopReason(stopReason: string): LanguageModelV3FinishReason {
  */
 function extractPrompt(prompt: LanguageModelV3Prompt): {
   systemPrompt: string | undefined
-  userMessage: string
+  userParts: ContentBlock[]
 } {
   const systemParts: string[] = []
-  let lastUserMessage = ""
+  let lastUserParts: ContentBlock[] = []
 
   for (const message of prompt) {
     if (message.role === "system") {
       systemParts.push(message.content)
-    } else if (message.role === "user") {
-      const parts: string[] = []
+      continue
+    }
+
+    if (message.role === "user") {
+      const parts: ContentBlock[] = []
       for (const part of message.content) {
         if (part.type === "text") {
-          parts.push(part.text)
+          parts.push({ type: "text", text: part.text })
+          continue
+        }
+        if (part.type === "file" && isImageMediaType(part.mediaType)) {
+          parts.push({
+            type: "image",
+            data: toBase64Data(part.data),
+            mimeType: normalizeMediaType(part.mediaType),
+          })
         }
       }
-      lastUserMessage = parts.join("\n")
+      lastUserParts = parts
     }
   }
 
@@ -181,7 +258,7 @@ function extractPrompt(prompt: LanguageModelV3Prompt): {
 
   return {
     systemPrompt,
-    userMessage: lastUserMessage,
+    userParts: lastUserParts,
   }
 }
 
@@ -213,6 +290,12 @@ function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
       for (const part of message.content) {
         if (part.type === "text") {
           parts.push(part.text)
+          continue
+        }
+        if (part.type === "file" && isImageMediaType(part.mediaType)) {
+          parts.push(`[Image: ${normalizeMediaType(part.mediaType)}]`)
+        } else if (part.type === "file") {
+          parts.push(`[File: ${part.mediaType}]`)
         }
       }
       lastUserMessage = parts.join("\n")
@@ -608,24 +691,108 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     toolCallId: string
     toolName: string
     result: string
+    content?: IPCContentBlock[]
   }> {
-    const results: Array<{ toolCallId: string; toolName: string; result: string }> = []
+    const results: Array<{
+      toolCallId: string
+      toolName: string
+      result: string
+      content?: IPCContentBlock[]
+    }> = []
 
     for (const message of prompt) {
-      if (message.role === "tool") {
-        for (const part of message.content) {
-          if (part.type === "tool-result") {
-            const output = part.output
-            const resultText = output.type === "text"
-              ? output.value
-              : JSON.stringify(output)
-            results.push({
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              result: resultText,
-            })
-          }
+      if (message.role !== "tool") continue
+
+      for (const part of message.content) {
+        if (part.type !== "tool-result") continue
+
+        const output = part.output
+
+        if (output.type === "text") {
+          results.push({
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            result: output.value,
+          })
+          continue
         }
+
+        if (output.type === "content") {
+          const contentBlocks: IPCContentBlock[] = []
+          const textParts: string[] = []
+
+          for (const contentPart of output.value) {
+            if (contentPart.type === "text") {
+              contentBlocks.push({ type: "text", text: contentPart.text })
+              textParts.push(contentPart.text)
+              continue
+            }
+
+            if (contentPart.type === "image-data") {
+              contentBlocks.push({
+                type: "image",
+                data: contentPart.data,
+                mimeType: normalizeMediaType(contentPart.mediaType),
+              })
+              continue
+            }
+
+            if (contentPart.type === "image-url") {
+              // For URL images, include the URL as data fallback
+              // The MCP bridge will convert to appropriate format
+              contentBlocks.push({
+                type: "image",
+                data: contentPart.url,
+                mimeType: normalizeMediaType("image/jpeg"),
+              })
+              continue
+            }
+
+            if (contentPart.type === "file-data" && isImageMediaType(contentPart.mediaType)) {
+              contentBlocks.push({
+                type: "image",
+                data: contentPart.data,
+                mimeType: normalizeMediaType(contentPart.mediaType),
+              })
+              continue
+            }
+
+            // Handle deprecated "media" type (opencode sends this format)
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const anyPart = contentPart as any
+            if (anyPart.type === "media" && isImageMediaType(anyPart.mediaType)) {
+              contentBlocks.push({
+                type: "image",
+                data: anyPart.data,
+                mimeType: normalizeMediaType(anyPart.mediaType),
+              })
+              continue
+            }
+          }
+
+          // Text fallback for the `result` field (backward compat)
+          const resultText = textParts.length > 0
+            ? textParts.join("\n")
+            : JSON.stringify(output)
+
+          // Only include content if there are image blocks
+          const hasImages = contentBlocks.some((b) => b.type === "image")
+
+          results.push({
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            result: resultText,
+            ...(hasImages ? { content: contentBlocks } : {}),
+          })
+          continue
+        }
+
+        // Fallback for unknown output types
+        results.push({
+          toolCallId: part.toolCallId,
+          toolName: part.toolName,
+          result: JSON.stringify(output),
+        })
       }
     }
 
@@ -1015,9 +1182,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             writePart({ type: "text-end", id: textId })
           }
 
-          writePart({ type: "error", error: err instanceof KiroACPError
-            ? new Error(err.message)
-            : new Error("An internal error occurred") })
+          writePart({ type: "error", error: new Error(extractErrorMessage(err)) })
 
           removeAbortListener()
 
@@ -1045,19 +1210,32 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const session = await this.acquireSession(options.tools)
     await this.ensureModel(session)
 
-    let compositeText: string
+    let promptBlocks: ContentBlock[]
 
     const hasHistory = reset && options.prompt.some(
       (m) => m.role === "assistant" || m.role === "tool",
     )
 
     if (hasHistory) {
-      compositeText = formatConversationReplay(options.prompt)
+      const compositeText = formatConversationReplay(options.prompt)
+      promptBlocks = [{ type: "text", text: compositeText }]
     } else {
-      const { systemPrompt, userMessage } = extractPrompt(options.prompt)
-      compositeText = systemPrompt
-        ? `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${userMessage}`
-        : userMessage
+      const { systemPrompt, userParts } = extractPrompt(options.prompt)
+      const hasImages = userParts.some((p) => p.type === "image")
+
+      if (hasImages) {
+        // Mixed content: send system prompt + user parts as separate blocks
+        promptBlocks = systemPrompt
+          ? [{ type: "text" as const, text: `<system_instructions>\n${systemPrompt}\n</system_instructions>` }, ...userParts]
+          : [...userParts]
+      } else {
+        // Text-only: combine into single ContentBlock (original behavior kiro-cli expects)
+        const userText = userParts.map((p) => p.text ?? "").join("\n")
+        const compositeText = systemPrompt
+          ? `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${userText}`
+          : userText
+        promptBlocks = [{ type: "text", text: compositeText }]
+      }
     }
 
     const sessionId = session.sessionId
@@ -1091,16 +1269,20 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     // can receive synchronous callbacks from client.prompt().
     const promptPromise = this.client.prompt({
       sessionId,
-      prompt: [{ type: "text", text: compositeText }],
+      prompt: promptBlocks,
       onUpdate,
       signal: promptAbort.signal,
     })
 
     attachPromise(promptPromise)
 
+    const bodyText = promptBlocks
+      .map((b) => b.type === "text" ? b.text : `[Image: ${b.mimeType}]`)
+      .join("\n")
+
     return {
       stream: readable,
-      request: { body: compositeText },
+      request: { body: bodyText },
       response: { headers: {} },
     }
   }
@@ -1111,7 +1293,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
   private async resumeWithToolResults(
     sessionId: string,
-    toolResults: Array<{ toolCallId: string; toolName: string; result: string }>,
+    toolResults: Array<{
+      toolCallId: string
+      toolName: string
+      result: string
+      content?: IPCContentBlock[]
+    }>,
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3StreamResult> {
     const turn = this.pendingTurns.get(sessionId)
@@ -1119,33 +1306,147 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       throw new Error(`No pending turn for session ${sessionId}`)
     }
 
+    // Check if any tool results contain images
+    const hasImages = toolResults.some(r => r.content?.some(b => b.type === "image"))
+
+    if (!hasImages) {
+      // Original path: send tool results with content as-is
+      const { readable, onUpdate, onToolCall, attachPromise } = this.createPromptStream({
+        sessionId,
+        promptAbort: turn.promptAbort,
+        initialOutputCharCount: turn.outputCharCount,
+        streamSegment: turn.streamSegment,
+        options,
+        savePendingTurn: (state) => {
+          turn.pendingToolCalls = state.pendingToolCalls
+          turn.outputCharCount = state.outputCharCount
+          turn.streamSegment = state.nextSegment
+        },
+      })
+
+      const laneRouter = this.client.getLaneRouter()
+      laneRouter?.updateHandler(sessionId, onToolCall)
+
+      this.client.setPromptCallback(sessionId, onUpdate)
+
+      for (const result of toolResults) {
+        this.sendToolResult(result.toolCallId, result.result, false, result.content)
+      }
+
+      attachPromise(turn.promptPromise)
+
+      return {
+        stream: readable,
+        request: { body: "[tool result resumption]" },
+        response: { headers: {} },
+      }
+    }
+
+    // FUP path: images present — send text-only results, then follow up with images
+
+    // 1. Collect image ContentBlocks from all tool results
+    const imageBlocks: ContentBlock[] = []
+    for (const result of toolResults) {
+      if (result.content) {
+        for (const block of result.content) {
+          if (block.type === "image" && block.data && block.mimeType) {
+            imageBlocks.push({ type: "image", data: block.data, mimeType: block.mimeType })
+          }
+        }
+      }
+    }
+
+    // 2. Send text-only tool results so MCP flow completes
+    // Only strip content from results that actually have images
+    for (const result of toolResults) {
+      const hasImageContent = result.content?.some(b => b.type === "image")
+      this.sendToolResult(result.toolCallId, result.result, false, hasImageContent ? undefined : result.content)
+    }
+
+    // 3. Abort the first response — we don't need the text-only hallucination.
+    // This cancels any ongoing generation and frees the session for the follow-up.
+    turn.promptAbort.abort()
+
+    // Wait for the prompt promise to settle (it should reject due to abort)
+    try {
+      await turn.promptPromise
+    } catch {
+      // Expected: abort causes rejection
+    }
+
+    // 4. Clean up the pending turn
+    this.pendingTurns.delete(sessionId)
+
+    // 5. Create a NEW prompt stream for the follow-up with images
+    const promptAbort = new AbortController()
+
+    // Use a `let` so savePendingTurn can reference followUpPromise
+    // (assigned after client.prompt() call below)
+    let followUpPromise!: Promise<{ stopReason: string }>
+
     const { readable, onUpdate, onToolCall, attachPromise } = this.createPromptStream({
       sessionId,
-      promptAbort: turn.promptAbort,
-      initialOutputCharCount: turn.outputCharCount,
-      streamSegment: turn.streamSegment,
+      promptAbort,
+      initialOutputCharCount: 0,
+      streamSegment: 0,
       options,
       savePendingTurn: (state) => {
-        turn.pendingToolCalls = state.pendingToolCalls
-        turn.outputCharCount = state.outputCharCount
-        turn.streamSegment = state.nextSegment
+        this.pendingTurns.set(sessionId, {
+          sessionId,
+          promptPromise: followUpPromise,
+          pendingToolCalls: state.pendingToolCalls,
+          outputCharCount: state.outputCharCount,
+          streamSegment: state.nextSegment,
+          promptAbort,
+        })
       },
     })
 
     const laneRouter = this.client.getLaneRouter()
     laneRouter?.updateHandler(sessionId, onToolCall)
-
     this.client.setPromptCallback(sessionId, onUpdate)
 
-    for (const result of toolResults) {
-      this.sendToolResult(result.toolCallId, result.result, false)
+    // 6. Send follow-up prompt with images as ContentBlocks
+
+    // Extract the original user request for context in the follow-up
+    let lastUserText = ""
+    for (const msg of options.prompt) {
+      if (msg.role === "user") {
+        for (const part of msg.content) {
+          if (part.type === "text") {
+            lastUserText = part.text
+          }
+        }
+      }
     }
 
-    attachPromise(turn.promptPromise)
+    // Build tool context: which tools returned images
+    const imageToolNames = toolResults
+      .filter(r => r.content?.some(b => b.type === "image"))
+      .map(r => r.toolName)
+    const toolContext = imageToolNames.length === 1
+      ? `the ${imageToolNames[0]} tool`
+      : `the following tools: ${imageToolNames.join(", ")}`
+
+    const followUpBlocks: ContentBlock[] = [
+      { type: "text", text: lastUserText
+        ? `The user asked: "${lastUserText}"\nYou called ${toolContext} which returned these images. Answer the user's original request based on the images:`
+        : `You called ${toolContext} which returned these images. Describe and analyze them:` },
+      ...imageBlocks,
+    ]
+
+    followUpPromise = this.client.prompt({
+      sessionId,
+      prompt: followUpBlocks,
+      onUpdate,
+      signal: promptAbort.signal,
+    })
+
+    attachPromise(followUpPromise)
 
     return {
       stream: readable,
-      request: { body: "[tool result resumption]" },
+      request: { body: "[tool result resumption with FUP images]" },
       response: { headers: {} },
     }
   }
@@ -1154,13 +1455,18 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   // Tool result delivery via IPC
   // -------------------------------------------------------------------------
 
-  private sendToolResult(callId: string, result: string, isError: boolean): void {
+  private sendToolResult(
+    callId: string,
+    result: string,
+    isError: boolean,
+    content?: IPCContentBlock[],
+  ): void {
     const ipcServer = this.client.getIPCServer()
     if (!ipcServer) {
       throw new Error("IPC server not available for sending tool result")
     }
 
-    ipcServer.resolveToolResult({ callId, result, isError })
+    ipcServer.resolveToolResult({ callId, result, isError, ...(content ? { content } : {}) })
   }
 
   // -------------------------------------------------------------------------

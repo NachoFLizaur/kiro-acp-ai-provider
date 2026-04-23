@@ -576,6 +576,152 @@ describe("IPCServer", () => {
   })
 
   // -------------------------------------------------------------------------
+  // Image content support
+  // -------------------------------------------------------------------------
+
+  describe("Image content support", () => {
+    test("tool result with content field passes through to pending response", async () => {
+      server = createIPCServer()
+      port = await server.start()
+      secret = server.getSecret()
+
+      server.getLaneRouter().register("sess-1", () => {})
+
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-img-1",
+        toolName: "screenshot",
+        args: {},
+      }, secret)
+
+      await new Promise((r) => setTimeout(r, 50))
+      expect(server.getPendingCount()).toBe(1)
+
+      // Send result with content field including an image block
+      await httpRequest(port, "POST", "/tool/result", {
+        callId: "call-img-1",
+        result: "Screenshot captured",
+        isError: false,
+        content: [
+          { type: "text", text: "Screenshot captured" },
+          { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+        ],
+      }, secret)
+
+      const pendingResult = await pendingPromise
+      const body = pendingResult.body as ToolExecuteResponse
+      expect(body.status).toBe("success")
+      expect(body.result).toBe("Screenshot captured")
+      expect(body.content).toBeDefined()
+      expect(body.content).toHaveLength(2)
+      expect(body.content![0]).toEqual({ type: "text", text: "Screenshot captured" })
+      expect(body.content![1]).toEqual({ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" })
+    })
+
+    test("tool result without content field works as before", async () => {
+      server = createIPCServer()
+      port = await server.start()
+      secret = server.getSecret()
+
+      server.getLaneRouter().register("sess-1", () => {})
+
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-text-only",
+        toolName: "bash",
+        args: { command: "echo hello" },
+      }, secret)
+
+      await new Promise((r) => setTimeout(r, 50))
+
+      // Send result WITHOUT content field — backward compatible
+      await httpRequest(port, "POST", "/tool/result", {
+        callId: "call-text-only",
+        result: "hello\n",
+        isError: false,
+      }, secret)
+
+      const pendingResult = await pendingPromise
+      const body = pendingResult.body as ToolExecuteResponse
+      expect(body.status).toBe("success")
+      expect(body.result).toBe("hello\n")
+      expect(body.content).toBeUndefined()
+    })
+
+    test("tool result with mixed text + image content", async () => {
+      server = createIPCServer()
+      port = await server.start()
+      secret = server.getSecret()
+
+      server.getLaneRouter().register("sess-1", () => {})
+
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-mixed",
+        toolName: "render",
+        args: {},
+      }, secret)
+
+      await new Promise((r) => setTimeout(r, 50))
+
+      const mixedContent = [
+        { type: "text", text: "Rendered output:" },
+        { type: "image", data: "base64png", mimeType: "image/png" },
+        { type: "text", text: "And another view:" },
+        { type: "image", data: "base64jpg", mimeType: "image/jpeg" },
+      ]
+
+      await httpRequest(port, "POST", "/tool/result", {
+        callId: "call-mixed",
+        result: "Rendered output:",
+        isError: false,
+        content: mixedContent,
+      }, secret)
+
+      const pendingResult = await pendingPromise
+      const body = pendingResult.body as ToolExecuteResponse
+      expect(body.status).toBe("success")
+      expect(body.content).toHaveLength(4)
+      expect(body.content![0]).toEqual({ type: "text", text: "Rendered output:" })
+      expect(body.content![1]).toEqual({ type: "image", data: "base64png", mimeType: "image/png" })
+      expect(body.content![2]).toEqual({ type: "text", text: "And another view:" })
+      expect(body.content![3]).toEqual({ type: "image", data: "base64jpg", mimeType: "image/jpeg" })
+    })
+
+    test("resolveToolResult passes content to pending promise", async () => {
+      server = createIPCServer()
+      port = await server.start()
+      secret = server.getSecret()
+
+      server.getLaneRouter().register("sess-1", () => {})
+
+      const pendingPromise = httpRequest(port, "POST", "/tool/pending", {
+        callId: "call-resolve-content",
+        toolName: "screenshot",
+        args: {},
+      }, secret)
+
+      await new Promise((r) => setTimeout(r, 50))
+      expect(server.getPendingCount()).toBe(1)
+
+      // Resolve directly via the in-process method with content
+      server.resolveToolResult({
+        callId: "call-resolve-content",
+        result: "Screenshot taken",
+        isError: false,
+        content: [
+          { type: "image", data: "resolvedBase64", mimeType: "image/webp" },
+        ],
+      })
+
+      const result = await pendingPromise
+      const body = result.body as ToolExecuteResponse
+      expect(body.status).toBe("success")
+      expect(body.result).toBe("Screenshot taken")
+      expect(body.content).toBeDefined()
+      expect(body.content).toHaveLength(1)
+      expect(body.content![0]).toEqual({ type: "image", data: "resolvedBase64", mimeType: "image/webp" })
+    })
+  })
+
+  // -------------------------------------------------------------------------
   // getPendingCount()
   // -------------------------------------------------------------------------
 

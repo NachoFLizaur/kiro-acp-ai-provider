@@ -24,10 +24,20 @@ export interface PendingToolCall {
   args: Record<string, unknown>
 }
 
+/** Content block for IPC transport — text or image. */
+export interface IPCContentBlock {
+  type: "text" | "image"
+  text?: string
+  data?: string      // base64 for images
+  mimeType?: string  // e.g., "image/png"
+}
+
 export interface ToolResultRequest {
   callId: string
   result: string
   isError?: boolean
+  /** Structured content blocks (text + images). When present, takes precedence over `result`. */
+  content?: IPCContentBlock[]
 }
 
 export interface ToolExecuteResponse {
@@ -35,6 +45,8 @@ export interface ToolExecuteResponse {
   result?: string
   error?: string
   code?: string
+  /** Structured content blocks (text + images). When present, MCP bridge should use these. */
+  content?: IPCContentBlock[]
 }
 
 export interface IPCServerOptions {
@@ -178,7 +190,7 @@ class IPCServerImpl implements IPCServer {
   }
 
   resolveToolResult(request: ToolResultRequest): void {
-    const { callId, result, isError } = request
+    const { callId, result, isError, content } = request
     const pending = this.pendingCalls.get(callId)
     if (!pending) return
 
@@ -188,6 +200,7 @@ class IPCServerImpl implements IPCServer {
     pending.resolve({
       status: isError ? "error" : "success",
       ...(isError ? { error: result } : { result }),
+      ...(content ? { content } : {}),
     })
   }
 
@@ -349,6 +362,7 @@ class IPCServerImpl implements IPCServer {
     pending.resolve({
       status: body.isError ? "error" : "success",
       ...(body.isError ? { error: body.result } : { result: body.result }),
+      ...(body.content ? { content: body.content } : {}),
     })
 
     respond(res, 200, { status: "ok" })

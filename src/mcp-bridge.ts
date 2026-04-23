@@ -53,8 +53,15 @@ interface JsonRpcResponse {
 // MCP protocol types
 // ---------------------------------------------------------------------------
 
+interface MCPContentBlock {
+  type: "text" | "image"
+  text?: string      // for type: "text"
+  data?: string      // base64 for type: "image"
+  mimeType?: string  // for type: "image"
+}
+
 interface MCPToolResult {
-  content: Array<{ type: "text"; text: string }>
+  content: MCPContentBlock[]
   isError?: boolean
 }
 
@@ -436,6 +443,23 @@ class MCPBridgeServer {
       )
 
       if (response.status === "success") {
+        // If structured content is available (may include images), use it
+        if (response.content && response.content.length > 0) {
+          const mcpContent: MCPContentBlock[] = response.content.map((block) => {
+            if (block.type === "image" && block.data && block.mimeType) {
+              return { type: "image" as const, data: block.data, mimeType: block.mimeType }
+            }
+            return { type: "text" as const, text: block.text ?? "" }
+          })
+
+          return {
+            jsonrpc: "2.0",
+            id: requestId,
+            result: { content: mcpContent } satisfies MCPToolResult,
+          }
+        }
+
+        // Fallback: text-only result (backward compatible)
         return {
           jsonrpc: "2.0",
           id: requestId,

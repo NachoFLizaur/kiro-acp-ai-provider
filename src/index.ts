@@ -48,6 +48,7 @@ export {
   createIPCServer,
   type IPCServer,
   type IPCServerOptions,
+  type IPCContentBlock,
   type PendingToolCall,
   type ToolResultRequest,
   type ToolExecuteResponse,
