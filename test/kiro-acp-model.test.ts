@@ -1,5 +1,6 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test"
 import { KiroACPLanguageModel, type KiroACPModelConfig } from "../src/kiro-acp-model"
+import { KiroACPError, KiroACPConnectionError } from "../src/acp-client"
 import type { ACPClient, ACPSession, SessionUpdate, PromptOptions } from "../src/acp-client"
 import type { IPCServer, PendingToolCall, ToolResultRequest } from "../src/ipc-server"
 import { LaneRouter } from "../src/lane-router"
@@ -418,11 +419,11 @@ describe("KiroACPLanguageModel", () => {
       )
 
       expect(capturedPrompt).toHaveLength(1)
-      const textContent = (capturedPrompt[0] as { text: string }).text
-      expect(textContent).toContain("<system_instructions>")
-      expect(textContent).toContain("You are a helpful assistant.")
-      expect(textContent).toContain("</system_instructions>")
-      expect(textContent).toContain("hello")
+      const block = capturedPrompt[0] as { text: string }
+      expect(block.text).toContain("<system_instructions>")
+      expect(block.text).toContain("You are a helpful assistant.")
+      expect(block.text).toContain("</system_instructions>")
+      expect(block.text).toContain("hello")
     })
 
     test("sends plain user message when no system prompt", async () => {
@@ -597,7 +598,7 @@ describe("KiroACPLanguageModel", () => {
   })
 
   describe("doStream() — error handling", () => {
-    test("emits error part when prompt rejects", async () => {
+    test("preserves original error message for non-KiroACPError errors", async () => {
       const client = createMockClient({
         prompt: mock(async () => {
           throw new Error("Connection lost")
@@ -615,7 +616,210 @@ describe("KiroACPLanguageModel", () => {
 
       expect(errorPart).toBeDefined()
       if (errorPart?.type === "error") {
-        expect((errorPart.error as Error).message).toBe("An internal error occurred")
+        expect((errorPart.error as Error).message).toBe("Connection lost")
+      }
+    })
+
+    test("passes through KiroACPError message", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPError("Session not found", -32000)
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toBe("Session not found")
+      }
+    })
+
+    test("passes through KiroACPError message directly (no keyword rewriting)", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPError("request failed", 401)
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toBe("request failed")
+      }
+    })
+
+    test("passes through KiroACPError auth timeout message from acp-client", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPError("Not logged in. Run 'kiro-cli login' to authenticate.")
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toContain("Not logged in")
+        expect((errorPart.error as Error).message).toContain("kiro-cli login")
+      }
+    })
+
+    test("passes through KiroACPError service timeout message from acp-client", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPError(
+            "Request timed out after 30000ms: initialize",
+          )
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toBe("Request timed out after 30000ms: initialize")
+      }
+    })
+
+    test("passes through plain Error message without rewriting", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new Error("Not logged in to Kiro")
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toBe("Not logged in to Kiro")
+      }
+    })
+
+    test("passes through service error message from KiroACPError without rewriting", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPError("backend error", 503)
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toBe("backend error")
+      }
+    })
+
+    test("passes through prompt timeout message from acp-client", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPError(
+            "Request timed out after 300000ms: session/prompt",
+          )
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toBe("Request timed out after 300000ms: session/prompt")
+      }
+    })
+
+    test("passes through KiroACPConnectionError message directly", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPConnectionError("Process exited (code=1, signal=null)")
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toBe("Process exited (code=1, signal=null)")
+      }
+    })
+
+    test("stringifies non-Error thrown values", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw "raw string error"
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        expect((errorPart.error as Error).message).toBe("raw string error")
       }
     })
   })
@@ -1647,6 +1851,1306 @@ describe("KiroACPLanguageModel", () => {
       await collectStream(result.stream)
 
       expect(capturedAffinityId).toBeUndefined()
+    })
+  })
+
+  describe("formatConversationReplay — image placeholders", () => {
+    test("includes [Image: image/png] placeholder for file parts with image MIME", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions(
+          [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "file",
+                  data: new Uint8Array([0x89, 0x50]),
+                  mediaType: "image/png",
+                },
+              ],
+            },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "I see an image." }],
+            },
+            { role: "user", content: [{ type: "text", text: "describe it" }] },
+          ],
+          { headers: { "x-session-reset": "true" } },
+        ),
+      )
+
+      const textContent = (capturedPrompt[0] as { text: string }).text
+      expect(textContent).toContain("[Image: image/png]")
+      expect(textContent).toContain("describe it")
+    })
+
+    test("handles mixed text + image user messages in correct order", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions(
+          [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "Here is my screenshot:" },
+                {
+                  type: "file",
+                  data: new Uint8Array([0x89, 0x50]),
+                  mediaType: "image/png",
+                },
+                { type: "text", text: "What do you see?" },
+              ],
+            },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "I see a screenshot." }],
+            },
+            { role: "user", content: [{ type: "text", text: "thanks" }] },
+          ],
+          { headers: { "x-session-reset": "true" } },
+        ),
+      )
+
+      const textContent = (capturedPrompt[0] as { text: string }).text
+      // The history should contain the mixed message with text and image placeholder
+      expect(textContent).toContain("Here is my screenshot:\n[Image: image/png]\nWhat do you see?")
+    })
+
+    test("normalizes image/* wildcard to image/jpeg in placeholder", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions(
+          [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "file",
+                  data: new Uint8Array([0xff, 0xd8]),
+                  mediaType: "image/*",
+                },
+              ],
+            },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "Got it." }],
+            },
+            { role: "user", content: [{ type: "text", text: "next" }] },
+          ],
+          { headers: { "x-session-reset": "true" } },
+        ),
+      )
+
+      const textContent = (capturedPrompt[0] as { text: string }).text
+      expect(textContent).toContain("[Image: image/jpeg]")
+      expect(textContent).not.toContain("image/*")
+    })
+
+    test("text-only messages are unchanged (no regression)", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions(
+          [
+            { role: "user", content: [{ type: "text", text: "hello" }] },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "hi there" }],
+            },
+            { role: "user", content: [{ type: "text", text: "follow up" }] },
+          ],
+          { headers: { "x-session-reset": "true" } },
+        ),
+      )
+
+      const textContent = (capturedPrompt[0] as { text: string }).text
+      expect(textContent).toContain("User: hello")
+      expect(textContent).toContain("Assistant: hi there")
+      expect(textContent).toContain("follow up")
+      expect(textContent).not.toContain("[Image:")
+    })
+
+    test("non-image file parts get a [File: mime] placeholder", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions(
+          [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "check this file" },
+                {
+                  type: "file",
+                  data: new Uint8Array([0x25, 0x50]),
+                  mediaType: "application/pdf",
+                },
+              ],
+            },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "ok" }],
+            },
+            { role: "user", content: [{ type: "text", text: "done" }] },
+          ],
+          { headers: { "x-session-reset": "true" } },
+        ),
+      )
+
+      const textContent = (capturedPrompt[0] as { text: string }).text
+      expect(textContent).toContain("check this file")
+      expect(textContent).not.toContain("[Image:")
+      expect(textContent).toContain("[File: application/pdf]")
+    })
+  })
+
+  describe("extractPrompt — base64 conversion (Task 01)", () => {
+    test("converts Uint8Array image data to base64", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+
+      await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              { type: "file", data: bytes, mediaType: "image/png" },
+            ],
+          },
+        ]),
+      )
+
+      const imageBlock = capturedPrompt[0] as { type: string; data: string; mimeType: string }
+      expect(imageBlock.type).toBe("image")
+      expect(imageBlock.data).toBe(Buffer.from(bytes).toString("base64"))
+      expect(imageBlock.mimeType).toBe("image/png")
+    })
+
+    test("passes string image data through unchanged", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              { type: "file", data: "aGVsbG8=", mediaType: "image/jpeg" },
+            ],
+          },
+        ]),
+      )
+
+      const imageBlock = capturedPrompt[0] as { type: string; data: string; mimeType: string }
+      expect(imageBlock.type).toBe("image")
+      expect(imageBlock.data).toBe("aGVsbG8=")
+    })
+
+    test("extracts base64 from data URL", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              {
+                type: "file",
+                data: new URL("data:image/png;base64,abc123"),
+                mediaType: "image/png",
+              },
+            ],
+          },
+        ]),
+      )
+
+      const imageBlock = capturedPrompt[0] as { type: string; data: string }
+      expect(imageBlock.type).toBe("image")
+      expect(imageBlock.data).toBe("abc123")
+    })
+
+    test("normalizes image/* wildcard to image/jpeg", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              { type: "file", data: "imgdata", mediaType: "image/*" },
+            ],
+          },
+        ]),
+      )
+
+      const imageBlock = capturedPrompt[0] as { type: string; mimeType: string }
+      expect(imageBlock.type).toBe("image")
+      expect(imageBlock.mimeType).toBe("image/jpeg")
+    })
+
+    test("preserves concrete image MIME types", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              { type: "file", data: "webpdata", mediaType: "image/webp" },
+            ],
+          },
+        ]),
+      )
+
+      const imageBlock = capturedPrompt[0] as { type: string; mimeType: string }
+      expect(imageBlock.type).toBe("image")
+      expect(imageBlock.mimeType).toBe("image/webp")
+    })
+  })
+
+  describe("extractPrompt — image handling (Task 02)", () => {
+    test("sends text ContentBlocks for text-only prompt", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "hello world" }] },
+        ]),
+      )
+
+      expect(capturedPrompt).toHaveLength(1)
+      expect(capturedPrompt[0]).toEqual({ type: "text", text: "hello world" })
+    })
+
+    test("sends image ContentBlocks for file parts", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              { type: "file", data: "imgdata", mediaType: "image/png" },
+            ],
+          },
+        ]),
+      )
+
+      expect(capturedPrompt).toHaveLength(1)
+      expect(capturedPrompt[0]).toEqual({
+        type: "image",
+        data: "imgdata",
+        mimeType: "image/png",
+      })
+    })
+
+    test("sends mixed text + image ContentBlocks", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Look at this:" },
+              { type: "file", data: "imgdata", mediaType: "image/png" },
+              { type: "text", text: "What is it?" },
+            ],
+          },
+        ]),
+      )
+
+      expect(capturedPrompt).toHaveLength(3)
+      expect(capturedPrompt[0]).toEqual({ type: "text", text: "Look at this:" })
+      expect(capturedPrompt[1]).toEqual({
+        type: "image",
+        data: "imgdata",
+        mimeType: "image/png",
+      })
+      expect(capturedPrompt[2]).toEqual({ type: "text", text: "What is it?" })
+    })
+
+    test("ignores non-image file parts", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "check this" },
+              { type: "file", data: "pdfdata", mediaType: "application/pdf" },
+            ],
+          },
+        ]),
+      )
+
+      // Only the text block should be sent; PDF is silently skipped
+      expect(capturedPrompt).toHaveLength(1)
+      expect(capturedPrompt[0]).toEqual({ type: "text", text: "check this" })
+    })
+
+    test("preserves system prompt with images", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          { role: "system", content: "You are a vision assistant." },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Describe this:" },
+              { type: "file", data: "imgdata", mediaType: "image/jpeg" },
+            ],
+          },
+        ]),
+      )
+
+      // System prompt is first, then user text, then image
+      expect(capturedPrompt).toHaveLength(3)
+      const systemBlock = capturedPrompt[0] as { type: string; text: string }
+      expect(systemBlock.type).toBe("text")
+      expect(systemBlock.text).toContain("<system_instructions>")
+      expect(systemBlock.text).toContain("You are a vision assistant.")
+      expect(capturedPrompt[1]).toEqual({ type: "text", text: "Describe this:" })
+      expect(capturedPrompt[2]).toEqual({
+        type: "image",
+        data: "imgdata",
+        mimeType: "image/jpeg",
+      })
+    })
+  })
+
+  describe("startFreshPrompt — ContentBlock[] wiring (Task 04)", () => {
+    test("client.prompt receives combined text block for text-only prompts", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          { role: "system", content: "Be helpful." },
+          { role: "user", content: [{ type: "text", text: "hello" }] },
+        ]),
+      )
+
+      // Text-only: system prompt and user text combined into single block
+      expect(capturedPrompt).toHaveLength(1)
+      const block = capturedPrompt[0] as { type: string; text: string }
+      expect(block.type).toBe("text")
+      expect(block.text).toContain("<system_instructions>")
+      expect(block.text).toContain("Be helpful.")
+      expect(block.text).toContain("hello")
+    })
+
+    test("client.prompt receives image blocks from user prompt", async () => {
+      let capturedPrompt: unknown[] = []
+
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          capturedPrompt = opts.prompt
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              { type: "file", data: "imgdata", mediaType: "image/png" },
+            ],
+          },
+        ]),
+      )
+
+      expect(capturedPrompt).toHaveLength(1)
+      const imageBlock = capturedPrompt[0] as { type: string; data: string; mimeType: string }
+      expect(imageBlock.type).toBe("image")
+      expect(imageBlock.data).toBe("imgdata")
+      expect(imageBlock.mimeType).toBe("image/png")
+    })
+
+    test("request.body contains readable representation with image placeholders", async () => {
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "response" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Look at this:" },
+              { type: "file", data: "imgdata", mediaType: "image/png" },
+            ],
+          },
+        ]),
+      )
+      await collectStream(result.stream)
+
+      // request.body should contain readable text with image placeholder
+      expect(result.request?.body).toContain("Look at this:")
+      expect(result.request?.body).toContain("[Image: image/png]")
+      // Should NOT contain raw base64 data
+      expect(result.request?.body).not.toContain("imgdata")
+    })
+  })
+
+  describe("Tool result image extraction", () => {
+    test("doStream sends text-only tool result for text output", async () => {
+      const laneRouter = new LaneRouter()
+      const resolvedResults: ToolResultRequest[] = []
+      const mockIPC = createMockIPCServer({
+        getLaneRouter: mock(() => laneRouter),
+        resolveToolResult: mock((req: ToolResultRequest) => {
+          resolvedResults.push(req)
+        }),
+      })
+
+      let promptResolve: ((value: { stopReason: string }) => void) | null = null
+
+      const client = createMockClient({
+        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
+        setPromptCallback: mock(() => {}),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "Running..." },
+          })
+          laneRouter.route({
+            callId: "tc-text-only",
+            toolName: "bash",
+            args: { command: "echo hello" },
+          })
+          return new Promise<{ stopReason: string }>((resolve) => {
+            promptResolve = resolve
+          })
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      // First doStream — triggers tool call
+      const result1 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "run it" }] }]),
+      )
+      await collectStream(result1.stream)
+
+      // Resolve prompt after tool result
+      setTimeout(() => promptResolve?.({ stopReason: "end_turn" }), 50)
+
+      // Second doStream with text-only tool result
+      const result2 = await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "run it" }] },
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", toolCallId: "tc-text-only", toolName: "bash", input: JSON.stringify({ command: "echo hello" }) },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "tc-text-only",
+                toolName: "bash",
+                output: { type: "text" as const, value: "hello\n" },
+              },
+            ],
+          },
+        ]),
+      )
+      await collectStream(result2.stream)
+
+      expect(resolvedResults).toHaveLength(1)
+      expect(resolvedResults[0].callId).toBe("tc-text-only")
+      expect(resolvedResults[0].result).toBe("hello\n")
+      expect((resolvedResults[0] as Record<string, unknown>).content).toBeUndefined()
+    })
+
+    test("doStream sends image content for content output with image-data via FUP", async () => {
+      const laneRouter = new LaneRouter()
+      const resolvedResults: ToolResultRequest[] = []
+      const mockIPC = createMockIPCServer({
+        getLaneRouter: mock(() => laneRouter),
+        resolveToolResult: mock((req: ToolResultRequest) => {
+          resolvedResults.push(req)
+        }),
+      })
+
+      let promptResolve: ((value: { stopReason: string }) => void) | null = null
+      let promptCallCount = 0
+      const promptCalls: PromptOptions[] = []
+
+      const client = createMockClient({
+        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
+        setPromptCallback: mock(() => {}),
+        prompt: mock(async (opts: PromptOptions) => {
+          promptCallCount++
+          promptCalls.push(opts)
+          if (promptCallCount === 1) {
+            // First call: initial prompt — emit text, route tool call
+            opts.onUpdate({
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "Taking screenshot..." },
+            })
+            laneRouter.route({
+              callId: "tc-img-data",
+              toolName: "screenshot",
+              args: {},
+            })
+            return new Promise<{ stopReason: string }>((resolve) => {
+              promptResolve = resolve
+            })
+          }
+          // Second call: FUP with images — respond immediately
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "I can see the screenshot." },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result1 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "take screenshot" }] }]),
+      )
+      await collectStream(result1.stream)
+
+      // Resolve the first prompt (text-only tool result response) before doStream resumes
+      setTimeout(() => promptResolve?.({ stopReason: "end_turn" }), 50)
+
+      const result2 = await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "take screenshot" }] },
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", toolCallId: "tc-img-data", toolName: "screenshot", input: "{}" },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "tc-img-data",
+                toolName: "screenshot",
+                output: {
+                  type: "content" as const,
+                  value: [
+                    { type: "image-data" as const, data: "iVBORw0KGgo=", mediaType: "image/png" },
+                  ],
+                },
+              },
+            ],
+          },
+        ]),
+      )
+      await collectStream(result2.stream)
+
+      // FUP path: tool result sent WITHOUT content (text-only)
+      expect(resolvedResults).toHaveLength(1)
+      expect((resolvedResults[0] as Record<string, unknown>).content).toBeUndefined()
+
+      // Follow-up prompt sent with image ContentBlocks
+      expect(promptCallCount).toBe(2)
+      const fupPrompt = promptCalls[1].prompt
+      expect(fupPrompt).toHaveLength(2)
+      expect(fupPrompt[0].type).toBe("text")
+      expect(fupPrompt[1]).toEqual({
+        type: "image",
+        data: "iVBORw0KGgo=",
+        mimeType: "image/png",
+      })
+    })
+
+    test("doStream sends image content for content output with image-url via FUP", async () => {
+      const laneRouter = new LaneRouter()
+      const resolvedResults: ToolResultRequest[] = []
+      const mockIPC = createMockIPCServer({
+        getLaneRouter: mock(() => laneRouter),
+        resolveToolResult: mock((req: ToolResultRequest) => {
+          resolvedResults.push(req)
+        }),
+      })
+
+      let promptResolve: ((value: { stopReason: string }) => void) | null = null
+      let promptCallCount = 0
+      const promptCalls: PromptOptions[] = []
+
+      const client = createMockClient({
+        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
+        setPromptCallback: mock(() => {}),
+        prompt: mock(async (opts: PromptOptions) => {
+          promptCallCount++
+          promptCalls.push(opts)
+          if (promptCallCount === 1) {
+            opts.onUpdate({
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "Fetching..." },
+            })
+            laneRouter.route({
+              callId: "tc-img-url",
+              toolName: "fetch_image",
+              args: {},
+            })
+            return new Promise<{ stopReason: string }>((resolve) => {
+              promptResolve = resolve
+            })
+          }
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "I can see the image." },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result1 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "fetch image" }] }]),
+      )
+      await collectStream(result1.stream)
+
+      setTimeout(() => promptResolve?.({ stopReason: "end_turn" }), 50)
+
+      const result2 = await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "fetch image" }] },
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", toolCallId: "tc-img-url", toolName: "fetch_image", input: "{}" },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "tc-img-url",
+                toolName: "fetch_image",
+                output: {
+                  type: "content" as const,
+                  value: [
+                    { type: "image-url" as const, url: "https://example.com/photo.jpg", mediaType: "image/jpeg" },
+                  ],
+                },
+              },
+            ],
+          },
+        ]),
+      )
+      await collectStream(result2.stream)
+
+      // FUP path: tool result sent WITHOUT content
+      expect(resolvedResults).toHaveLength(1)
+      expect((resolvedResults[0] as Record<string, unknown>).content).toBeUndefined()
+
+      // Follow-up prompt sent with image ContentBlocks
+      expect(promptCallCount).toBe(2)
+      const fupPrompt = promptCalls[1].prompt
+      expect(fupPrompt).toHaveLength(2)
+      expect(fupPrompt[0].type).toBe("text")
+      expect(fupPrompt[1]).toEqual({
+        type: "image",
+        data: "https://example.com/photo.jpg",
+        mimeType: "image/jpeg",
+      })
+    })
+
+    test("doStream sends image content for file-data with image MIME via FUP", async () => {
+      const laneRouter = new LaneRouter()
+      const resolvedResults: ToolResultRequest[] = []
+      const mockIPC = createMockIPCServer({
+        getLaneRouter: mock(() => laneRouter),
+        resolveToolResult: mock((req: ToolResultRequest) => {
+          resolvedResults.push(req)
+        }),
+      })
+
+      let promptResolve: ((value: { stopReason: string }) => void) | null = null
+      let promptCallCount = 0
+      const promptCalls: PromptOptions[] = []
+
+      const client = createMockClient({
+        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
+        setPromptCallback: mock(() => {}),
+        prompt: mock(async (opts: PromptOptions) => {
+          promptCallCount++
+          promptCalls.push(opts)
+          if (promptCallCount === 1) {
+            opts.onUpdate({
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "Processing..." },
+            })
+            laneRouter.route({
+              callId: "tc-file-data",
+              toolName: "convert",
+              args: {},
+            })
+            return new Promise<{ stopReason: string }>((resolve) => {
+              promptResolve = resolve
+            })
+          }
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "I can see the converted image." },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result1 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "convert" }] }]),
+      )
+      await collectStream(result1.stream)
+
+      setTimeout(() => promptResolve?.({ stopReason: "end_turn" }), 50)
+
+      const result2 = await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "convert" }] },
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", toolCallId: "tc-file-data", toolName: "convert", input: "{}" },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "tc-file-data",
+                toolName: "convert",
+                output: {
+                  type: "content" as const,
+                  value: [
+                    { type: "file-data" as const, data: "webpBase64Data", mediaType: "image/webp" },
+                  ],
+                },
+              },
+            ],
+          },
+        ]),
+      )
+      await collectStream(result2.stream)
+
+      // FUP path: tool result sent WITHOUT content
+      expect(resolvedResults).toHaveLength(1)
+      expect((resolvedResults[0] as Record<string, unknown>).content).toBeUndefined()
+
+      // Follow-up prompt sent with image ContentBlocks
+      expect(promptCallCount).toBe(2)
+      const fupPrompt = promptCalls[1].prompt
+      expect(fupPrompt).toHaveLength(2)
+      expect(fupPrompt[0].type).toBe("text")
+      expect(fupPrompt[1]).toEqual({
+        type: "image",
+        data: "webpBase64Data",
+        mimeType: "image/webp",
+      })
+    })
+
+    test("doStream provides text fallback in result field and sends images via FUP", async () => {
+      const laneRouter = new LaneRouter()
+      const resolvedResults: ToolResultRequest[] = []
+      const mockIPC = createMockIPCServer({
+        getLaneRouter: mock(() => laneRouter),
+        resolveToolResult: mock((req: ToolResultRequest) => {
+          resolvedResults.push(req)
+        }),
+      })
+
+      let promptResolve: ((value: { stopReason: string }) => void) | null = null
+      let promptCallCount = 0
+      const promptCalls: PromptOptions[] = []
+
+      const client = createMockClient({
+        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
+        setPromptCallback: mock(() => {}),
+        prompt: mock(async (opts: PromptOptions) => {
+          promptCallCount++
+          promptCalls.push(opts)
+          if (promptCallCount === 1) {
+            opts.onUpdate({
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "Rendering..." },
+            })
+            laneRouter.route({
+              callId: "tc-mixed-fallback",
+              toolName: "render",
+              args: {},
+            })
+            return new Promise<{ stopReason: string }>((resolve) => {
+              promptResolve = resolve
+            })
+          }
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "I can see the rendered output." },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result1 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "render" }] }]),
+      )
+      await collectStream(result1.stream)
+
+      setTimeout(() => promptResolve?.({ stopReason: "end_turn" }), 50)
+
+      const result2 = await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "render" }] },
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", toolCallId: "tc-mixed-fallback", toolName: "render", input: "{}" },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "tc-mixed-fallback",
+                toolName: "render",
+                output: {
+                  type: "content" as const,
+                  value: [
+                    { type: "text" as const, text: "Rendered successfully" },
+                    { type: "image-data" as const, data: "pngBase64", mediaType: "image/png" },
+                  ],
+                },
+              },
+            ],
+          },
+        ]),
+      )
+      await collectStream(result2.stream)
+
+      // FUP path: tool result sent with text fallback but WITHOUT content
+      expect(resolvedResults).toHaveLength(1)
+      expect(resolvedResults[0].result).toBe("Rendered successfully")
+      expect((resolvedResults[0] as Record<string, unknown>).content).toBeUndefined()
+
+      // Follow-up prompt sent with image ContentBlocks (only images, not text)
+      expect(promptCallCount).toBe(2)
+      const fupPrompt = promptCalls[1].prompt
+      expect(fupPrompt).toHaveLength(2)
+      expect(fupPrompt[0].type).toBe("text")
+      expect(fupPrompt[1]).toEqual({ type: "image", data: "pngBase64", mimeType: "image/png" })
+    })
+
+    test("doStream omits content field when no images in content output", async () => {
+      const laneRouter = new LaneRouter()
+      const resolvedResults: ToolResultRequest[] = []
+      const mockIPC = createMockIPCServer({
+        getLaneRouter: mock(() => laneRouter),
+        resolveToolResult: mock((req: ToolResultRequest) => {
+          resolvedResults.push(req)
+        }),
+      })
+
+      let promptResolve: ((value: { stopReason: string }) => void) | null = null
+
+      const client = createMockClient({
+        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
+        setPromptCallback: mock(() => {}),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "Running..." },
+          })
+          laneRouter.route({
+            callId: "tc-text-content",
+            toolName: "bash",
+            args: {},
+          })
+          return new Promise<{ stopReason: string }>((resolve) => {
+            promptResolve = resolve
+          })
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result1 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "run" }] }]),
+      )
+      await collectStream(result1.stream)
+
+      setTimeout(() => promptResolve?.({ stopReason: "end_turn" }), 50)
+
+      const result2 = await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "run" }] },
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", toolCallId: "tc-text-content", toolName: "bash", input: "{}" },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "tc-text-content",
+                toolName: "bash",
+                output: {
+                  type: "content" as const,
+                  value: [
+                    { type: "text" as const, text: "just text output" },
+                  ],
+                },
+              },
+            ],
+          },
+        ]),
+      )
+      await collectStream(result2.stream)
+
+      expect(resolvedResults).toHaveLength(1)
+      expect(resolvedResults[0].result).toBe("just text output")
+      // No content field when there are no images
+      expect((resolvedResults[0] as Record<string, unknown>).content).toBeUndefined()
+    })
+
+    test("doStream normalizes image/* wildcard in tool result via FUP", async () => {
+      const laneRouter = new LaneRouter()
+      const resolvedResults: ToolResultRequest[] = []
+      const mockIPC = createMockIPCServer({
+        getLaneRouter: mock(() => laneRouter),
+        resolveToolResult: mock((req: ToolResultRequest) => {
+          resolvedResults.push(req)
+        }),
+      })
+
+      let promptResolve: ((value: { stopReason: string }) => void) | null = null
+      let promptCallCount = 0
+      const promptCalls: PromptOptions[] = []
+
+      const client = createMockClient({
+        getIPCServer: mock(() => mockIPC),
+        getLaneRouter: mock(() => laneRouter),
+        setPromptCallback: mock(() => {}),
+        prompt: mock(async (opts: PromptOptions) => {
+          promptCallCount++
+          promptCalls.push(opts)
+          if (promptCallCount === 1) {
+            opts.onUpdate({
+              sessionUpdate: "agent_message_chunk",
+              content: { text: "Processing..." },
+            })
+            laneRouter.route({
+              callId: "tc-wildcard",
+              toolName: "capture",
+              args: {},
+            })
+            return new Promise<{ stopReason: string }>((resolve) => {
+              promptResolve = resolve
+            })
+          }
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "I can see the captured image." },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result1 = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "capture" }] }]),
+      )
+      await collectStream(result1.stream)
+
+      setTimeout(() => promptResolve?.({ stopReason: "end_turn" }), 50)
+
+      const result2 = await model.doStream(
+        makeCallOptions([
+          { role: "user", content: [{ type: "text", text: "capture" }] },
+          {
+            role: "assistant",
+            content: [
+              { type: "tool-call", toolCallId: "tc-wildcard", toolName: "capture", input: "{}" },
+            ],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "tc-wildcard",
+                toolName: "capture",
+                output: {
+                  type: "content" as const,
+                  value: [
+                    { type: "image-data" as const, data: "wildcardBase64", mediaType: "image/*" },
+                  ],
+                },
+              },
+            ],
+          },
+        ]),
+      )
+      await collectStream(result2.stream)
+
+      // FUP path: tool result sent WITHOUT content
+      expect(resolvedResults).toHaveLength(1)
+      expect((resolvedResults[0] as Record<string, unknown>).content).toBeUndefined()
+
+      // Follow-up prompt sent with normalized mimeType
+      expect(promptCallCount).toBe(2)
+      const fupPrompt = promptCalls[1].prompt
+      expect(fupPrompt).toHaveLength(2)
+      expect(fupPrompt[1].mimeType).toBe("image/jpeg")
     })
   })
 
