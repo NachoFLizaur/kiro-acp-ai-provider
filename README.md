@@ -126,6 +126,26 @@ Use `listModels()` for the current list.
 
 Tools work through the standard AI SDK contract. The provider includes an MCP bridge that reads tool definitions from a JSON file and relays calls to your application via IPC. Pass custom tools through the AI SDK as usual — the provider handles the MCP bridge plumbing.
 
+## Image Support
+
+The provider supports images in two paths:
+
+### User-attached images
+
+Images pasted in chat are sent as `ContentBlock[]` with the prompt via ACP's `session/prompt`. This is the native path — kiro-cli handles image optimization and the model sees them directly.
+
+### Tool-returned images
+
+When a tool (e.g., a file read tool) returns an image, the provider uses a follow-up prompt approach:
+
+1. The tool result is sent via IPC as text-only (so the MCP bridge flow completes)
+2. The first model response is aborted
+3. A follow-up `session/prompt` is sent with the images as `ContentBlock[]`, including the original user request for context
+
+This is necessary because kiro-cli's MCP tool result path doesn't reliably handle large images — sending them through the user-message path (`session/prompt`) ensures proper image processing.
+
+> **Note**: The follow-up approach adds a small latency overhead (~1-2s) for tool results that contain images. Text-only tool results are unaffected.
+
 ## Known Limitations
 
 - **System prompt**: Kiro's base context is always present; yours is injected via `<system_instructions>` tags
@@ -135,6 +155,7 @@ Tools work through the standard AI SDK contract. The provider includes an MCP br
 - **Revert-to-message**: Requires the consumer to signal session reset via `x-session-reset` header as Kiro ACP doesn't support Checkpointing.
 - **No ACP session/fork**: Kiro ACP doesn't support native fork/truncate, so reverts replay the conversation history as context text
 - **No Thinking support**: Kiro ACP doesn't support it.
+- **Tool-returned images**: Uses a follow-up prompt approach which adds ~1-2s latency and an extra synthetic message in kiro-cli's session history
 
 ## License
 
