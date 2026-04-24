@@ -114,7 +114,8 @@ function parseToolCallNotification(update: Record<string, unknown>): {
   toolName: string | undefined
   args: Record<string, unknown>
 } {
-  const toolCallId = update.toolCallId as string | undefined
+  const toolCallId = (update.toolCallId as string | undefined)
+    ?? (update.callId as string | undefined)
   const rawInput = update.rawInput as Record<string, unknown> | undefined
 
   let toolName: string | undefined
@@ -124,6 +125,14 @@ function parseToolCallNotification(update: Record<string, unknown>): {
     if (match) {
       toolName = match[1]
     }
+  }
+
+  if (!toolName && typeof update.toolName === "string") {
+    toolName = update.toolName
+  }
+  if (!toolName && typeof update.name === "string") {
+    const match = update.name.match(/\/([^/]+)$/)
+    toolName = match ? match[1] : update.name
   }
 
   const args: Record<string, unknown> = {}
@@ -465,6 +474,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       this.ensureIpcPortInToolsFile(toolsFilePath)
     }
 
+    if (toolsFilePath && tools && tools.length > 0) {
+      this.ensureToolsFileReady(toolsFilePath, tools)
+    }
+
     // Try loading an existing session (affinity-based)
     if (this.currentAffinityId) {
       if (this.config.sessionId) {
@@ -669,6 +682,63 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       renameSync(tmpPath, toolsFilePath)
     } catch {
       // File doesn't exist or is invalid — will be written on next writeToolsToFile()
+    }
+  }
+
+  /**
+   * Ensure tools file has executable tool definitions and IPC wiring.
+   *
+   * If file contents are stale/incomplete, attempts one in-place repair by
+   * rewriting tools + IPC fields, then validates again.
+   */
+  private ensureToolsFileReady(
+    toolsFilePath: string,
+    tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
+  ): void {
+    const validate = (): { ok: boolean; reason?: string } => {
+      try {
+        const raw = readFileSync(toolsFilePath, "utf-8")
+        const parsed = JSON.parse(raw) as MCPToolsFile
+
+        const expectedNames = tools
+          .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
+          .map((tool) => tool.name)
+
+        const actualNames = new Set((parsed.tools ?? []).map((tool) => tool.name))
+        const missing = expectedNames.filter((name) => !actualNames.has(name))
+
+        if (missing.length > 0) {
+          return { ok: false, reason: `missing tools: ${missing.join(", ")}` }
+        }
+
+        const ipcPort = this.client.getIpcPort()
+        if (ipcPort != null && parsed.ipcPort !== ipcPort) {
+          return { ok: false, reason: "ipcPort not injected" }
+        }
+
+        const ipcSecret = this.client.getIpcSecret()
+        if (ipcSecret && parsed.ipcSecret !== ipcSecret) {
+          return { ok: false, reason: "ipcSecret not injected" }
+        }
+
+        return { ok: true }
+      } catch {
+        return { ok: false, reason: "tools file unreadable" }
+      }
+    }
+
+    const first = validate()
+    if (first.ok) return
+
+    this.writeToolsToFile(toolsFilePath, tools)
+    this.ensureIpcPortInToolsFile(toolsFilePath)
+
+    const second = validate()
+    if (!second.ok) {
+      throw new KiroACPError(
+        `Tools file is not ready for MCP bridge (${second.reason ?? "unknown reason"})`,
+        -1,
+      )
     }
   }
 

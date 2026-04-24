@@ -402,6 +402,13 @@ declare class KiroACPLanguageModel implements LanguageModelV3 {
      * Needed when tools are written before ensureClient() starts the IPC server.
      */
     private ensureIpcPortInToolsFile;
+    /**
+     * Ensure tools file has executable tool definitions and IPC wiring.
+     *
+     * If file contents are stale/incomplete, attempts one in-place repair by
+     * rewriting tools + IPC fields, then validates again.
+     */
+    private ensureToolsFileReady;
     private cleanupSessionToolsFile;
     /**
      * Extract tool results from `role: "tool"` messages in the prompt.

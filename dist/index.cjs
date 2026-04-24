@@ -1488,7 +1488,7 @@ function loadPersistedSession(cwd, affinityId) {
 
 // src/kiro-acp-model.ts
 function parseToolCallNotification(update) {
-  const toolCallId = update.toolCallId;
+  const toolCallId = update.toolCallId ?? update.callId;
   const rawInput = update.rawInput;
   let toolName;
   const title = update.title;
@@ -1497,6 +1497,13 @@ function parseToolCallNotification(update) {
     if (match) {
       toolName = match[1];
     }
+  }
+  if (!toolName && typeof update.toolName === "string") {
+    toolName = update.toolName;
+  }
+  if (!toolName && typeof update.name === "string") {
+    const match = update.name.match(/\/([^/]+)$/);
+    toolName = match ? match[1] : update.name;
   }
   const args = {};
   if (rawInput) {
@@ -1716,6 +1723,9 @@ var KiroACPLanguageModel = class _KiroACPLanguageModel {
     if (toolsFilePath && this.client.getIpcPort() != null) {
       this.ensureIpcPortInToolsFile(toolsFilePath);
     }
+    if (toolsFilePath && tools && tools.length > 0) {
+      this.ensureToolsFileReady(toolsFilePath, tools);
+    }
     if (this.currentAffinityId) {
       if (this.config.sessionId) {
         try {
@@ -1888,6 +1898,48 @@ Please acknowledge this context and continue from where we left off.
       (0, import_node_fs5.writeFileSync)(tmpPath, JSON.stringify(parsed, null, 2), { mode: 384 });
       (0, import_node_fs5.renameSync)(tmpPath, toolsFilePath);
     } catch {
+    }
+  }
+  /**
+   * Ensure tools file has executable tool definitions and IPC wiring.
+   *
+   * If file contents are stale/incomplete, attempts one in-place repair by
+   * rewriting tools + IPC fields, then validates again.
+   */
+  ensureToolsFileReady(toolsFilePath, tools) {
+    const validate = () => {
+      try {
+        const raw = (0, import_node_fs5.readFileSync)(toolsFilePath, "utf-8");
+        const parsed = JSON.parse(raw);
+        const expectedNames = tools.filter((tool) => tool.type === "function").map((tool) => tool.name);
+        const actualNames = new Set((parsed.tools ?? []).map((tool) => tool.name));
+        const missing = expectedNames.filter((name) => !actualNames.has(name));
+        if (missing.length > 0) {
+          return { ok: false, reason: `missing tools: ${missing.join(", ")}` };
+        }
+        const ipcPort = this.client.getIpcPort();
+        if (ipcPort != null && parsed.ipcPort !== ipcPort) {
+          return { ok: false, reason: "ipcPort not injected" };
+        }
+        const ipcSecret = this.client.getIpcSecret();
+        if (ipcSecret && parsed.ipcSecret !== ipcSecret) {
+          return { ok: false, reason: "ipcSecret not injected" };
+        }
+        return { ok: true };
+      } catch {
+        return { ok: false, reason: "tools file unreadable" };
+      }
+    };
+    const first = validate();
+    if (first.ok) return;
+    this.writeToolsToFile(toolsFilePath, tools);
+    this.ensureIpcPortInToolsFile(toolsFilePath);
+    const second = validate();
+    if (!second.ok) {
+      throw new KiroACPError(
+        `Tools file is not ready for MCP bridge (${second.reason ?? "unknown reason"})`,
+        -1
+      );
     }
   }
   cleanupSessionToolsFile(sessionId) {
