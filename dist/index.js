@@ -1934,6 +1934,14 @@ Please acknowledge this context and continue from where we left off.
     this.setAffinityId(affinityId);
     const isChild = typeof options.headers?.["x-parent-session-id"] === "string";
     const hasTools = (options.tools ?? []).length > 0;
+    if (!hasTools && !this.client.isRunning()) {
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+      void writer.write({ type: "stream-start", warnings: [] });
+      void writer.write({ type: "finish", finishReason: { unified: "stop", raw: "deferred" }, usage: emptyUsage() });
+      void writer.close();
+      return { stream: readable, request: { body: "" }, response: { headers: {} } };
+    }
     if (isChild && hasTools && affinityId) {
       return this.doStreamIsolated(options, affinityId);
     }

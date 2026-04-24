@@ -884,6 +884,18 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const isChild = typeof options.headers?.["x-parent-session-id"] === "string"
     const hasTools = (options.tools ?? []).length > 0
 
+    // Defer kiro-cli startup until a call with tools arrives.
+    // Starting without tools creates an MCP bridge with an empty tool set
+    // that cannot be updated later (kiro-cli doesn't re-read agent config).
+    if (!hasTools && !this.client.isRunning()) {
+      const { readable, writable } = new TransformStream<LanguageModelV3StreamPart>()
+      const writer = writable.getWriter()
+      void writer.write({ type: "stream-start", warnings: [] })
+      void writer.write({ type: "finish", finishReason: { unified: "stop", raw: "deferred" }, usage: emptyUsage() })
+      void writer.close()
+      return { stream: readable, request: { body: "" }, response: { headers: {} } }
+    }
+
     // Subagent with tools → use isolated client (separate kiro-cli process)
     // to prevent tool leakage from the parent session.
     if (isChild && hasTools && affinityId) {
