@@ -334,6 +334,19 @@ var MCPBridgeServer = class {
         this.ipcSecret
       );
       if (response.status === "success") {
+        if (response.content && response.content.length > 0) {
+          const mcpContent = response.content.map((block) => {
+            if (block.type === "image" && block.data && block.mimeType) {
+              return { type: "image", data: block.data, mimeType: block.mimeType };
+            }
+            return { type: "text", text: block.text ?? "" };
+          });
+          return {
+            jsonrpc: "2.0",
+            id: requestId,
+            result: { content: mcpContent }
+          };
+        }
         return {
           jsonrpc: "2.0",
           id: requestId,

@@ -390,14 +390,15 @@ var IPCServerImpl = class {
     return this.laneRouter;
   }
   resolveToolResult(request) {
-    const { callId, result, isError } = request;
+    const { callId, result, isError, content } = request;
     const pending = this.pendingCalls.get(callId);
     if (!pending) return;
     clearTimeout(pending.timer);
     this.pendingCalls.delete(callId);
     pending.resolve({
       status: isError ? "error" : "success",
-      ...isError ? { error: result } : { result }
+      ...isError ? { error: result } : { result },
+      ...content ? { content } : {}
     });
   }
   // -------------------------------------------------------------------------
@@ -520,7 +521,8 @@ var IPCServerImpl = class {
     this.pendingCalls.delete(body.callId);
     pending.resolve({
       status: body.isError ? "error" : "success",
-      ...body.isError ? { error: body.result } : { result: body.result }
+      ...body.isError ? { error: body.result } : { result: body.result },
+      ...body.content ? { content: body.content } : {}
     });
     respond(res, 200, { status: "ok" });
   }
@@ -637,6 +639,8 @@ var ACPClient = class _ACPClient {
   ipcPort = null;
   availableTools = [];
   toolsReadyListeners = /* @__PURE__ */ new Set();
+  _startedToolless = false;
+  _startPromise = null;
   /**
    * Per-instance unique ID for tools file isolation. Without this, concurrent
    * clients sharing the same cwd would clobber each other's tool definitions.
@@ -663,7 +667,16 @@ var ACPClient = class _ACPClient {
    *   MCP bridge sees the full tool set on its first query.
    */
   async start(toolsFilePath) {
+    if (this._startPromise) return this._startPromise;
     if (this.running) throw new KiroACPConnectionError("Client is already running");
+    this._startPromise = this._doStart(toolsFilePath);
+    try {
+      return await this._startPromise;
+    } finally {
+      this._startPromise = null;
+    }
+  }
+  async _doStart(toolsFilePath) {
     this.stderrBuffer = "";
     const authStatus = verifyAuth();
     if (!authStatus.installed) {
@@ -766,6 +779,8 @@ var ACPClient = class _ACPClient {
   async stop() {
     if (!this.running || !this.process) return;
     this.running = false;
+    this._startedToolless = false;
+    this._startPromise = null;
     this.process.stdin?.end();
     const proc = this.process;
     await new Promise((resolve) => {
@@ -912,6 +927,9 @@ var ACPClient = class _ACPClient {
   // -------------------------------------------------------------------------
   isRunning() {
     return this.running;
+  }
+  isStartedToolless() {
+    return this._startedToolless;
   }
   getStderr() {
     return this.stderrBuffer;
@@ -1101,6 +1119,7 @@ var ACPClient = class _ACPClient {
       const tmpPath = makeTmpPath(toolsFile);
       (0, import_node_fs3.writeFileSync)(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 384 });
       (0, import_node_fs3.renameSync)(tmpPath, toolsFile);
+      this._startedToolless = true;
     }
     const config = generateAgentConfig({
       name: this.options.agent,
@@ -1287,6 +1306,13 @@ var ACPClient = class _ACPClient {
             this.sendNotification("session/cancel", { sessionId: sid });
           }
         }
+        if (method === "initialize" || method === "session/new") {
+          const auth = verifyAuth();
+          if (!auth.authenticated) {
+            reject(new KiroACPError("Not logged in. Run 'kiro-cli login' to authenticate.", -1));
+            return;
+          }
+        }
         reject(this.createTimeoutError(method, timeoutMs));
       }, timeoutMs) : null;
       this.pending.set(id, { resolve, reject, method, timer });
@@ -1351,7 +1377,8 @@ ${stderr}` : "";
     clearTimeout(pending.timer ?? void 0);
     this.pending.delete(msg.id);
     if (msg.error) {
-      pending.reject(new KiroACPError(msg.error.message, msg.error.code, msg.error.data));
+      const errorMessage = msg.error.message || `JSON-RPC error (code: ${msg.error.code ?? "unknown"})`;
+      pending.reject(new KiroACPError(errorMessage, msg.error.code, msg.error.data));
     } else {
       pending.resolve(msg.result);
     }
@@ -1487,6 +1514,34 @@ function loadPersistedSession(cwd, affinityId) {
 }
 
 // src/kiro-acp-model.ts
+function toBase64Data(data) {
+  if (data instanceof Uint8Array) {
+    return Buffer.from(data).toString("base64");
+  }
+  if (data instanceof URL) {
+    if (data.protocol === "data:") {
+      const href = data.href;
+      const base64Marker = ";base64,";
+      const markerIndex = href.indexOf(base64Marker);
+      if (markerIndex !== -1) {
+        return href.slice(markerIndex + base64Marker.length);
+      }
+      const commaIndex = href.indexOf(",");
+      if (commaIndex !== -1) {
+        return href.slice(commaIndex + 1);
+      }
+    }
+    return data.href;
+  }
+  return data;
+}
+function normalizeMediaType(mediaType) {
+  if (mediaType === "image/*") return "image/jpeg";
+  return mediaType;
+}
+function isImageMediaType(mediaType) {
+  return mediaType.startsWith("image/") || mediaType === "image/*";
+}
 function parseToolCallNotification(update) {
   const toolCallId = update.toolCallId ?? update.callId;
   const rawInput = update.rawInput;
@@ -1564,26 +1619,40 @@ function mapStopReason(stopReason) {
       return { unified: "other", raw: stopReason };
   }
 }
+function extractErrorMessage(err) {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
 function extractPrompt(prompt) {
   const systemParts = [];
-  let lastUserMessage = "";
+  let lastUserParts = [];
   for (const message of prompt) {
     if (message.role === "system") {
       systemParts.push(message.content);
-    } else if (message.role === "user") {
+      continue;
+    }
+    if (message.role === "user") {
       const parts = [];
       for (const part of message.content) {
         if (part.type === "text") {
-          parts.push(part.text);
+          parts.push({ type: "text", text: part.text });
+          continue;
+        }
+        if (part.type === "file" && isImageMediaType(part.mediaType)) {
+          parts.push({
+            type: "image",
+            data: toBase64Data(part.data),
+            mimeType: normalizeMediaType(part.mediaType)
+          });
         }
       }
-      lastUserMessage = parts.join("\n");
+      lastUserParts = parts;
     }
   }
   const systemPrompt = systemParts.length > 0 ? systemParts.join("\n\n") : void 0;
   return {
     systemPrompt,
-    userMessage: lastUserMessage
+    userParts: lastUserParts
   };
 }
 function formatConversationReplay(prompt) {
@@ -1603,6 +1672,12 @@ function formatConversationReplay(prompt) {
       for (const part of message.content) {
         if (part.type === "text") {
           parts.push(part.text);
+          continue;
+        }
+        if (part.type === "file" && isImageMediaType(part.mediaType)) {
+          parts.push(`[Image: ${normalizeMediaType(part.mediaType)}]`);
+        } else if (part.type === "file") {
+          parts.push(`[File: ${part.mediaType}]`);
         }
       }
       lastUserMessage = parts.join("\n");
@@ -1650,7 +1725,6 @@ var KiroACPLanguageModel = class _KiroACPLanguageModel {
   client;
   config;
   currentModelId = null;
-  initPromise = null;
   totalCredits = 0;
   currentAffinityId;
   /**
@@ -1690,19 +1764,7 @@ var KiroACPLanguageModel = class _KiroACPLanguageModel {
    */
   async ensureClient(toolsFilePath) {
     if (this.client.isRunning()) return;
-    if (this.initPromise) {
-      await this.initPromise;
-      if (this.client.isRunning()) return;
-      this.initPromise = null;
-    }
-    this.initPromise = this.client.start(toolsFilePath).then(() => {
-    });
-    try {
-      await this.initPromise;
-    } catch (err) {
-      this.initPromise = null;
-      throw err;
-    }
+    await this.client.start(toolsFilePath);
   }
   /**
    * Create a new ACP session for this doStream() call.
@@ -1720,6 +1782,9 @@ var KiroACPLanguageModel = class _KiroACPLanguageModel {
       toolNames = this.writeToolsToFile(toolsFilePath, tools);
     }
     await this.ensureClient(toolsFilePath);
+    if (toolsFilePath && this.client.isStartedToolless()) {
+      this.syncToolsToBridgePath(toolsFilePath);
+    }
     if (toolsFilePath && this.client.getIpcPort() != null) {
       this.ensureIpcPortInToolsFile(toolsFilePath);
     }
@@ -1880,10 +1945,17 @@ Please acknowledge this context and continue from where we left off.
     (0, import_node_fs5.renameSync)(tmpPath, toolsFilePath);
     return toolNames;
   }
-  /**
-   * Inject IPC port into a tools file if missing.
-   * Needed when tools are written before ensureClient() starts the IPC server.
-   */
+  syncToolsToBridgePath(sessionToolsFilePath) {
+    const bridgePath = this.client.getOrCreateToolsFilePath();
+    if (bridgePath === sessionToolsFilePath) return;
+    try {
+      const content = (0, import_node_fs5.readFileSync)(sessionToolsFilePath, "utf-8");
+      const tmpPath = bridgePath + ".tmp";
+      (0, import_node_fs5.writeFileSync)(tmpPath, content, { mode: 384 });
+      (0, import_node_fs5.renameSync)(tmpPath, bridgePath);
+    } catch {
+    }
+  }
   ensureIpcPortInToolsFile(toolsFilePath) {
     const ipcPort = this.client.getIpcPort();
     if (ipcPort == null) return;
@@ -1957,18 +2029,76 @@ Please acknowledge this context and continue from where we left off.
   extractToolResults(prompt) {
     const results = [];
     for (const message of prompt) {
-      if (message.role === "tool") {
-        for (const part of message.content) {
-          if (part.type === "tool-result") {
-            const output = part.output;
-            const resultText = output.type === "text" ? output.value : JSON.stringify(output);
-            results.push({
-              toolCallId: part.toolCallId,
-              toolName: part.toolName,
-              result: resultText
-            });
-          }
+      if (message.role !== "tool") continue;
+      for (const part of message.content) {
+        if (part.type !== "tool-result") continue;
+        const output = part.output;
+        if (output.type === "text") {
+          results.push({
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            result: output.value
+          });
+          continue;
         }
+        if (output.type === "content") {
+          const contentBlocks = [];
+          const textParts = [];
+          for (const contentPart of output.value) {
+            if (contentPart.type === "text") {
+              contentBlocks.push({ type: "text", text: contentPart.text });
+              textParts.push(contentPart.text);
+              continue;
+            }
+            if (contentPart.type === "image-data") {
+              contentBlocks.push({
+                type: "image",
+                data: contentPart.data,
+                mimeType: normalizeMediaType(contentPart.mediaType)
+              });
+              continue;
+            }
+            if (contentPart.type === "image-url") {
+              contentBlocks.push({
+                type: "image",
+                data: contentPart.url,
+                mimeType: normalizeMediaType("image/jpeg")
+              });
+              continue;
+            }
+            if (contentPart.type === "file-data" && isImageMediaType(contentPart.mediaType)) {
+              contentBlocks.push({
+                type: "image",
+                data: contentPart.data,
+                mimeType: normalizeMediaType(contentPart.mediaType)
+              });
+              continue;
+            }
+            const anyPart = contentPart;
+            if (anyPart.type === "media" && isImageMediaType(anyPart.mediaType)) {
+              contentBlocks.push({
+                type: "image",
+                data: anyPart.data,
+                mimeType: normalizeMediaType(anyPart.mediaType)
+              });
+              continue;
+            }
+          }
+          const resultText = textParts.length > 0 ? textParts.join("\n") : JSON.stringify(output);
+          const hasImages = contentBlocks.some((b) => b.type === "image");
+          results.push({
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            result: resultText,
+            ...hasImages ? { content: contentBlocks } : {}
+          });
+          continue;
+        }
+        results.push({
+          toolCallId: part.toolCallId,
+          toolName: part.toolName,
+          result: JSON.stringify(output)
+        });
       }
     }
     return results;
@@ -1981,14 +2111,6 @@ Please acknowledge this context and continue from where we left off.
     this.setAffinityId(affinityId);
     const isChild = typeof options.headers?.["x-parent-session-id"] === "string";
     const hasTools = (options.tools ?? []).length > 0;
-    if (!hasTools && !this.client.isRunning()) {
-      const { readable, writable } = new TransformStream();
-      const writer = writable.getWriter();
-      void writer.write({ type: "stream-start", warnings: [] });
-      void writer.write({ type: "finish", finishReason: { unified: "stop", raw: "deferred" }, usage: emptyUsage() });
-      void writer.close();
-      return { stream: readable, request: { body: "" }, response: { headers: {} } };
-    }
     if (isChild && hasTools && affinityId) {
       return this.doStreamIsolated(options, affinityId);
     }
@@ -2270,7 +2392,7 @@ Please acknowledge this context and continue from where we left off.
         if (textStarted) {
           writePart({ type: "text-end", id: textId });
         }
-        writePart({ type: "error", error: err instanceof KiroACPError ? new Error(err.message) : new Error("An internal error occurred") });
+        writePart({ type: "error", error: new Error(extractErrorMessage(err)) });
         removeAbortListener();
         streamClosed = true;
         try {
@@ -2288,19 +2410,29 @@ Please acknowledge this context and continue from where we left off.
   async startFreshPrompt(options, reset = false) {
     const session = await this.acquireSession(options.tools);
     await this.ensureModel(session);
-    let compositeText;
+    let promptBlocks;
     const hasHistory = reset && options.prompt.some(
       (m) => m.role === "assistant" || m.role === "tool"
     );
     if (hasHistory) {
-      compositeText = formatConversationReplay(options.prompt);
+      const compositeText = formatConversationReplay(options.prompt);
+      promptBlocks = [{ type: "text", text: compositeText }];
     } else {
-      const { systemPrompt, userMessage } = extractPrompt(options.prompt);
-      compositeText = systemPrompt ? `<system_instructions>
+      const { systemPrompt, userParts } = extractPrompt(options.prompt);
+      const hasImages = userParts.some((p) => p.type === "image");
+      if (hasImages) {
+        promptBlocks = systemPrompt ? [{ type: "text", text: `<system_instructions>
+${systemPrompt}
+</system_instructions>` }, ...userParts] : [...userParts];
+      } else {
+        const userText = userParts.map((p) => p.text ?? "").join("\n");
+        const compositeText = systemPrompt ? `<system_instructions>
 ${systemPrompt}
 </system_instructions>
 
-${userMessage}` : userMessage;
+${userText}` : userText;
+        promptBlocks = [{ type: "text", text: compositeText }];
+      }
     }
     const sessionId = session.sessionId;
     const promptAbort = new AbortController();
@@ -2325,14 +2457,15 @@ ${userMessage}` : userMessage;
     laneRouter?.register(sessionId, onToolCall);
     const promptPromise = this.client.prompt({
       sessionId,
-      prompt: [{ type: "text", text: compositeText }],
+      prompt: promptBlocks,
       onUpdate,
       signal: promptAbort.signal
     });
     attachPromise(promptPromise);
+    const bodyText = promptBlocks.map((b) => b.type === "text" ? b.text : `[Image: ${b.mimeType}]`).join("\n");
     return {
       stream: readable,
-      request: { body: compositeText },
+      request: { body: bodyText },
       response: { headers: {} }
     };
   }
@@ -2344,40 +2477,114 @@ ${userMessage}` : userMessage;
     if (!turn) {
       throw new Error(`No pending turn for session ${sessionId}`);
     }
+    const hasImages = toolResults.some((r) => r.content?.some((b) => b.type === "image"));
+    if (!hasImages) {
+      const { readable: readable2, onUpdate: onUpdate2, onToolCall: onToolCall2, attachPromise: attachPromise2 } = this.createPromptStream({
+        sessionId,
+        promptAbort: turn.promptAbort,
+        initialOutputCharCount: turn.outputCharCount,
+        streamSegment: turn.streamSegment,
+        options,
+        savePendingTurn: (state) => {
+          turn.pendingToolCalls = state.pendingToolCalls;
+          turn.outputCharCount = state.outputCharCount;
+          turn.streamSegment = state.nextSegment;
+        }
+      });
+      const laneRouter2 = this.client.getLaneRouter();
+      laneRouter2?.updateHandler(sessionId, onToolCall2);
+      this.client.setPromptCallback(sessionId, onUpdate2);
+      for (const result of toolResults) {
+        this.sendToolResult(result.toolCallId, result.result, false, result.content);
+      }
+      attachPromise2(turn.promptPromise);
+      return {
+        stream: readable2,
+        request: { body: "[tool result resumption]" },
+        response: { headers: {} }
+      };
+    }
+    const imageBlocks = [];
+    for (const result of toolResults) {
+      if (result.content) {
+        for (const block of result.content) {
+          if (block.type === "image" && block.data && block.mimeType) {
+            imageBlocks.push({ type: "image", data: block.data, mimeType: block.mimeType });
+          }
+        }
+      }
+    }
+    for (const result of toolResults) {
+      const hasImageContent = result.content?.some((b) => b.type === "image");
+      this.sendToolResult(result.toolCallId, result.result, false, hasImageContent ? void 0 : result.content);
+    }
+    turn.promptAbort.abort();
+    try {
+      await turn.promptPromise;
+    } catch {
+    }
+    this.pendingTurns.delete(sessionId);
+    const promptAbort = new AbortController();
+    let followUpPromise;
     const { readable, onUpdate, onToolCall, attachPromise } = this.createPromptStream({
       sessionId,
-      promptAbort: turn.promptAbort,
-      initialOutputCharCount: turn.outputCharCount,
-      streamSegment: turn.streamSegment,
+      promptAbort,
+      initialOutputCharCount: 0,
+      streamSegment: 0,
       options,
       savePendingTurn: (state) => {
-        turn.pendingToolCalls = state.pendingToolCalls;
-        turn.outputCharCount = state.outputCharCount;
-        turn.streamSegment = state.nextSegment;
+        this.pendingTurns.set(sessionId, {
+          sessionId,
+          promptPromise: followUpPromise,
+          pendingToolCalls: state.pendingToolCalls,
+          outputCharCount: state.outputCharCount,
+          streamSegment: state.nextSegment,
+          promptAbort
+        });
       }
     });
     const laneRouter = this.client.getLaneRouter();
     laneRouter?.updateHandler(sessionId, onToolCall);
     this.client.setPromptCallback(sessionId, onUpdate);
-    for (const result of toolResults) {
-      this.sendToolResult(result.toolCallId, result.result, false);
+    let lastUserText = "";
+    for (const msg of options.prompt) {
+      if (msg.role === "user") {
+        for (const part of msg.content) {
+          if (part.type === "text") {
+            lastUserText = part.text;
+          }
+        }
+      }
     }
-    attachPromise(turn.promptPromise);
+    const imageToolNames = toolResults.filter((r) => r.content?.some((b) => b.type === "image")).map((r) => r.toolName);
+    const toolContext = imageToolNames.length === 1 ? `the ${imageToolNames[0]} tool` : `the following tools: ${imageToolNames.join(", ")}`;
+    const followUpBlocks = [
+      { type: "text", text: lastUserText ? `The user asked: "${lastUserText}"
+You called ${toolContext} which returned these images. Answer the user's original request based on the images:` : `You called ${toolContext} which returned these images. Describe and analyze them:` },
+      ...imageBlocks
+    ];
+    followUpPromise = this.client.prompt({
+      sessionId,
+      prompt: followUpBlocks,
+      onUpdate,
+      signal: promptAbort.signal
+    });
+    attachPromise(followUpPromise);
     return {
       stream: readable,
-      request: { body: "[tool result resumption]" },
+      request: { body: "[tool result resumption with FUP images]" },
       response: { headers: {} }
     };
   }
   // -------------------------------------------------------------------------
   // Tool result delivery via IPC
   // -------------------------------------------------------------------------
-  sendToolResult(callId, result, isError) {
+  sendToolResult(callId, result, isError, content) {
     const ipcServer = this.client.getIPCServer();
     if (!ipcServer) {
       throw new Error("IPC server not available for sending tool result");
     }
-    ipcServer.resolveToolResult({ callId, result, isError });
+    ipcServer.resolveToolResult({ callId, result, isError, ...content ? { content } : {} });
   }
   // -------------------------------------------------------------------------
   // LanguageModelV3 — doGenerate

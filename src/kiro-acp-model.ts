@@ -13,6 +13,7 @@ import type {
 } from "@ai-sdk/provider"
 import { readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
+import { KiroACPError } from "./acp-client"
 import type { ACPClient, ACPSession, SessionUpdate, ContentBlock } from "./acp-client"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
@@ -377,7 +378,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private readonly client: ACPClient
   private readonly config: KiroACPModelConfig
   private currentModelId: string | null = null
-  private initPromise: Promise<void> | null = null
   private totalCredits = 0
   private currentAffinityId: string | undefined
 
@@ -429,22 +429,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private async ensureClient(toolsFilePath?: string): Promise<void> {
     if (this.client.isRunning()) return
-
-    if (this.initPromise) {
-      await this.initPromise
-      if (this.client.isRunning()) return
-      // Client died after init succeeded — clear and reinitialize
-      this.initPromise = null
-    }
-
-    this.initPromise = this.client.start(toolsFilePath).then(() => {})
-
-    try {
-      await this.initPromise
-    } catch (err) {
-      this.initPromise = null
-      throw err
-    }
+    await this.client.start(toolsFilePath)
   }
 
   /**
@@ -469,7 +454,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     await this.ensureClient(toolsFilePath)
 
-    // Re-inject ipcPort now that the IPC server is running
+    // If kiro-cli was started toolless (empty MCP bridge), update the
+    // bridge's fixed tools file so it picks up the real tools on the
+    // next tools/list query — no restart needed.
+    if (toolsFilePath && this.client.isStartedToolless()) {
+      this.syncToolsToBridgePath(toolsFilePath)
+    }
     if (toolsFilePath && this.client.getIpcPort() != null) {
       this.ensureIpcPortInToolsFile(toolsFilePath)
     }
@@ -661,10 +651,18 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     return toolNames
   }
 
-  /**
-   * Inject IPC port into a tools file if missing.
-   * Needed when tools are written before ensureClient() starts the IPC server.
-   */
+  private syncToolsToBridgePath(sessionToolsFilePath: string): void {
+    const bridgePath = this.client.getOrCreateToolsFilePath()
+    if (bridgePath === sessionToolsFilePath) return
+    try {
+      const content = readFileSync(sessionToolsFilePath, "utf-8")
+      const tmpPath = bridgePath + ".tmp"
+      writeFileSync(tmpPath, content, { mode: 0o600 })
+      renameSync(tmpPath, bridgePath)
+    } catch {
+      // Best-effort — bridge will serve stale tools until next sync
+    }
+  }
   private ensureIpcPortInToolsFile(toolsFilePath: string): void {
     const ipcPort = this.client.getIpcPort()
     if (ipcPort == null) return
@@ -883,18 +881,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     const isChild = typeof options.headers?.["x-parent-session-id"] === "string"
     const hasTools = (options.tools ?? []).length > 0
-
-    // Defer kiro-cli startup until a call with tools arrives.
-    // Starting without tools creates an MCP bridge with an empty tool set
-    // that cannot be updated later (kiro-cli doesn't re-read agent config).
-    if (!hasTools && !this.client.isRunning()) {
-      const { readable, writable } = new TransformStream<LanguageModelV3StreamPart>()
-      const writer = writable.getWriter()
-      void writer.write({ type: "stream-start", warnings: [] })
-      void writer.write({ type: "finish", finishReason: { unified: "stop", raw: "deferred" }, usage: emptyUsage() })
-      void writer.close()
-      return { stream: readable, request: { body: "" }, response: { headers: {} } }
-    }
 
     // Subagent with tools → use isolated client (separate kiro-cli process)
     // to prevent tool leakage from the parent session.

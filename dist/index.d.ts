@@ -40,16 +40,27 @@ interface PendingToolCall {
     toolName: string;
     args: Record<string, unknown>;
 }
+/** Content block for IPC transport — text or image. */
+interface IPCContentBlock {
+    type: "text" | "image";
+    text?: string;
+    data?: string;
+    mimeType?: string;
+}
 interface ToolResultRequest {
     callId: string;
     result: string;
     isError?: boolean;
+    /** Structured content blocks (text + images). When present, takes precedence over `result`. */
+    content?: IPCContentBlock[];
 }
 interface ToolExecuteResponse {
     status: "success" | "error" | "ok";
     result?: string;
     error?: string;
     code?: string;
+    /** Structured content blocks (text + images). When present, MCP bridge should use these. */
+    content?: IPCContentBlock[];
 }
 interface IPCServerOptions {
     host?: string;
@@ -194,6 +205,8 @@ declare class ACPClient {
     private ipcPort;
     private availableTools;
     private toolsReadyListeners;
+    private _startedToolless;
+    private _startPromise;
     /**
      * Per-instance unique ID for tools file isolation. Without this, concurrent
      * clients sharing the same cwd would clobber each other's tool definitions.
@@ -215,6 +228,7 @@ declare class ACPClient {
      *   MCP bridge sees the full tool set on its first query.
      */
     start(toolsFilePath?: string): Promise<InitializeResult>;
+    private _doStart;
     stop(): Promise<void>;
     createSession(): Promise<ACPSession>;
     private sendNewSession;
@@ -228,6 +242,7 @@ declare class ACPClient {
     getMetadata(sessionId: string): SessionMetadata | undefined;
     getAllMetadata(): SessionMetadata[];
     isRunning(): boolean;
+    isStartedToolless(): boolean;
     getStderr(): string;
     getCwd(): string;
     getAgentName(): string | undefined;
@@ -332,7 +347,6 @@ declare class KiroACPLanguageModel implements LanguageModelV3 {
     private readonly client;
     private readonly config;
     private currentModelId;
-    private initPromise;
     private totalCredits;
     private currentAffinityId;
     /**
@@ -397,10 +411,7 @@ declare class KiroACPLanguageModel implements LanguageModelV3 {
      * @returns Sorted tool names string (for change detection).
      */
     private writeToolsToFile;
-    /**
-     * Inject IPC port into a tools file if missing.
-     * Needed when tools are written before ensureClient() starts the IPC server.
-     */
+    private syncToolsToBridgePath;
     private ensureIpcPortInToolsFile;
     /**
      * Ensure tools file has executable tool definitions and IPC wiring.
@@ -565,4 +576,4 @@ interface GetQuotaOptions {
  */
 declare function getQuota(options?: GetQuotaOptions): Promise<QuotaInfo>;
 
-export { ACPClient, type ACPClientOptions, type ACPSession, type AgentConfigOptions, type AuthStatus, type AvailableTool, type CommandResult, type ContentBlock, type GetQuotaOptions, type IPCServer, type IPCServerOptions, type InitializeResult, KiroACPConnectionError, KiroACPError, KiroACPLanguageModel, type KiroACPModelConfig, type KiroACPModelOverrides, type KiroACPProvider, type KiroACPProviderSettings, type ListModelsOptions, type MCPToolDefinition, type MCPToolInputSchema, type MCPToolsFile, type Mode, type Model, type PendingToolCall, type PermissionDecision, type PermissionRequest, type PromptOptions, type QuotaInfo, type SessionMetadata, type SessionUpdate, type ToolExecuteResponse, type ToolResultRequest, createIPCServer, createKiroAcp, generateAgentConfig, getQuota, listModels, verifyAuth, writeAgentConfig };
+export { ACPClient, type ACPClientOptions, type ACPSession, type AgentConfigOptions, type AuthStatus, type AvailableTool, type CommandResult, type ContentBlock, type GetQuotaOptions, type IPCContentBlock, type IPCServer, type IPCServerOptions, type InitializeResult, KiroACPConnectionError, KiroACPError, KiroACPLanguageModel, type KiroACPModelConfig, type KiroACPModelOverrides, type KiroACPProvider, type KiroACPProviderSettings, type ListModelsOptions, type MCPToolDefinition, type MCPToolInputSchema, type MCPToolsFile, type Mode, type Model, type PendingToolCall, type PermissionDecision, type PermissionRequest, type PromptOptions, type QuotaInfo, type SessionMetadata, type SessionUpdate, type ToolExecuteResponse, type ToolResultRequest, createIPCServer, createKiroAcp, generateAgentConfig, getQuota, listModels, verifyAuth, writeAgentConfig };

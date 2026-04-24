@@ -5,11 +5,10 @@ import { fileURLToPath } from "node:url"
 import { dirname, join, isAbsolute } from "node:path"
 import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig } from "./agent-config"
+import { generateAgentConfig, writeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import { verifyAuth } from "./kiro-auth"
 import type { LaneRouter } from "./lane-router"
-import { verifyAuth } from "./kiro-auth"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -201,6 +200,8 @@ export class ACPClient {
   private ipcPort: number | null = null
   private availableTools: AvailableTool[] = []
   private toolsReadyListeners = new Set<(tools: AvailableTool[]) => void>()
+  private _startedToolless = false
+  private _startPromise: Promise<InitializeResult> | null = null
 
   /**
    * Per-instance unique ID for tools file isolation. Without this, concurrent
@@ -233,7 +234,21 @@ export class ACPClient {
    *   MCP bridge sees the full tool set on its first query.
    */
   async start(toolsFilePath?: string): Promise<InitializeResult> {
+    // If already starting, wait for the in-flight start to complete.
+    // Multiple KiroACPLanguageModel instances share one ACPClient and may
+    // call start() concurrently (e.g. main prompt + title generation).
+    if (this._startPromise) return this._startPromise
     if (this.running) throw new KiroACPConnectionError("Client is already running")
+
+    this._startPromise = this._doStart(toolsFilePath)
+    try {
+      return await this._startPromise
+    } finally {
+      this._startPromise = null
+    }
+  }
+
+  private async _doStart(toolsFilePath?: string): Promise<InitializeResult> {
     this.stderrBuffer = ""
 
     const authStatus = verifyAuth()
@@ -367,6 +382,8 @@ export class ACPClient {
     if (!this.running || !this.process) return
 
     this.running = false
+    this._startedToolless = false
+    this._startPromise = null
     this.process.stdin?.end()
 
     const proc = this.process
@@ -551,6 +568,10 @@ export class ACPClient {
 
   isRunning(): boolean {
     return this.running
+  }
+
+  isStartedToolless(): boolean {
+    return this._startedToolless
   }
 
   getStderr(): string {
@@ -763,6 +784,10 @@ export class ACPClient {
         }
       }
     } else {
+      // No tools provided — create empty tools file + MCP bridge so
+      // kiro-cli can still respond (e.g. title generation).
+      // When tools arrive later, acquireSession() copies them to this
+      // fixed path so the bridge picks them up on the next tools/list.
       toolsFile = this.getOrCreateToolsFilePath()
       const secret = this.ipcServer?.getSecret()
       const toolsData = {
@@ -774,6 +799,7 @@ export class ACPClient {
       const tmpPath = makeTmpPath(toolsFile)
       writeFileSync(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
       renameSync(tmpPath, toolsFile)
+      this._startedToolless = true
     }
 
     const config = generateAgentConfig({
