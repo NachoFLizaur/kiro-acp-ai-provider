@@ -874,7 +874,18 @@ export class ACPClient {
       }
     }
 
-    // No fallback to shared temp directory — prevents executing potentially tampered code
+    // Strategy 5: process.execPath (Bun compiled binary returns "bun" for process.argv[0], but execPath is correct)
+    const execDir = dirname(process.execPath || "")
+    if (execDir && execDir !== ".") {
+      let dir = execDir
+      for (let i = 0; i < 10; i++) {
+        const candidate = join(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
+        if (existsSync(candidate)) return candidate
+        const parent = dirname(dir)
+        if (parent === dir) break
+        dir = parent
+      }
+    }
 
     throw new KiroACPConnectionError(
       "Could not find mcp-bridge.js. Ensure kiro-acp-ai-provider is installed.",
