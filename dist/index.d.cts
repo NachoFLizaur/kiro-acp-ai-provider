@@ -284,6 +284,8 @@ declare class ACPClient {
      * rewrites the config before any session is created).
      */
     private setupAgentConfig;
+    private getAgentConfigLockPath;
+    private withAgentConfigLock;
     /**
      * Resolve the MCP bridge script to a real filesystem path.
      *
