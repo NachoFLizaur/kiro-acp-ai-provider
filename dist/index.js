@@ -1,7 +1,7 @@
 // src/acp-client.ts
 import { spawn, execFileSync as execFileSync2 } from "child_process";
 import { createInterface } from "readline";
-import { createHash, randomBytes as randomBytes2 } from "crypto";
+import { createHash, randomBytes as randomBytes3 } from "crypto";
 import { fileURLToPath } from "url";
 import { dirname as dirname2, join as join3, isAbsolute } from "path";
 import { existsSync as existsSync2, mkdirSync as mkdirSync2, chmodSync, readFileSync as readFileSync2, readdirSync, renameSync as renameSync2, statSync, unlinkSync, writeFileSync as writeFileSync2 } from "fs";
@@ -9,6 +9,7 @@ import { tmpdir } from "os";
 
 // src/agent-config.ts
 import { mkdirSync, writeFileSync, renameSync } from "fs";
+import { randomBytes } from "crypto";
 import { join, dirname, basename } from "path";
 function sanitizeName(name) {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -40,7 +41,7 @@ function writeAgentConfig(dir, name, config) {
   const agentsDir = join(dir, ".kiro", "agents");
   const filePath = join(agentsDir, `${safeName}.json`);
   mkdirSync(dirname(filePath), { recursive: true, mode: 448 });
-  const tmpPath = filePath + ".tmp";
+  const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   writeFileSync(tmpPath, JSON.stringify(config, null, 2) + "\n", { encoding: "utf-8", mode: 384 });
   renameSync(tmpPath, filePath);
   return filePath;
@@ -48,7 +49,7 @@ function writeAgentConfig(dir, name, config) {
 
 // src/ipc-server.ts
 import * as http from "http";
-import { randomBytes, timingSafeEqual } from "crypto";
+import { randomBytes as randomBytes2, timingSafeEqual } from "crypto";
 
 // src/lane-router.ts
 var CORRELATION_BUFFER_TIMEOUT_MS = 2e3;
@@ -284,7 +285,7 @@ var IPCServerImpl = class {
   secret;
   constructor(options = {}) {
     this.host = options.host ?? "127.0.0.1";
-    this.secret = randomBytes(32).toString("hex");
+    this.secret = randomBytes2(32).toString("hex");
   }
   async start() {
     if (this.server) {
@@ -568,6 +569,12 @@ var KiroACPConnectionError = class extends Error {
 var DEFAULT_REQUEST_TIMEOUT_MS = 3e5;
 var INITIALIZE_TIMEOUT_MS = 3e4;
 var STOP_TIMEOUT_MS = 1e4;
+var AGENT_CONFIG_LOCK_TIMEOUT_MS = 1e4;
+var AGENT_CONFIG_LOCK_RETRY_MS = 50;
+var AGENT_CONFIG_LOCK_STALE_MS = 3e4;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 var ACPClient = class _ACPClient {
   options;
   process = null;
@@ -587,7 +594,7 @@ var ACPClient = class _ACPClient {
    * Per-instance unique ID for tools file isolation. Without this, concurrent
    * clients sharing the same cwd would clobber each other's tool definitions.
    */
-  instanceId = randomBytes2(4).toString("hex");
+  instanceId = randomBytes3(4).toString("hex");
   sessionToolsFiles = /* @__PURE__ */ new Set();
   /**
    * Mutex for serializing agent config rewrites + session creation.
@@ -627,84 +634,87 @@ var ACPClient = class _ACPClient {
     }
     this.ipcServer = createIPCServer();
     this.ipcPort = await this.ipcServer.start();
-    if (this.options.agent) {
-      this.setupAgentConfig(toolsFilePath);
-    }
-    try {
-      execFileSync2("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
-        timeout: 5e3,
-        stdio: "ignore"
-      });
-    } catch {
-    }
-    const args = ["acp"];
-    if (this.options.agent) {
-      const sanitizedAgent = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_");
-      args.push("--agent", sanitizedAgent);
-    }
-    if (this.options.trustAllTools) args.push("--trust-all-tools");
-    this.process = spawn("kiro-cli", args, {
-      cwd: this.options.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...this.options.env }
-    });
-    this.running = true;
-    this.process.stderr?.on("data", (chunk) => {
-      this.stderrBuffer += chunk.toString();
-      if (this.stderrBuffer.length > 4096) {
-        this.stderrBuffer = this.stderrBuffer.slice(-4096);
+    const initialize = async () => {
+      if (this.options.agent) {
+        this.setupAgentConfig(toolsFilePath);
       }
-    });
-    this.process.on("exit", (code, signal) => {
-      this.running = false;
-      const rejectPending = () => {
+      try {
+        execFileSync2("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
+          timeout: 5e3,
+          stdio: "ignore"
+        });
+      } catch {
+      }
+      const args = ["acp"];
+      if (this.options.agent) {
+        const sanitizedAgent = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_");
+        args.push("--agent", sanitizedAgent);
+      }
+      if (this.options.trustAllTools) args.push("--trust-all-tools");
+      this.process = spawn("kiro-cli", args, {
+        cwd: this.options.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, ...this.options.env }
+      });
+      this.running = true;
+      this.process.stderr?.on("data", (chunk) => {
+        this.stderrBuffer += chunk.toString();
+        if (this.stderrBuffer.length > 4096) {
+          this.stderrBuffer = this.stderrBuffer.slice(-4096);
+        }
+      });
+      this.process.on("exit", (code, signal) => {
+        this.running = false;
+        const rejectPending = () => {
+          for (const [id, pending] of this.pending) {
+            const detail = pending.method === "initialize" ? this.formatRecentStderr() : "";
+            pending.reject(
+              new KiroACPConnectionError(
+                `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}${detail}`
+              )
+            );
+            clearTimeout(pending.timer ?? void 0);
+            this.pending.delete(id);
+          }
+        };
+        if (this.readline) {
+          this.readline.once("close", rejectPending);
+        } else {
+          rejectPending();
+        }
+      });
+      this.process.on("error", (err) => {
+        this.running = false;
         for (const [id, pending] of this.pending) {
           const detail = pending.method === "initialize" ? this.formatRecentStderr() : "";
-          pending.reject(
-            new KiroACPConnectionError(
-              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}${detail}`
-            )
-          );
+          pending.reject(new KiroACPConnectionError(`Process error: ${err.message}${detail}`));
           clearTimeout(pending.timer ?? void 0);
           this.pending.delete(id);
         }
+      });
+      this.readline = createInterface({ input: this.process.stdout });
+      this.readline.on("line", (line) => this.handleLine(line));
+      const clientInfo = this.options.clientInfo ?? {
+        name: "kiro-acp-ai-provider",
+        version: "1.0.0",
+        title: "Kiro ACP AI Provider"
       };
-      if (this.readline) {
-        this.readline.once("close", rejectPending);
-      } else {
-        rejectPending();
+      const result = await this.sendRequest(
+        "initialize",
+        {
+          protocolVersion: 1,
+          clientCapabilities: {},
+          clientInfo
+        },
+        INITIALIZE_TIMEOUT_MS
+      );
+      const initResult = result;
+      if (!initResult || typeof initResult !== "object" || !("agentInfo" in initResult)) {
+        throw new KiroACPError("Invalid response from initialize: missing agentInfo", -1);
       }
-    });
-    this.process.on("error", (err) => {
-      this.running = false;
-      for (const [id, pending] of this.pending) {
-        const detail = pending.method === "initialize" ? this.formatRecentStderr() : "";
-        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}${detail}`));
-        clearTimeout(pending.timer ?? void 0);
-        this.pending.delete(id);
-      }
-    });
-    this.readline = createInterface({ input: this.process.stdout });
-    this.readline.on("line", (line) => this.handleLine(line));
-    const clientInfo = this.options.clientInfo ?? {
-      name: "kiro-acp-ai-provider",
-      version: "1.0.0",
-      title: "Kiro ACP AI Provider"
+      return initResult;
     };
-    const result = await this.sendRequest(
-      "initialize",
-      {
-        protocolVersion: 1,
-        clientCapabilities: {},
-        clientInfo
-      },
-      INITIALIZE_TIMEOUT_MS
-    );
-    const initResult = result;
-    if (!initResult || typeof initResult !== "object" || !("agentInfo" in initResult)) {
-      throw new KiroACPError("Invalid response from initialize: missing agentInfo", -1);
-    }
-    return initResult;
+    return this.options.agent ? this.withAgentConfigLock(initialize) : initialize();
   }
   async stop() {
     if (!this.running || !this.process) return;
@@ -928,18 +938,20 @@ var ACPClient = class _ACPClient {
     });
     try {
       await previousLock;
-      if (this.options.agent) {
-        const bridgePath = this.resolveBridgePath();
-        const config = generateAgentConfig({
-          name: this.options.agent,
-          mcpBridgePath: bridgePath,
-          toolsFilePath,
-          cwd: this.options.cwd,
-          prompt: this.options.agentPrompt
-        });
-        writeAgentConfig(this.options.cwd, this.options.agent, config);
-      }
-      return await this.sendNewSession();
+      return await this.withAgentConfigLock(async () => {
+        if (this.options.agent) {
+          const bridgePath = this.resolveBridgePath();
+          const config = generateAgentConfig({
+            name: this.options.agent,
+            mcpBridgePath: bridgePath,
+            toolsFilePath,
+            cwd: this.options.cwd,
+            prompt: this.options.agentPrompt
+          });
+          writeAgentConfig(this.options.cwd, this.options.agent, config);
+        }
+        return this.sendNewSession();
+      });
     } finally {
       releaseLock();
     }
@@ -1010,6 +1022,7 @@ var ACPClient = class _ACPClient {
    */
   setupAgentConfig(populatedToolsFilePath) {
     const bridgePath = this.resolveBridgePath();
+    const makeTmpPath = (path) => `${path}.${process.pid}.${randomBytes3(4).toString("hex")}.tmp`;
     let toolsFile;
     if (populatedToolsFilePath) {
       toolsFile = populatedToolsFilePath;
@@ -1022,7 +1035,7 @@ var ACPClient = class _ACPClient {
             ;
             parsed.ipcPort = this.ipcPort;
             if (secret) parsed.ipcSecret = secret;
-            const tmpPath = toolsFile + ".tmp";
+            const tmpPath = makeTmpPath(toolsFile);
             writeFileSync2(tmpPath, JSON.stringify(parsed, null, 2), { mode: 384 });
             renameSync2(tmpPath, toolsFile);
           }
@@ -1038,7 +1051,7 @@ var ACPClient = class _ACPClient {
         ...this.ipcPort != null ? { ipcPort: this.ipcPort } : {},
         ...secret ? { ipcSecret: secret } : {}
       };
-      const tmpPath = toolsFile + ".tmp";
+      const tmpPath = makeTmpPath(toolsFile);
       writeFileSync2(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 384 });
       renameSync2(tmpPath, toolsFile);
     }
@@ -1050,6 +1063,51 @@ var ACPClient = class _ACPClient {
       prompt: this.options.agentPrompt
     });
     writeAgentConfig(this.options.cwd, this.options.agent, config);
+  }
+  getAgentConfigLockPath() {
+    if (!this.options.agent) return null;
+    const sanitizedAgent = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_");
+    return join3(this.options.cwd, ".kiro", "agents", `${sanitizedAgent}.lock`);
+  }
+  async withAgentConfigLock(operation) {
+    const lockPath = this.getAgentConfigLockPath();
+    if (!lockPath) return operation();
+    mkdirSync2(dirname2(lockPath), { recursive: true, mode: 448 });
+    const deadline = Date.now() + AGENT_CONFIG_LOCK_TIMEOUT_MS;
+    for (; ; ) {
+      try {
+        writeFileSync2(
+          lockPath,
+          JSON.stringify({ pid: process.pid, instanceId: this.instanceId, createdAt: Date.now() }),
+          { encoding: "utf-8", flag: "wx", mode: 384 }
+        );
+        break;
+      } catch (err) {
+        const code = err instanceof Error && "code" in err ? String(err.code) : void 0;
+        if (code !== "EEXIST") throw err;
+        try {
+          const lockStat = statSync(lockPath);
+          if (Date.now() - lockStat.mtimeMs > AGENT_CONFIG_LOCK_STALE_MS) {
+            unlinkSync(lockPath);
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        if (Date.now() >= deadline) {
+          throw new KiroACPConnectionError(`Timed out waiting for agent config lock: ${lockPath}`);
+        }
+        await sleep(AGENT_CONFIG_LOCK_RETRY_MS);
+      }
+    }
+    try {
+      return await operation();
+    } finally {
+      try {
+        unlinkSync(lockPath);
+      } catch {
+      }
+    }
   }
   /**
    * Resolve the MCP bridge script to a real filesystem path.
@@ -1325,7 +1383,7 @@ ${stderr}` : "";
 
 // src/kiro-acp-model.ts
 import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync4 } from "fs";
-import { randomBytes as randomBytes3 } from "crypto";
+import { randomBytes as randomBytes4 } from "crypto";
 
 // src/session-storage.ts
 import { writeFileSync as writeFileSync3, readFileSync as readFileSync3, mkdirSync as mkdirSync3, renameSync as renameSync3, unlinkSync as unlinkSync2 } from "fs";
@@ -1603,7 +1661,7 @@ var KiroACPLanguageModel = class _KiroACPLanguageModel {
     let toolsFilePath;
     let toolNames = "";
     if (tools && tools.length > 0) {
-      const streamId = randomBytes3(4).toString("hex");
+      const streamId = randomBytes4(4).toString("hex");
       toolsFilePath = this.client.createSessionToolsFilePath(streamId);
       toolNames = this.writeToolsToFile(toolsFilePath, tools);
     }
