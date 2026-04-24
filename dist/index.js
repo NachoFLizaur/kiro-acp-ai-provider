@@ -1,10 +1,10 @@
 // src/acp-client.ts
-import { spawn, execFileSync } from "child_process";
+import { spawn, execFileSync as execFileSync2 } from "child_process";
 import { createInterface } from "readline";
 import { createHash, randomBytes as randomBytes2 } from "crypto";
 import { fileURLToPath } from "url";
-import { dirname as dirname2, join as join2, isAbsolute } from "path";
-import { existsSync, mkdirSync as mkdirSync2, chmodSync, readFileSync, readdirSync, renameSync as renameSync2, statSync, unlinkSync, writeFileSync as writeFileSync2 } from "fs";
+import { dirname as dirname2, join as join3, isAbsolute } from "path";
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, chmodSync, readFileSync as readFileSync2, readdirSync, renameSync as renameSync2, statSync, unlinkSync, writeFileSync as writeFileSync2 } from "fs";
 import { tmpdir } from "os";
 
 // src/agent-config.ts
@@ -512,6 +512,42 @@ function createIPCServer(options = {}) {
   return new IPCServerImpl(options);
 }
 
+// src/kiro-auth.ts
+import { existsSync } from "fs";
+import { execFileSync } from "child_process";
+import { homedir } from "os";
+import { join as join2 } from "path";
+function verifyAuth() {
+  let installed = false;
+  let version;
+  try {
+    version = execFileSync("kiro-cli", ["--version"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 5e3
+    }).toString().trim();
+    installed = true;
+  } catch {
+    return { installed: false, authenticated: false };
+  }
+  let authenticated = false;
+  try {
+    const output = execFileSync("kiro-cli", ["whoami"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 1e4
+    }).toString();
+    authenticated = output.includes("Logged in");
+  } catch {
+  }
+  const tokenPath = join2(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json");
+  const hasToken = existsSync(tokenPath);
+  return {
+    installed,
+    authenticated,
+    version,
+    tokenPath: hasToken ? tokenPath : void 0
+  };
+}
+
 // src/acp-client.ts
 var KiroACPError = class extends Error {
   constructor(message, code, data) {
@@ -574,11 +610,19 @@ var ACPClient = class _ACPClient {
    */
   async start(toolsFilePath) {
     if (this.running) throw new KiroACPConnectionError("Client is already running");
+    this.stderrBuffer = "";
+    const authStatus = verifyAuth();
+    if (!authStatus.installed) {
+      throw new KiroACPConnectionError("`kiro-cli` is not installed or not available on PATH.");
+    }
+    if (!authStatus.authenticated) {
+      throw new KiroACPConnectionError("`kiro-cli` is not authenticated. Run `kiro-cli login` and retry.");
+    }
     const cwd = this.options.cwd;
     if (!isAbsolute(cwd)) {
       throw new KiroACPError(`cwd must be absolute: ${cwd}`, -1);
     }
-    if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
+    if (!existsSync2(cwd) || !statSync(cwd).isDirectory()) {
       throw new KiroACPError(`cwd is not a directory: ${cwd}`, -1);
     }
     this.ipcServer = createIPCServer();
@@ -587,7 +631,7 @@ var ACPClient = class _ACPClient {
       this.setupAgentConfig(toolsFilePath);
     }
     try {
-      execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
+      execFileSync2("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
         timeout: 5e3,
         stdio: "ignore"
       });
@@ -615,9 +659,10 @@ var ACPClient = class _ACPClient {
       this.running = false;
       const rejectPending = () => {
         for (const [id, pending] of this.pending) {
+          const detail = pending.method === "initialize" ? this.formatRecentStderr() : "";
           pending.reject(
             new KiroACPConnectionError(
-              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}`
+              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}${detail}`
             )
           );
           clearTimeout(pending.timer ?? void 0);
@@ -633,7 +678,8 @@ var ACPClient = class _ACPClient {
     this.process.on("error", (err) => {
       this.running = false;
       for (const [id, pending] of this.pending) {
-        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}`));
+        const detail = pending.method === "initialize" ? this.formatRecentStderr() : "";
+        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}${detail}`));
         clearTimeout(pending.timer ?? void 0);
         this.pending.delete(id);
       }
@@ -842,11 +888,11 @@ var ACPClient = class _ACPClient {
    */
   getOrCreateToolsFilePath() {
     if (this.toolsFilePath) return this.toolsFilePath;
-    const toolsDir = join2(tmpdir(), "kiro-acp");
+    const toolsDir = join3(tmpdir(), "kiro-acp");
     mkdirSync2(toolsDir, { recursive: true, mode: 448 });
     chmodSync(toolsDir, 448);
     const cwdHash = createHash("md5").update(this.options.cwd).digest("hex").slice(0, 8);
-    this.toolsFilePath = join2(toolsDir, `tools-${cwdHash}-${this.instanceId}.json`);
+    this.toolsFilePath = join3(toolsDir, `tools-${cwdHash}-${this.instanceId}.json`);
     return this.toolsFilePath;
   }
   /**
@@ -854,11 +900,11 @@ var ACPClient = class _ACPClient {
    * Path: `{tmpdir}/kiro-acp/tools-{cwdHash}-{sessionUniqueId}.json`
    */
   createSessionToolsFilePath(sessionUniqueId) {
-    const toolsDir = join2(tmpdir(), "kiro-acp");
+    const toolsDir = join3(tmpdir(), "kiro-acp");
     mkdirSync2(toolsDir, { recursive: true, mode: 448 });
     chmodSync(toolsDir, 448);
     const cwdHash = createHash("md5").update(this.options.cwd).digest("hex").slice(0, 8);
-    const filePath = join2(toolsDir, `tools-${cwdHash}-${sessionUniqueId}.json`);
+    const filePath = join3(toolsDir, `tools-${cwdHash}-${sessionUniqueId}.json`);
     this.sessionToolsFiles.add(filePath);
     return filePath;
   }
@@ -969,7 +1015,7 @@ var ACPClient = class _ACPClient {
       toolsFile = populatedToolsFilePath;
       if (this.ipcPort != null) {
         try {
-          const existing = readFileSync(toolsFile, "utf-8");
+          const existing = readFileSync2(toolsFile, "utf-8");
           const parsed = JSON.parse(existing);
           const secret = this.ipcServer?.getSecret();
           if (parsed.ipcPort !== this.ipcPort || secret && parsed.ipcSecret !== secret) {
@@ -1015,23 +1061,23 @@ var ACPClient = class _ACPClient {
     try {
       if (typeof import.meta?.url === "string" && import.meta.url) {
         const currentDir = dirname2(fileURLToPath(import.meta.url));
-        const directPath = join2(currentDir, "mcp-bridge.js");
-        if (!directPath.includes("$bunfs") && existsSync(directPath)) {
+        const directPath = join3(currentDir, "mcp-bridge.js");
+        if (!directPath.includes("$bunfs") && existsSync2(directPath)) {
           return directPath;
         }
       }
     } catch {
     }
-    const nmBase = join2(this.options.cwd, "node_modules");
-    const directNm = join2(nmBase, "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
-    if (existsSync(directNm)) return directNm;
-    const bunDir = join2(nmBase, ".bun");
-    if (existsSync(bunDir)) {
+    const nmBase = join3(this.options.cwd, "node_modules");
+    const directNm = join3(nmBase, "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
+    if (existsSync2(directNm)) return directNm;
+    const bunDir = join3(nmBase, ".bun");
+    if (existsSync2(bunDir)) {
       try {
         const entries = readdirSync(bunDir);
         for (const entry of entries) {
           if (entry.includes("kiro-acp-ai-provider")) {
-            const cached = join2(
+            const cached = join3(
               bunDir,
               entry,
               "node_modules",
@@ -1039,7 +1085,7 @@ var ACPClient = class _ACPClient {
               "dist",
               "mcp-bridge.js"
             );
-            if (existsSync(cached)) return cached;
+            if (existsSync2(cached)) return cached;
           }
         }
       } catch {
@@ -1047,14 +1093,14 @@ var ACPClient = class _ACPClient {
     }
     let searchDir = this.options.cwd;
     for (let i = 0; i < 10; i++) {
-      const candidate = join2(searchDir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
-      if (existsSync(candidate)) return candidate;
-      const ancestorBunDir = join2(searchDir, "node_modules", ".bun");
-      if (existsSync(ancestorBunDir)) {
+      const candidate = join3(searchDir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
+      if (existsSync2(candidate)) return candidate;
+      const ancestorBunDir = join3(searchDir, "node_modules", ".bun");
+      if (existsSync2(ancestorBunDir)) {
         try {
           for (const entry of readdirSync(ancestorBunDir)) {
             if (entry.includes("kiro-acp-ai-provider")) {
-              const cached = join2(
+              const cached = join3(
                 ancestorBunDir,
                 entry,
                 "node_modules",
@@ -1062,7 +1108,7 @@ var ACPClient = class _ACPClient {
                 "dist",
                 "mcp-bridge.js"
               );
-              if (existsSync(cached)) return cached;
+              if (existsSync2(cached)) return cached;
             }
           }
         } catch {
@@ -1076,14 +1122,14 @@ var ACPClient = class _ACPClient {
     if (binDir) {
       let dir = binDir;
       for (let i = 0; i < 10; i++) {
-        const candidate = join2(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
-        if (existsSync(candidate)) return candidate;
-        const binBunDir = join2(dir, "node_modules", ".bun");
-        if (existsSync(binBunDir)) {
+        const candidate = join3(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
+        if (existsSync2(candidate)) return candidate;
+        const binBunDir = join3(dir, "node_modules", ".bun");
+        if (existsSync2(binBunDir)) {
           try {
             for (const entry of readdirSync(binBunDir)) {
               if (entry.includes("kiro-acp-ai-provider")) {
-                const cached = join2(
+                const cached = join3(
                   binBunDir,
                   entry,
                   "node_modules",
@@ -1091,7 +1137,7 @@ var ACPClient = class _ACPClient {
                   "dist",
                   "mcp-bridge.js"
                 );
-                if (existsSync(cached)) return cached;
+                if (existsSync2(cached)) return cached;
               }
             }
           } catch {
@@ -1106,8 +1152,8 @@ var ACPClient = class _ACPClient {
     if (execDir && execDir !== ".") {
       let dir = execDir;
       for (let i = 0; i < 10; i++) {
-        const candidate = join2(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
-        if (existsSync(candidate)) return candidate;
+        const candidate = join3(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
+        if (existsSync2(candidate)) return candidate;
         const parent = dirname2(dir);
         if (parent === dir) break;
         dir = parent;
@@ -1136,12 +1182,29 @@ var ACPClient = class _ACPClient {
             this.sendNotification("session/cancel", { sessionId: sid });
           }
         }
-        reject(new KiroACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1));
+        reject(this.createTimeoutError(method, timeoutMs));
       }, timeoutMs) : null;
       this.pending.set(id, { resolve, reject, method, timer });
       const line = JSON.stringify(request) + "\n";
       this.process.stdin.write(line);
     });
+  }
+  createTimeoutError(method, timeoutMs) {
+    const parts = [`Request timed out after ${timeoutMs}ms: ${method}`];
+    if (method === "initialize") {
+      const detail = this.formatRecentStderr();
+      if (detail) {
+        parts.push(detail.trimStart());
+      }
+    }
+    return new KiroACPError(parts.join("\n\n"), -1);
+  }
+  formatRecentStderr() {
+    const stderr = this.stderrBuffer.trim();
+    return stderr ? `
+
+kiro-cli stderr:
+${stderr}` : "";
   }
   sendNotification(method, params) {
     if (!this.running || !this.process?.stdin?.writable) return;
@@ -1261,32 +1324,32 @@ var ACPClient = class _ACPClient {
 };
 
 // src/kiro-acp-model.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync4, renameSync as renameSync4 } from "fs";
+import { readFileSync as readFileSync4, writeFileSync as writeFileSync4, renameSync as renameSync4 } from "fs";
 import { randomBytes as randomBytes3 } from "crypto";
 
 // src/session-storage.ts
-import { writeFileSync as writeFileSync3, readFileSync as readFileSync2, mkdirSync as mkdirSync3, renameSync as renameSync3, unlinkSync as unlinkSync2 } from "fs";
+import { writeFileSync as writeFileSync3, readFileSync as readFileSync3, mkdirSync as mkdirSync3, renameSync as renameSync3, unlinkSync as unlinkSync2 } from "fs";
 import { createHash as createHash2 } from "crypto";
-import { join as join3 } from "path";
-import { homedir } from "os";
+import { join as join4 } from "path";
+import { homedir as homedir2 } from "os";
 function getXdgDataHome() {
-  return process.env.XDG_DATA_HOME || join3(homedir(), ".local", "share");
+  return process.env.XDG_DATA_HOME || join4(homedir2(), ".local", "share");
 }
 var APP_DIR = "kiro-acp-ai-provider";
 var SESSION_TTL_MS = 24 * 60 * 60 * 1e3;
 function getSessionDir(cwd) {
   const cwdHash = createHash2("md5").update(cwd).digest("hex").slice(0, 8);
-  return join3(getXdgDataHome(), APP_DIR, "sessions", cwdHash);
+  return join4(getXdgDataHome(), APP_DIR, "sessions", cwdHash);
 }
 function getSessionFilePath(cwd, affinityId) {
   const sanitized = affinityId ? affinityId.replace(/[^a-zA-Z0-9_-]/g, "_") : void 0;
   const fileName = sanitized ? `${sanitized}.json` : "_default.json";
-  return join3(getSessionDir(cwd), fileName);
+  return join4(getSessionDir(cwd), fileName);
 }
 function persistSession(cwd, sessionId, affinityId) {
   try {
     const filePath = getSessionFilePath(cwd, affinityId);
-    const dir = join3(filePath, "..");
+    const dir = join4(filePath, "..");
     mkdirSync3(dir, { recursive: true, mode: 448 });
     const data = {
       kiroSessionId: sessionId,
@@ -1308,7 +1371,7 @@ function clearPersistedSession(cwd, affinityId) {
 function loadPersistedSession(cwd, affinityId) {
   try {
     const filePath = getSessionFilePath(cwd, affinityId);
-    const raw = readFileSync2(filePath, "utf-8");
+    const raw = readFileSync3(filePath, "utf-8");
     const data = JSON.parse(raw);
     if (Date.now() - data.lastUsed > SESSION_TTL_MS) return null;
     if (!data.kiroSessionId || typeof data.kiroSessionId !== "string") return null;
@@ -1710,7 +1773,7 @@ Please acknowledge this context and continue from where we left off.
     const ipcPort = this.client.getIpcPort();
     if (ipcPort == null) return;
     try {
-      const raw = readFileSync3(toolsFilePath, "utf-8");
+      const raw = readFileSync4(toolsFilePath, "utf-8");
       const parsed = JSON.parse(raw);
       const ipcSecret = this.client.getIpcSecret();
       if (parsed.ipcPort === ipcPort && parsed.ipcSecret === ipcSecret) return;
@@ -2280,42 +2343,6 @@ function createKiroAcp(settings = {}) {
     return lastModel?.getTotalCredits() ?? 0;
   };
   return provider;
-}
-
-// src/kiro-auth.ts
-import { existsSync as existsSync2 } from "fs";
-import { execFileSync as execFileSync2 } from "child_process";
-import { homedir as homedir2 } from "os";
-import { join as join4 } from "path";
-function verifyAuth() {
-  let installed = false;
-  let version;
-  try {
-    version = execFileSync2("kiro-cli", ["--version"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 5e3
-    }).toString().trim();
-    installed = true;
-  } catch {
-    return { installed: false, authenticated: false };
-  }
-  let authenticated = false;
-  try {
-    const output = execFileSync2("kiro-cli", ["whoami"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 1e4
-    }).toString();
-    authenticated = output.includes("Logged in");
-  } catch {
-  }
-  const tokenPath = join4(homedir2(), ".aws", "sso", "cache", "kiro-auth-token.json");
-  const hasToken = existsSync2(tokenPath);
-  return {
-    installed,
-    authenticated,
-    version,
-    tokenPath: hasToken ? tokenPath : void 0
-  };
 }
 
 // src/kiro-models.ts

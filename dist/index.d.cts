@@ -292,6 +292,8 @@ declare class ACPClient {
      */
     private resolveBridgePath;
     private sendRequest;
+    private createTimeoutError;
+    private formatRecentStderr;
     private sendNotification;
     private sendResponse;
     private handleLine;

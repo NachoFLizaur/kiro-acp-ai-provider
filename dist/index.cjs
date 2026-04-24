@@ -45,13 +45,13 @@ __export(index_exports, {
 module.exports = __toCommonJS(index_exports);
 
 // src/acp-client.ts
-var import_node_child_process = require("child_process");
+var import_node_child_process2 = require("child_process");
 var import_node_readline = require("readline");
 var import_node_crypto2 = require("crypto");
 var import_node_url = require("url");
-var import_node_path2 = require("path");
-var import_node_fs2 = require("fs");
-var import_node_os = require("os");
+var import_node_path3 = require("path");
+var import_node_fs3 = require("fs");
+var import_node_os2 = require("os");
 
 // src/agent-config.ts
 var import_node_fs = require("fs");
@@ -558,6 +558,42 @@ function createIPCServer(options = {}) {
   return new IPCServerImpl(options);
 }
 
+// src/kiro-auth.ts
+var import_node_fs2 = require("fs");
+var import_node_child_process = require("child_process");
+var import_node_os = require("os");
+var import_node_path2 = require("path");
+function verifyAuth() {
+  let installed = false;
+  let version;
+  try {
+    version = (0, import_node_child_process.execFileSync)("kiro-cli", ["--version"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 5e3
+    }).toString().trim();
+    installed = true;
+  } catch {
+    return { installed: false, authenticated: false };
+  }
+  let authenticated = false;
+  try {
+    const output = (0, import_node_child_process.execFileSync)("kiro-cli", ["whoami"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 1e4
+    }).toString();
+    authenticated = output.includes("Logged in");
+  } catch {
+  }
+  const tokenPath = (0, import_node_path2.join)((0, import_node_os.homedir)(), ".aws", "sso", "cache", "kiro-auth-token.json");
+  const hasToken = (0, import_node_fs2.existsSync)(tokenPath);
+  return {
+    installed,
+    authenticated,
+    version,
+    tokenPath: hasToken ? tokenPath : void 0
+  };
+}
+
 // src/acp-client.ts
 var import_meta = {};
 var KiroACPError = class extends Error {
@@ -621,11 +657,19 @@ var ACPClient = class _ACPClient {
    */
   async start(toolsFilePath) {
     if (this.running) throw new KiroACPConnectionError("Client is already running");
+    this.stderrBuffer = "";
+    const authStatus = verifyAuth();
+    if (!authStatus.installed) {
+      throw new KiroACPConnectionError("`kiro-cli` is not installed or not available on PATH.");
+    }
+    if (!authStatus.authenticated) {
+      throw new KiroACPConnectionError("`kiro-cli` is not authenticated. Run `kiro-cli login` and retry.");
+    }
     const cwd = this.options.cwd;
-    if (!(0, import_node_path2.isAbsolute)(cwd)) {
+    if (!(0, import_node_path3.isAbsolute)(cwd)) {
       throw new KiroACPError(`cwd must be absolute: ${cwd}`, -1);
     }
-    if (!(0, import_node_fs2.existsSync)(cwd) || !(0, import_node_fs2.statSync)(cwd).isDirectory()) {
+    if (!(0, import_node_fs3.existsSync)(cwd) || !(0, import_node_fs3.statSync)(cwd).isDirectory()) {
       throw new KiroACPError(`cwd is not a directory: ${cwd}`, -1);
     }
     this.ipcServer = createIPCServer();
@@ -634,7 +678,7 @@ var ACPClient = class _ACPClient {
       this.setupAgentConfig(toolsFilePath);
     }
     try {
-      (0, import_node_child_process.execFileSync)("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
+      (0, import_node_child_process2.execFileSync)("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
         timeout: 5e3,
         stdio: "ignore"
       });
@@ -646,7 +690,7 @@ var ACPClient = class _ACPClient {
       args.push("--agent", sanitizedAgent);
     }
     if (this.options.trustAllTools) args.push("--trust-all-tools");
-    this.process = (0, import_node_child_process.spawn)("kiro-cli", args, {
+    this.process = (0, import_node_child_process2.spawn)("kiro-cli", args, {
       cwd: this.options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...this.options.env }
@@ -662,9 +706,10 @@ var ACPClient = class _ACPClient {
       this.running = false;
       const rejectPending = () => {
         for (const [id, pending] of this.pending) {
+          const detail = pending.method === "initialize" ? this.formatRecentStderr() : "";
           pending.reject(
             new KiroACPConnectionError(
-              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}`
+              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}${detail}`
             )
           );
           clearTimeout(pending.timer ?? void 0);
@@ -680,7 +725,8 @@ var ACPClient = class _ACPClient {
     this.process.on("error", (err) => {
       this.running = false;
       for (const [id, pending] of this.pending) {
-        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}`));
+        const detail = pending.method === "initialize" ? this.formatRecentStderr() : "";
+        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}${detail}`));
         clearTimeout(pending.timer ?? void 0);
         this.pending.delete(id);
       }
@@ -741,14 +787,14 @@ var ACPClient = class _ACPClient {
     }
     if (this.toolsFilePath) {
       try {
-        (0, import_node_fs2.unlinkSync)(this.toolsFilePath);
+        (0, import_node_fs3.unlinkSync)(this.toolsFilePath);
       } catch {
       }
       this.toolsFilePath = null;
     }
     for (const filePath of this.sessionToolsFiles) {
       try {
-        (0, import_node_fs2.unlinkSync)(filePath);
+        (0, import_node_fs3.unlinkSync)(filePath);
       } catch {
       }
     }
@@ -889,11 +935,11 @@ var ACPClient = class _ACPClient {
    */
   getOrCreateToolsFilePath() {
     if (this.toolsFilePath) return this.toolsFilePath;
-    const toolsDir = (0, import_node_path2.join)((0, import_node_os.tmpdir)(), "kiro-acp");
-    (0, import_node_fs2.mkdirSync)(toolsDir, { recursive: true, mode: 448 });
-    (0, import_node_fs2.chmodSync)(toolsDir, 448);
+    const toolsDir = (0, import_node_path3.join)((0, import_node_os2.tmpdir)(), "kiro-acp");
+    (0, import_node_fs3.mkdirSync)(toolsDir, { recursive: true, mode: 448 });
+    (0, import_node_fs3.chmodSync)(toolsDir, 448);
     const cwdHash = (0, import_node_crypto2.createHash)("md5").update(this.options.cwd).digest("hex").slice(0, 8);
-    this.toolsFilePath = (0, import_node_path2.join)(toolsDir, `tools-${cwdHash}-${this.instanceId}.json`);
+    this.toolsFilePath = (0, import_node_path3.join)(toolsDir, `tools-${cwdHash}-${this.instanceId}.json`);
     return this.toolsFilePath;
   }
   /**
@@ -901,18 +947,18 @@ var ACPClient = class _ACPClient {
    * Path: `{tmpdir}/kiro-acp/tools-{cwdHash}-{sessionUniqueId}.json`
    */
   createSessionToolsFilePath(sessionUniqueId) {
-    const toolsDir = (0, import_node_path2.join)((0, import_node_os.tmpdir)(), "kiro-acp");
-    (0, import_node_fs2.mkdirSync)(toolsDir, { recursive: true, mode: 448 });
-    (0, import_node_fs2.chmodSync)(toolsDir, 448);
+    const toolsDir = (0, import_node_path3.join)((0, import_node_os2.tmpdir)(), "kiro-acp");
+    (0, import_node_fs3.mkdirSync)(toolsDir, { recursive: true, mode: 448 });
+    (0, import_node_fs3.chmodSync)(toolsDir, 448);
     const cwdHash = (0, import_node_crypto2.createHash)("md5").update(this.options.cwd).digest("hex").slice(0, 8);
-    const filePath = (0, import_node_path2.join)(toolsDir, `tools-${cwdHash}-${sessionUniqueId}.json`);
+    const filePath = (0, import_node_path3.join)(toolsDir, `tools-${cwdHash}-${sessionUniqueId}.json`);
     this.sessionToolsFiles.add(filePath);
     return filePath;
   }
   removeSessionToolsFile(filePath) {
     this.sessionToolsFiles.delete(filePath);
     try {
-      (0, import_node_fs2.unlinkSync)(filePath);
+      (0, import_node_fs3.unlinkSync)(filePath);
     } catch {
     }
   }
@@ -1016,7 +1062,7 @@ var ACPClient = class _ACPClient {
       toolsFile = populatedToolsFilePath;
       if (this.ipcPort != null) {
         try {
-          const existing = (0, import_node_fs2.readFileSync)(toolsFile, "utf-8");
+          const existing = (0, import_node_fs3.readFileSync)(toolsFile, "utf-8");
           const parsed = JSON.parse(existing);
           const secret = this.ipcServer?.getSecret();
           if (parsed.ipcPort !== this.ipcPort || secret && parsed.ipcSecret !== secret) {
@@ -1024,8 +1070,8 @@ var ACPClient = class _ACPClient {
             parsed.ipcPort = this.ipcPort;
             if (secret) parsed.ipcSecret = secret;
             const tmpPath = toolsFile + ".tmp";
-            (0, import_node_fs2.writeFileSync)(tmpPath, JSON.stringify(parsed, null, 2), { mode: 384 });
-            (0, import_node_fs2.renameSync)(tmpPath, toolsFile);
+            (0, import_node_fs3.writeFileSync)(tmpPath, JSON.stringify(parsed, null, 2), { mode: 384 });
+            (0, import_node_fs3.renameSync)(tmpPath, toolsFile);
           }
         } catch {
         }
@@ -1040,8 +1086,8 @@ var ACPClient = class _ACPClient {
         ...secret ? { ipcSecret: secret } : {}
       };
       const tmpPath = toolsFile + ".tmp";
-      (0, import_node_fs2.writeFileSync)(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 384 });
-      (0, import_node_fs2.renameSync)(tmpPath, toolsFile);
+      (0, import_node_fs3.writeFileSync)(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 384 });
+      (0, import_node_fs3.renameSync)(tmpPath, toolsFile);
     }
     const config = generateAgentConfig({
       name: this.options.agent,
@@ -1061,24 +1107,24 @@ var ACPClient = class _ACPClient {
   resolveBridgePath() {
     try {
       if (typeof import_meta?.url === "string" && import_meta.url) {
-        const currentDir = (0, import_node_path2.dirname)((0, import_node_url.fileURLToPath)(import_meta.url));
-        const directPath = (0, import_node_path2.join)(currentDir, "mcp-bridge.js");
-        if (!directPath.includes("$bunfs") && (0, import_node_fs2.existsSync)(directPath)) {
+        const currentDir = (0, import_node_path3.dirname)((0, import_node_url.fileURLToPath)(import_meta.url));
+        const directPath = (0, import_node_path3.join)(currentDir, "mcp-bridge.js");
+        if (!directPath.includes("$bunfs") && (0, import_node_fs3.existsSync)(directPath)) {
           return directPath;
         }
       }
     } catch {
     }
-    const nmBase = (0, import_node_path2.join)(this.options.cwd, "node_modules");
-    const directNm = (0, import_node_path2.join)(nmBase, "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
-    if ((0, import_node_fs2.existsSync)(directNm)) return directNm;
-    const bunDir = (0, import_node_path2.join)(nmBase, ".bun");
-    if ((0, import_node_fs2.existsSync)(bunDir)) {
+    const nmBase = (0, import_node_path3.join)(this.options.cwd, "node_modules");
+    const directNm = (0, import_node_path3.join)(nmBase, "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
+    if ((0, import_node_fs3.existsSync)(directNm)) return directNm;
+    const bunDir = (0, import_node_path3.join)(nmBase, ".bun");
+    if ((0, import_node_fs3.existsSync)(bunDir)) {
       try {
-        const entries = (0, import_node_fs2.readdirSync)(bunDir);
+        const entries = (0, import_node_fs3.readdirSync)(bunDir);
         for (const entry of entries) {
           if (entry.includes("kiro-acp-ai-provider")) {
-            const cached = (0, import_node_path2.join)(
+            const cached = (0, import_node_path3.join)(
               bunDir,
               entry,
               "node_modules",
@@ -1086,7 +1132,7 @@ var ACPClient = class _ACPClient {
               "dist",
               "mcp-bridge.js"
             );
-            if ((0, import_node_fs2.existsSync)(cached)) return cached;
+            if ((0, import_node_fs3.existsSync)(cached)) return cached;
           }
         }
       } catch {
@@ -1094,14 +1140,14 @@ var ACPClient = class _ACPClient {
     }
     let searchDir = this.options.cwd;
     for (let i = 0; i < 10; i++) {
-      const candidate = (0, import_node_path2.join)(searchDir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
-      if ((0, import_node_fs2.existsSync)(candidate)) return candidate;
-      const ancestorBunDir = (0, import_node_path2.join)(searchDir, "node_modules", ".bun");
-      if ((0, import_node_fs2.existsSync)(ancestorBunDir)) {
+      const candidate = (0, import_node_path3.join)(searchDir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
+      if ((0, import_node_fs3.existsSync)(candidate)) return candidate;
+      const ancestorBunDir = (0, import_node_path3.join)(searchDir, "node_modules", ".bun");
+      if ((0, import_node_fs3.existsSync)(ancestorBunDir)) {
         try {
-          for (const entry of (0, import_node_fs2.readdirSync)(ancestorBunDir)) {
+          for (const entry of (0, import_node_fs3.readdirSync)(ancestorBunDir)) {
             if (entry.includes("kiro-acp-ai-provider")) {
-              const cached = (0, import_node_path2.join)(
+              const cached = (0, import_node_path3.join)(
                 ancestorBunDir,
                 entry,
                 "node_modules",
@@ -1109,28 +1155,28 @@ var ACPClient = class _ACPClient {
                 "dist",
                 "mcp-bridge.js"
               );
-              if ((0, import_node_fs2.existsSync)(cached)) return cached;
+              if ((0, import_node_fs3.existsSync)(cached)) return cached;
             }
           }
         } catch {
         }
       }
-      const parent = (0, import_node_path2.dirname)(searchDir);
+      const parent = (0, import_node_path3.dirname)(searchDir);
       if (parent === searchDir) break;
       searchDir = parent;
     }
-    const binDir = (0, import_node_path2.dirname)(process.argv[0] || "");
+    const binDir = (0, import_node_path3.dirname)(process.argv[0] || "");
     if (binDir) {
       let dir = binDir;
       for (let i = 0; i < 10; i++) {
-        const candidate = (0, import_node_path2.join)(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
-        if ((0, import_node_fs2.existsSync)(candidate)) return candidate;
-        const binBunDir = (0, import_node_path2.join)(dir, "node_modules", ".bun");
-        if ((0, import_node_fs2.existsSync)(binBunDir)) {
+        const candidate = (0, import_node_path3.join)(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
+        if ((0, import_node_fs3.existsSync)(candidate)) return candidate;
+        const binBunDir = (0, import_node_path3.join)(dir, "node_modules", ".bun");
+        if ((0, import_node_fs3.existsSync)(binBunDir)) {
           try {
-            for (const entry of (0, import_node_fs2.readdirSync)(binBunDir)) {
+            for (const entry of (0, import_node_fs3.readdirSync)(binBunDir)) {
               if (entry.includes("kiro-acp-ai-provider")) {
-                const cached = (0, import_node_path2.join)(
+                const cached = (0, import_node_path3.join)(
                   binBunDir,
                   entry,
                   "node_modules",
@@ -1138,24 +1184,24 @@ var ACPClient = class _ACPClient {
                   "dist",
                   "mcp-bridge.js"
                 );
-                if ((0, import_node_fs2.existsSync)(cached)) return cached;
+                if ((0, import_node_fs3.existsSync)(cached)) return cached;
               }
             }
           } catch {
           }
         }
-        const parent = (0, import_node_path2.dirname)(dir);
+        const parent = (0, import_node_path3.dirname)(dir);
         if (parent === dir) break;
         dir = parent;
       }
     }
-    const execDir = (0, import_node_path2.dirname)(process.execPath || "");
+    const execDir = (0, import_node_path3.dirname)(process.execPath || "");
     if (execDir && execDir !== ".") {
       let dir = execDir;
       for (let i = 0; i < 10; i++) {
-        const candidate = (0, import_node_path2.join)(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
-        if ((0, import_node_fs2.existsSync)(candidate)) return candidate;
-        const parent = (0, import_node_path2.dirname)(dir);
+        const candidate = (0, import_node_path3.join)(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js");
+        if ((0, import_node_fs3.existsSync)(candidate)) return candidate;
+        const parent = (0, import_node_path3.dirname)(dir);
         if (parent === dir) break;
         dir = parent;
       }
@@ -1183,12 +1229,29 @@ var ACPClient = class _ACPClient {
             this.sendNotification("session/cancel", { sessionId: sid });
           }
         }
-        reject(new KiroACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1));
+        reject(this.createTimeoutError(method, timeoutMs));
       }, timeoutMs) : null;
       this.pending.set(id, { resolve, reject, method, timer });
       const line = JSON.stringify(request) + "\n";
       this.process.stdin.write(line);
     });
+  }
+  createTimeoutError(method, timeoutMs) {
+    const parts = [`Request timed out after ${timeoutMs}ms: ${method}`];
+    if (method === "initialize") {
+      const detail = this.formatRecentStderr();
+      if (detail) {
+        parts.push(detail.trimStart());
+      }
+    }
+    return new KiroACPError(parts.join("\n\n"), -1);
+  }
+  formatRecentStderr() {
+    const stderr = this.stderrBuffer.trim();
+    return stderr ? `
+
+kiro-cli stderr:
+${stderr}` : "";
   }
   sendNotification(method, params) {
     if (!this.running || !this.process?.stdin?.writable) return;
@@ -1308,54 +1371,54 @@ var ACPClient = class _ACPClient {
 };
 
 // src/kiro-acp-model.ts
-var import_node_fs4 = require("fs");
+var import_node_fs5 = require("fs");
 var import_node_crypto4 = require("crypto");
 
 // src/session-storage.ts
-var import_node_fs3 = require("fs");
+var import_node_fs4 = require("fs");
 var import_node_crypto3 = require("crypto");
-var import_node_path3 = require("path");
-var import_node_os2 = require("os");
+var import_node_path4 = require("path");
+var import_node_os3 = require("os");
 function getXdgDataHome() {
-  return process.env.XDG_DATA_HOME || (0, import_node_path3.join)((0, import_node_os2.homedir)(), ".local", "share");
+  return process.env.XDG_DATA_HOME || (0, import_node_path4.join)((0, import_node_os3.homedir)(), ".local", "share");
 }
 var APP_DIR = "kiro-acp-ai-provider";
 var SESSION_TTL_MS = 24 * 60 * 60 * 1e3;
 function getSessionDir(cwd) {
   const cwdHash = (0, import_node_crypto3.createHash)("md5").update(cwd).digest("hex").slice(0, 8);
-  return (0, import_node_path3.join)(getXdgDataHome(), APP_DIR, "sessions", cwdHash);
+  return (0, import_node_path4.join)(getXdgDataHome(), APP_DIR, "sessions", cwdHash);
 }
 function getSessionFilePath(cwd, affinityId) {
   const sanitized = affinityId ? affinityId.replace(/[^a-zA-Z0-9_-]/g, "_") : void 0;
   const fileName = sanitized ? `${sanitized}.json` : "_default.json";
-  return (0, import_node_path3.join)(getSessionDir(cwd), fileName);
+  return (0, import_node_path4.join)(getSessionDir(cwd), fileName);
 }
 function persistSession(cwd, sessionId, affinityId) {
   try {
     const filePath = getSessionFilePath(cwd, affinityId);
-    const dir = (0, import_node_path3.join)(filePath, "..");
-    (0, import_node_fs3.mkdirSync)(dir, { recursive: true, mode: 448 });
+    const dir = (0, import_node_path4.join)(filePath, "..");
+    (0, import_node_fs4.mkdirSync)(dir, { recursive: true, mode: 448 });
     const data = {
       kiroSessionId: sessionId,
       lastUsed: Date.now()
     };
     const tmpPath = filePath + ".tmp";
-    (0, import_node_fs3.writeFileSync)(tmpPath, JSON.stringify(data), { mode: 384 });
-    (0, import_node_fs3.renameSync)(tmpPath, filePath);
+    (0, import_node_fs4.writeFileSync)(tmpPath, JSON.stringify(data), { mode: 384 });
+    (0, import_node_fs4.renameSync)(tmpPath, filePath);
   } catch {
   }
 }
 function clearPersistedSession(cwd, affinityId) {
   const filePath = getSessionFilePath(cwd, affinityId);
   try {
-    (0, import_node_fs3.unlinkSync)(filePath);
+    (0, import_node_fs4.unlinkSync)(filePath);
   } catch {
   }
 }
 function loadPersistedSession(cwd, affinityId) {
   try {
     const filePath = getSessionFilePath(cwd, affinityId);
-    const raw = (0, import_node_fs3.readFileSync)(filePath, "utf-8");
+    const raw = (0, import_node_fs4.readFileSync)(filePath, "utf-8");
     const data = JSON.parse(raw);
     if (Date.now() - data.lastUsed > SESSION_TTL_MS) return null;
     if (!data.kiroSessionId || typeof data.kiroSessionId !== "string") return null;
@@ -1745,8 +1808,8 @@ Please acknowledge this context and continue from where we left off.
       ...ipcSecret ? { ipcSecret } : {}
     };
     const tmpPath = toolsFilePath + ".tmp";
-    (0, import_node_fs4.writeFileSync)(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 384 });
-    (0, import_node_fs4.renameSync)(tmpPath, toolsFilePath);
+    (0, import_node_fs5.writeFileSync)(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 384 });
+    (0, import_node_fs5.renameSync)(tmpPath, toolsFilePath);
     return toolNames;
   }
   /**
@@ -1757,15 +1820,15 @@ Please acknowledge this context and continue from where we left off.
     const ipcPort = this.client.getIpcPort();
     if (ipcPort == null) return;
     try {
-      const raw = (0, import_node_fs4.readFileSync)(toolsFilePath, "utf-8");
+      const raw = (0, import_node_fs5.readFileSync)(toolsFilePath, "utf-8");
       const parsed = JSON.parse(raw);
       const ipcSecret = this.client.getIpcSecret();
       if (parsed.ipcPort === ipcPort && parsed.ipcSecret === ipcSecret) return;
       parsed.ipcPort = ipcPort;
       if (ipcSecret) parsed.ipcSecret = ipcSecret;
       const tmpPath = toolsFilePath + ".tmp";
-      (0, import_node_fs4.writeFileSync)(tmpPath, JSON.stringify(parsed, null, 2), { mode: 384 });
-      (0, import_node_fs4.renameSync)(tmpPath, toolsFilePath);
+      (0, import_node_fs5.writeFileSync)(tmpPath, JSON.stringify(parsed, null, 2), { mode: 384 });
+      (0, import_node_fs5.renameSync)(tmpPath, toolsFilePath);
     } catch {
     }
   }
@@ -2327,42 +2390,6 @@ function createKiroAcp(settings = {}) {
     return lastModel?.getTotalCredits() ?? 0;
   };
   return provider;
-}
-
-// src/kiro-auth.ts
-var import_node_fs5 = require("fs");
-var import_node_child_process2 = require("child_process");
-var import_node_os3 = require("os");
-var import_node_path4 = require("path");
-function verifyAuth() {
-  let installed = false;
-  let version;
-  try {
-    version = (0, import_node_child_process2.execFileSync)("kiro-cli", ["--version"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 5e3
-    }).toString().trim();
-    installed = true;
-  } catch {
-    return { installed: false, authenticated: false };
-  }
-  let authenticated = false;
-  try {
-    const output = (0, import_node_child_process2.execFileSync)("kiro-cli", ["whoami"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 1e4
-    }).toString();
-    authenticated = output.includes("Logged in");
-  } catch {
-  }
-  const tokenPath = (0, import_node_path4.join)((0, import_node_os3.homedir)(), ".aws", "sso", "cache", "kiro-auth-token.json");
-  const hasToken = (0, import_node_fs5.existsSync)(tokenPath);
-  return {
-    installed,
-    authenticated,
-    version,
-    tokenPath: hasToken ? tokenPath : void 0
-  };
 }
 
 // src/kiro-models.ts
