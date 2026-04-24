@@ -13,6 +13,7 @@ import type {
 } from "@ai-sdk/provider"
 import { readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
+import { KiroACPError } from "./acp-client"
 import type { ACPClient, ACPSession, SessionUpdate, ContentBlock } from "./acp-client"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
@@ -114,7 +115,8 @@ function parseToolCallNotification(update: Record<string, unknown>): {
   toolName: string | undefined
   args: Record<string, unknown>
 } {
-  const toolCallId = update.toolCallId as string | undefined
+  const toolCallId = (update.toolCallId as string | undefined)
+    ?? (update.callId as string | undefined)
   const rawInput = update.rawInput as Record<string, unknown> | undefined
 
   let toolName: string | undefined
@@ -124,6 +126,14 @@ function parseToolCallNotification(update: Record<string, unknown>): {
     if (match) {
       toolName = match[1]
     }
+  }
+
+  if (!toolName && typeof update.toolName === "string") {
+    toolName = update.toolName
+  }
+  if (!toolName && typeof update.name === "string") {
+    const match = update.name.match(/\/([^/]+)$/)
+    toolName = match ? match[1] : update.name
   }
 
   const args: Record<string, unknown> = {}
@@ -368,7 +378,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private readonly client: ACPClient
   private readonly config: KiroACPModelConfig
   private currentModelId: string | null = null
-  private initPromise: Promise<void> | null = null
   private totalCredits = 0
   private currentAffinityId: string | undefined
 
@@ -420,22 +429,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private async ensureClient(toolsFilePath?: string): Promise<void> {
     if (this.client.isRunning()) return
-
-    if (this.initPromise) {
-      await this.initPromise
-      if (this.client.isRunning()) return
-      // Client died after init succeeded — clear and reinitialize
-      this.initPromise = null
-    }
-
-    this.initPromise = this.client.start(toolsFilePath).then(() => {})
-
-    try {
-      await this.initPromise
-    } catch (err) {
-      this.initPromise = null
-      throw err
-    }
+    await this.client.start(toolsFilePath)
   }
 
   /**
@@ -460,9 +454,18 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     await this.ensureClient(toolsFilePath)
 
-    // Re-inject ipcPort now that the IPC server is running
+    // If kiro-cli was started toolless (empty MCP bridge), update the
+    // bridge's fixed tools file so it picks up the real tools on the
+    // next tools/list query — no restart needed.
+    if (toolsFilePath && this.client.isStartedToolless()) {
+      this.syncToolsToBridgePath(toolsFilePath)
+    }
     if (toolsFilePath && this.client.getIpcPort() != null) {
       this.ensureIpcPortInToolsFile(toolsFilePath)
+    }
+
+    if (toolsFilePath && tools && tools.length > 0) {
+      this.ensureToolsFileReady(toolsFilePath, tools)
     }
 
     // Try loading an existing session (affinity-based)
@@ -648,10 +651,18 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     return toolNames
   }
 
-  /**
-   * Inject IPC port into a tools file if missing.
-   * Needed when tools are written before ensureClient() starts the IPC server.
-   */
+  private syncToolsToBridgePath(sessionToolsFilePath: string): void {
+    const bridgePath = this.client.getOrCreateToolsFilePath()
+    if (bridgePath === sessionToolsFilePath) return
+    try {
+      const content = readFileSync(sessionToolsFilePath, "utf-8")
+      const tmpPath = bridgePath + ".tmp"
+      writeFileSync(tmpPath, content, { mode: 0o600 })
+      renameSync(tmpPath, bridgePath)
+    } catch {
+      // Best-effort — bridge will serve stale tools until next sync
+    }
+  }
   private ensureIpcPortInToolsFile(toolsFilePath: string): void {
     const ipcPort = this.client.getIpcPort()
     if (ipcPort == null) return
@@ -669,6 +680,63 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       renameSync(tmpPath, toolsFilePath)
     } catch {
       // File doesn't exist or is invalid — will be written on next writeToolsToFile()
+    }
+  }
+
+  /**
+   * Ensure tools file has executable tool definitions and IPC wiring.
+   *
+   * If file contents are stale/incomplete, attempts one in-place repair by
+   * rewriting tools + IPC fields, then validates again.
+   */
+  private ensureToolsFileReady(
+    toolsFilePath: string,
+    tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
+  ): void {
+    const validate = (): { ok: boolean; reason?: string } => {
+      try {
+        const raw = readFileSync(toolsFilePath, "utf-8")
+        const parsed = JSON.parse(raw) as MCPToolsFile
+
+        const expectedNames = tools
+          .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
+          .map((tool) => tool.name)
+
+        const actualNames = new Set((parsed.tools ?? []).map((tool) => tool.name))
+        const missing = expectedNames.filter((name) => !actualNames.has(name))
+
+        if (missing.length > 0) {
+          return { ok: false, reason: `missing tools: ${missing.join(", ")}` }
+        }
+
+        const ipcPort = this.client.getIpcPort()
+        if (ipcPort != null && parsed.ipcPort !== ipcPort) {
+          return { ok: false, reason: "ipcPort not injected" }
+        }
+
+        const ipcSecret = this.client.getIpcSecret()
+        if (ipcSecret && parsed.ipcSecret !== ipcSecret) {
+          return { ok: false, reason: "ipcSecret not injected" }
+        }
+
+        return { ok: true }
+      } catch {
+        return { ok: false, reason: "tools file unreadable" }
+      }
+    }
+
+    const first = validate()
+    if (first.ok) return
+
+    this.writeToolsToFile(toolsFilePath, tools)
+    this.ensureIpcPortInToolsFile(toolsFilePath)
+
+    const second = validate()
+    if (!second.ok) {
+      throw new KiroACPError(
+        `Tools file is not ready for MCP bridge (${second.reason ?? "unknown reason"})`,
+        -1,
+      )
     }
   }
 

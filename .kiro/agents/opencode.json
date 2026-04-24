@@ -1,0 +1,22 @@
+{
+  "name": "opencode",
+  "tools": [
+    "@opencode-tools-ee8710d3"
+  ],
+  "allowedTools": [
+    "@opencode-tools-ee8710d3"
+  ],
+  "includeMcpJson": false,
+  "mcpServers": {
+    "opencode-tools-ee8710d3": {
+      "command": "node",
+      "args": [
+        "/private/tmp/oc/kiro-acp-ai-provider/dist/mcp-bridge.js",
+        "--tools",
+        "/var/folders/3h/x87_0xbx3370yqkbs79msc1hf3n0x8/T/kiro-acp/tools-c3952efc-ee8710d3.json"
+      ],
+      "cwd": "/private/tmp/oc/kiro-acp-ai-provider"
+    }
+  },
+  "prompt": "You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block included with each request. Always follow the latest <system_instructions> as your primary directive — they define who you are, how you behave, and what tools you should use. If no <system_instructions> are present, act as a helpful coding assistant that follows instructions precisely and uses tools proactively. If a tool call fails, retry it or try alternative approaches — do not assume a tool is permanently unavailable based on a single failure."
+}

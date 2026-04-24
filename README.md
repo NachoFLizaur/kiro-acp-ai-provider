@@ -13,7 +13,7 @@ npm install kiro-acp-ai-provider @ai-sdk/provider ai
 - **Node.js 18+** or **Bun**
 - **kiro-cli** installed and authenticated:
   ```bash
-  kiro-cli auth login
+  kiro-cli login
   ```
 - **Kiro subscription** (Pro, Pro+, or Power)
 

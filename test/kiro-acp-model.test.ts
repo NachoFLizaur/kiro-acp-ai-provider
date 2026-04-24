@@ -10,7 +10,7 @@ import type {
   LanguageModelV3Prompt,
   LanguageModelV3FunctionTool,
 } from "@ai-sdk/provider"
-import { readFileSync, mkdirSync, existsSync } from "node:fs"
+import { readFileSync, mkdirSync, existsSync, mkdtempSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 
@@ -105,6 +105,11 @@ async function collectStream(
     parts.push(value)
   }
   return parts
+}
+
+/** Create a unique temporary directory for tools-file tests. */
+function createTempToolsDir(): string {
+  return mkdtempSync(join(tmpdir(), "kiro-acp-test-"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,7 +1324,7 @@ describe("KiroACPLanguageModel", () => {
 
   describe("writeToolsFile() — dynamic tool synchronization", () => {
     test("writes AI SDK function tools to the tools file in MCP format", async () => {
-      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      const toolsDir = createTempToolsDir()
       mkdirSync(toolsDir, { recursive: true })
       const toolsFile = join(toolsDir, "tools.json")
 
@@ -1404,7 +1409,7 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("skips provider tools and only syncs function tools", async () => {
-      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      const toolsDir = createTempToolsDir()
       mkdirSync(toolsDir, { recursive: true })
       const toolsFile = join(toolsDir, "tools.json")
 
@@ -1457,7 +1462,7 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("does not write tools file when no tools are provided", async () => {
-      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      const toolsDir = createTempToolsDir()
       mkdirSync(toolsDir, { recursive: true })
       const toolsFile = join(toolsDir, "tools.json")
 
@@ -1485,7 +1490,7 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("writes tools file even before client is started (lazy start)", async () => {
-      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      const toolsDir = createTempToolsDir()
       mkdirSync(toolsDir, { recursive: true })
       const toolsFile = join(toolsDir, "tools.json")
 
@@ -1534,7 +1539,7 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("uses empty string for missing tool description", async () => {
-      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      const toolsDir = createTempToolsDir()
       mkdirSync(toolsDir, { recursive: true })
       const toolsFile = join(toolsDir, "tools.json")
 
@@ -1579,7 +1584,7 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("writes a new tools file for each doStream call (no reuse)", async () => {
-      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      const toolsDir = createTempToolsDir()
       mkdirSync(toolsDir, { recursive: true })
 
       let callCount = 0
@@ -1642,7 +1647,7 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("does not call waitForToolsReady since each doStream creates a new session", async () => {
-      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      const toolsDir = createTempToolsDir()
       mkdirSync(toolsDir, { recursive: true })
 
       let fileCount = 0
@@ -1713,7 +1718,7 @@ describe("KiroACPLanguageModel", () => {
     })
 
     test("does not call waitForToolsReady when tools change but client is not running", async () => {
-      const toolsDir = join(tmpdir(), `kiro-acp-test-${Date.now()}`)
+      const toolsDir = createTempToolsDir()
       mkdirSync(toolsDir, { recursive: true })
       const toolsFile = join(toolsDir, "tools.json")
 
