@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync
 import { tmpdir } from "node:os"
 import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
+import { verifyAuth } from "./kiro-auth"
 import type { LaneRouter } from "./lane-router"
 import { verifyAuth } from "./kiro-auth"
 
@@ -226,6 +227,15 @@ export class ACPClient {
    */
   async start(toolsFilePath?: string): Promise<InitializeResult> {
     if (this.running) throw new KiroACPConnectionError("Client is already running")
+    this.stderrBuffer = ""
+
+    const authStatus = verifyAuth()
+    if (!authStatus.installed) {
+      throw new KiroACPConnectionError("`kiro-cli` is not installed or not available on PATH.")
+    }
+    if (!authStatus.authenticated) {
+      throw new KiroACPConnectionError("`kiro-cli` is not authenticated. Run `kiro-cli login` and retry.")
+    }
 
     // Validate cwd is an absolute path to an existing directory
     const cwd = this.options.cwd
@@ -285,9 +295,10 @@ export class ACPClient {
 
       const rejectPending = () => {
         for (const [id, pending] of this.pending) {
+          const detail = pending.method === "initialize" ? this.formatRecentStderr() : ""
           pending.reject(
             new KiroACPConnectionError(
-              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}`,
+              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}${detail}`,
             ),
           )
           clearTimeout(pending.timer ?? undefined)
@@ -305,7 +316,8 @@ export class ACPClient {
     this.process.on("error", (err) => {
       this.running = false
       for (const [id, pending] of this.pending) {
-        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}`))
+        const detail = pending.method === "initialize" ? this.formatRecentStderr() : ""
+        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}${detail}`))
         clearTimeout(pending.timer ?? undefined)
         this.pending.delete(id)
       }
@@ -927,7 +939,7 @@ export class ACPClient {
                 return
               }
             }
-            reject(new KiroACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1))
+            reject(this.createTimeoutError(method, timeoutMs))
           }, timeoutMs)
         : null
 
@@ -936,6 +948,23 @@ export class ACPClient {
       const line = JSON.stringify(request) + "\n"
       this.process!.stdin!.write(line)
     })
+  }
+
+  private createTimeoutError(method: string, timeoutMs: number): KiroACPError {
+    const parts = [`Request timed out after ${timeoutMs}ms: ${method}`]
+    if (method === "initialize") {
+      const detail = this.formatRecentStderr()
+      if (detail) {
+        parts.push(detail.trimStart())
+      }
+    }
+
+    return new KiroACPError(parts.join("\n\n"), -1)
+  }
+
+  private formatRecentStderr(): string {
+    const stderr = this.stderrBuffer.trim()
+    return stderr ? `\n\nkiro-cli stderr:\n${stderr}` : ""
   }
 
   private sendNotification(method: string, params: unknown): void {
