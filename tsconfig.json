@@ -9,6 +9,7 @@
     "declaration": true,
     "outDir": "dist",
     "rootDir": "src",
+    "resolveJsonModule": true,
     "skipLibCheck": true,
     "types": ["bun-types"]
   },

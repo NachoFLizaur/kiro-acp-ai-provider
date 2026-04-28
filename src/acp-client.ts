@@ -5,10 +5,12 @@ import { fileURLToPath } from "node:url"
 import { dirname, join, isAbsolute } from "node:path"
 import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
+import { getXdgDataHome } from "./session-storage"
 import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 import { verifyAuth } from "./kiro-auth"
+import { MCP_BRIDGE_SOURCE } from "./mcp-bridge-source"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -200,6 +202,8 @@ export class ACPClient {
    */
   private readonly instanceId = randomBytes(4).toString("hex")
 
+  private resolvedBridgePath?: string
+
   private readonly sessionToolsFiles = new Set<string>()
 
   /**
@@ -243,8 +247,6 @@ export class ACPClient {
 
     if (this.options.agent) {
       this.setupAgentConfig(toolsFilePath)
-      // Clean up stale agent config files from crashed processes
-      this.cleanupStaleAgentConfigs()
     }
 
     // Ensure MCP tool timeout is sufficient for long-running subagent tasks.
@@ -289,7 +291,7 @@ export class ACPClient {
 
       const rejectPending = () => {
         for (const [id, pending] of this.pending) {
-          const detail = pending.method === "initialize" ? this.formatRecentStderr() : ""
+          const detail = (pending.method === "initialize" || pending.method === "session/new") ? this.formatRecentStderr() : ""
           pending.reject(
             new KiroACPConnectionError(
               `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}${detail}`,
@@ -310,7 +312,7 @@ export class ACPClient {
     this.process.on("error", (err) => {
       this.running = false
       for (const [id, pending] of this.pending) {
-        const detail = pending.method === "initialize" ? this.formatRecentStderr() : ""
+        const detail = (pending.method === "initialize" || pending.method === "session/new") ? this.formatRecentStderr() : ""
         pending.reject(new KiroACPConnectionError(`Process error: ${err.message}${detail}`))
         clearTimeout(pending.timer ?? undefined)
         this.pending.delete(id)
@@ -399,13 +401,6 @@ export class ACPClient {
       }
     }
     this.sessionToolsFiles.clear()
-
-    // Remove our per-instance agent config file
-    if (this.options.agent) {
-      const safeName = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_")
-      const configPath = join(this.options.cwd, ".kiro", "agents", `${safeName}-${this.instanceId}.json`)
-      try { unlinkSync(configPath) } catch { /* already gone */ }
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -729,35 +724,6 @@ export class ACPClient {
   }
 
   // -------------------------------------------------------------------------
-  // Internal: Agent config cleanup
-  // -------------------------------------------------------------------------
-
-  /**
-   * Remove stale per-instance agent config files left by crashed processes.
-   * Only removes files matching the `{sanitizedAgent}-*.json` pattern that
-   * are older than 1 hour and don't belong to this instance.
-   */
-  private cleanupStaleAgentConfigs(): void {
-    if (!this.options.agent) return
-    const sanitizedAgent = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_")
-    const agentsDir = join(this.options.cwd, ".kiro", "agents")
-    try {
-      const prefix = `${sanitizedAgent}-`
-      const ownFile = `${sanitizedAgent}-${this.instanceId}.json`
-      for (const entry of readdirSync(agentsDir)) {
-        if (entry.startsWith(prefix) && entry !== ownFile) {
-          const fullPath = join(agentsDir, entry)
-          const stat = statSync(fullPath)
-          // Only clean up files older than 1 hour
-          if (Date.now() - stat.mtimeMs > 3_600_000) {
-            unlinkSync(fullPath)
-          }
-        }
-      }
-    } catch { /* best-effort */ }
-  }
-
-  // -------------------------------------------------------------------------
   // Internal: Agent config setup
   // -------------------------------------------------------------------------
 
@@ -817,18 +783,51 @@ export class ACPClient {
   }
 
   /**
+   * Walk up parent directories from `startDir`, checking for mcp-bridge.js
+   * in node_modules (both standard and Bun's .bun cache).
+   */
+  private findBridgeInAncestors(startDir: string, maxDepth = 10): string | undefined {
+    let dir = startDir
+    for (let i = 0; i < maxDepth; i++) {
+      const candidate = join(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
+      if (existsSync(candidate)) return candidate
+
+      const bunDir = join(dir, "node_modules", ".bun")
+      if (existsSync(bunDir)) {
+        try {
+          for (const entry of readdirSync(bunDir)) {
+            if (entry.includes("kiro-acp-ai-provider")) {
+              const cached = join(bunDir, entry, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
+              if (existsSync(cached)) return cached
+            }
+          }
+        } catch { /* ignore */ }
+      }
+
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+    return undefined
+  }
+
+  /**
    * Resolve the MCP bridge script to a real filesystem path.
    *
    * Handles: dev symlinks, npm/bun installs, Bun-compiled binaries
-   * (virtual /$bunfs paths), .bun cache, and ancestor node_modules.
+   * (virtual /$bunfs paths), .bun cache, ancestor node_modules, and
+   * XDG extraction for compiled binaries.
    */
   private resolveBridgePath(): string {
+    if (this.resolvedBridgePath) return this.resolvedBridgePath
+
     // Strategy 1: Direct path next to this module (dev with file: symlink)
     try {
       if (typeof import.meta?.url === "string" && import.meta.url) {
         const currentDir = dirname(fileURLToPath(import.meta.url))
         const directPath = join(currentDir, "mcp-bridge.js")
         if (!directPath.includes("$bunfs") && existsSync(directPath)) {
+          this.resolvedBridgePath = directPath
           return directPath
         }
       }
@@ -840,7 +839,10 @@ export class ACPClient {
     const nmBase = join(this.options.cwd, "node_modules")
 
     const directNm = join(nmBase, "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
-    if (existsSync(directNm)) return directNm
+    if (existsSync(directNm)) {
+      this.resolvedBridgePath = directNm
+      return directNm
+    }
 
     // Check bun's .bun cache
     const bunDir = join(nmBase, ".bun")
@@ -857,7 +859,10 @@ export class ACPClient {
               "dist",
               "mcp-bridge.js",
             )
-            if (existsSync(cached)) return cached
+            if (existsSync(cached)) {
+              this.resolvedBridgePath = cached
+              return cached
+            }
           }
         }
       } catch {
@@ -866,73 +871,45 @@ export class ACPClient {
     }
 
     // Strategy 3: Walk up from cwd
-    let searchDir = this.options.cwd
-    for (let i = 0; i < 10; i++) {
-      const candidate = join(searchDir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
-      if (existsSync(candidate)) return candidate
-
-      const ancestorBunDir = join(searchDir, "node_modules", ".bun")
-      if (existsSync(ancestorBunDir)) {
-        try {
-          for (const entry of readdirSync(ancestorBunDir)) {
-            if (entry.includes("kiro-acp-ai-provider")) {
-              const cached = join(
-                ancestorBunDir,
-                entry,
-                "node_modules",
-                "kiro-acp-ai-provider",
-                "dist",
-                "mcp-bridge.js",
-              )
-              if (existsSync(cached)) return cached
-            }
-          }
-        } catch {
-          // Ignore
-        }
-      }
-
-      const parent = dirname(searchDir)
-      if (parent === searchDir) break
-      searchDir = parent
+    const fromCwd = this.findBridgeInAncestors(this.options.cwd)
+    if (fromCwd) {
+      this.resolvedBridgePath = fromCwd
+      return fromCwd
     }
 
     // Strategy 4: Relative to binary/executable path
     const binDir = dirname(process.argv[0] || "")
     if (binDir) {
-      let dir = binDir
-      for (let i = 0; i < 10; i++) {
-        const candidate = join(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
-        if (existsSync(candidate)) return candidate
-
-        const binBunDir = join(dir, "node_modules", ".bun")
-        if (existsSync(binBunDir)) {
-          try {
-            for (const entry of readdirSync(binBunDir)) {
-              if (entry.includes("kiro-acp-ai-provider")) {
-                const cached = join(
-                  binBunDir,
-                  entry,
-                  "node_modules",
-                  "kiro-acp-ai-provider",
-                  "dist",
-                  "mcp-bridge.js",
-                )
-                if (existsSync(cached)) return cached
-              }
-            }
-          } catch {
-            // Ignore
-          }
-        }
-
-        const parent = dirname(dir)
-        if (parent === dir) break
-        dir = parent
+      const fromBin = this.findBridgeInAncestors(binDir)
+      if (fromBin) {
+        this.resolvedBridgePath = fromBin
+        return fromBin
       }
     }
 
-    // No fallback to shared temp directory — prevents executing potentially tampered code
+    // Strategy 5: Extract embedded bridge to XDG data directory (compiled binary)
+    if (MCP_BRIDGE_SOURCE) {
+      const dataDir = getXdgDataHome()
+      const bridgeDir = join(dataDir, "kiro-acp-ai-provider")
+      const bridgePath = join(bridgeDir, "mcp-bridge.js")
+
+      if (existsSync(bridgePath)) {
+        try {
+          if (readFileSync(bridgePath, "utf-8") === MCP_BRIDGE_SOURCE) {
+            this.resolvedBridgePath = bridgePath
+            return bridgePath
+          }
+        } catch { /* re-extract below */ }
+      }
+
+      mkdirSync(bridgeDir, { recursive: true, mode: 0o700 })
+      const tmpPath = `${bridgePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
+      writeFileSync(tmpPath, MCP_BRIDGE_SOURCE, { mode: 0o600, flag: "wx" })
+      renameSync(tmpPath, bridgePath)
+
+      this.resolvedBridgePath = bridgePath
+      return bridgePath
+    }
 
     throw new KiroACPConnectionError(
       "Could not find mcp-bridge.js. Ensure kiro-acp-ai-provider is installed.",
