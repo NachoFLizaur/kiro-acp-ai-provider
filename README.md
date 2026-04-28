@@ -5,15 +5,20 @@
 ## Install
 
 ```bash
-npm install kiro-acp-ai-provider @ai-sdk/provider ai
+npm install kiro-acp-ai-provider @ai-sdk/provider
 ```
+
+> **Note**: Your application also needs the `ai` package (Vercel AI SDK) — install it separately if you haven't already:
+> ```bash
+> npm install ai
+> ```
 
 ## Prerequisites
 
 - **Node.js 18+** or **Bun**
 - **kiro-cli** installed and authenticated:
   ```bash
-  kiro-cli auth login
+  kiro-cli login
   ```
 - **Kiro subscription** (Pro, Pro+, or Power)
 
@@ -52,10 +57,12 @@ The provider translates AI SDK calls into ACP messages sent to a `kiro-cli` subp
 ```typescript
 const kiro = createKiroAcp({
   cwd: "/path/to/project",        // Working directory (default: process.cwd())
+  model: "claude-sonnet-4.6",     // Default model ID
   agent: "my-agent",              // Custom agent name (--agent flag)
   trustAllTools: true,            // Auto-approve all tool calls
   agentPrompt: "You are a ...",   // Custom system prompt
   contextWindow: 200_000,         // Max context window in tokens (default: 1_000_000)
+  mcpTimeout: 30,                 // MCP tool call timeout in minutes (default: 30)
   sessionId: "previous-id",       // Resume an existing session
   env: { MY_VAR: "value" },       // Extra env vars for kiro-cli
   clientInfo: { name: "my-app", version: "1.0.0" },
