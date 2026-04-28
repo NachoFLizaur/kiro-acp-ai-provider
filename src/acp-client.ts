@@ -202,6 +202,16 @@ export class ACPClient {
    */
   private readonly instanceId = randomBytes(4).toString("hex")
 
+  /**
+   * The unique agent name including the instanceId suffix. Used as the `name`
+   * field inside the agent config JSON so that kiro-cli doesn't confuse
+   * sessions from different instances sharing the same working directory.
+   */
+  private get uniqueAgentName(): string {
+    const sanitizedAgent = this.options.agent!.replace(/[^a-zA-Z0-9_-]/g, "_")
+    return `${sanitizedAgent}-${this.instanceId}`
+  }
+
   private resolvedBridgePath?: string
 
   private readonly sessionToolsFiles = new Set<string>()
@@ -262,9 +272,7 @@ export class ACPClient {
 
     const args = ["acp"]
     if (this.options.agent) {
-      const sanitizedAgent = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_")
-      const uniqueAgent = `${sanitizedAgent}-${this.instanceId}`
-      args.push("--agent", uniqueAgent)
+      args.push("--agent", this.uniqueAgentName)
     }
     if (this.options.trustAllTools) args.push("--trust-all-tools")
 
@@ -640,7 +648,7 @@ export class ACPClient {
       if (this.options.agent) {
         const bridgePath = this.resolveBridgePath()
         const config = generateAgentConfig({
-          name: this.options.agent,
+          name: this.uniqueAgentName,
           mcpBridgePath: bridgePath,
           toolsFilePath,
           cwd: this.options.cwd,
@@ -772,7 +780,7 @@ export class ACPClient {
     }
 
     const config = generateAgentConfig({
-      name: this.options.agent,
+      name: this.uniqueAgentName,
       mcpBridgePath: bridgePath,
       toolsFilePath: toolsFile,
       cwd: this.options.cwd,
