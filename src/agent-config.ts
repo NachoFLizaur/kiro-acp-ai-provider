@@ -1,4 +1,5 @@
 import { mkdirSync, writeFileSync, renameSync } from "node:fs"
+import { randomBytes } from "node:crypto"
 import { join, dirname, basename } from "node:path"
 
 // ---------------------------------------------------------------------------
@@ -87,13 +88,15 @@ export function writeAgentConfig(
   dir: string,
   name: string,
   config: Record<string, unknown>,
+  instanceId?: string,
 ): string {
   const safeName = sanitizeName(name)
+  const suffix = instanceId ? `-${instanceId}` : ""
   const agentsDir = join(dir, ".kiro", "agents")
-  const filePath = join(agentsDir, `${safeName}.json`)
+  const filePath = join(agentsDir, `${safeName}${suffix}.json`)
 
   mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 })
-  const tmpPath = filePath + ".tmp"
+  const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
   writeFileSync(tmpPath, JSON.stringify(config, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 })
   renameSync(tmpPath, filePath)
 

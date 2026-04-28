@@ -1,5 +1,5 @@
 import { writeFileSync, readFileSync, mkdirSync, renameSync, unlinkSync } from "node:fs"
-import { createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { join } from "node:path"
 import { homedir } from "node:os"
 
@@ -16,8 +16,10 @@ export interface PersistedSession {
 // XDG base path
 // ---------------------------------------------------------------------------
 
-function getXdgDataHome(): string {
-  return process.env.XDG_DATA_HOME || join(homedir(), ".local", "share")
+export function getXdgDataHome(): string {
+  if (process.env.XDG_DATA_HOME) return process.env.XDG_DATA_HOME
+  if (process.platform === "win32" && process.env.LOCALAPPDATA) return process.env.LOCALAPPDATA
+  return join(homedir(), ".local", "share")
 }
 
 // ---------------------------------------------------------------------------
@@ -52,7 +54,7 @@ export function persistSession(cwd: string, sessionId: string, affinityId?: stri
       kiroSessionId: sessionId,
       lastUsed: Date.now(),
     }
-    const tmpPath = filePath + ".tmp"
+    const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
     writeFileSync(tmpPath, JSON.stringify(data), { mode: 0o600 })
     renameSync(tmpPath, filePath)
   } catch {

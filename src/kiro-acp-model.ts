@@ -13,7 +13,7 @@ import type {
 } from "@ai-sdk/provider"
 import { readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
-import type { ACPClient, ACPSession, SessionUpdate, ContentBlock } from "./acp-client"
+import { KiroACPError, type ACPClient, type ACPSession, type SessionUpdate, type ContentBlock } from "./acp-client"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
@@ -109,14 +109,18 @@ export interface KiroACPModelConfig {
  * Internal kiro-cli fields (like `__tool_use_purpose`) are stripped
  * for correlation matching against IPC calls.
  */
-function parseToolCallNotification(update: Record<string, unknown>): {
+export function parseToolCallNotification(update: Record<string, unknown>): {
   toolCallId: string | undefined
   toolName: string | undefined
   args: Record<string, unknown>
 } {
-  const toolCallId = update.toolCallId as string | undefined
+  // Tool call ID: prefer toolCallId, fall back to callId
+  const toolCallId = (update.toolCallId as string | undefined)
+    ?? (update.callId as string | undefined)
+
   const rawInput = update.rawInput as Record<string, unknown> | undefined
 
+  // Tool name: prefer title (Running: @source/name), fall back to toolName, then name
   let toolName: string | undefined
   const title = update.title as string | undefined
   if (title) {
@@ -124,6 +128,17 @@ function parseToolCallNotification(update: Record<string, unknown>): {
     if (match) {
       toolName = match[1]
     }
+  }
+
+  // Fallback: direct toolName field
+  if (!toolName && typeof update.toolName === "string") {
+    toolName = update.toolName
+  }
+
+  // Fallback: name field (may be a path like "@server/tool" — extract last segment)
+  if (!toolName && typeof update.name === "string") {
+    const match = update.name.match(/\/([^/]+)$/)
+    toolName = match ? match[1] : update.name
   }
 
   const args: Record<string, unknown> = {}
@@ -465,6 +480,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       this.ensureIpcPortInToolsFile(toolsFilePath)
     }
 
+    // Validate the tools file has all expected definitions and correct IPC wiring
+    if (toolsFilePath && tools && tools.length > 0) {
+      this.ensureToolsFileReady(toolsFilePath, tools)
+    }
+
     // Try loading an existing session (affinity-based)
     if (this.currentAffinityId) {
       if (this.config.sessionId) {
@@ -642,7 +662,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       ...(ipcPort != null ? { ipcPort } : {}),
       ...(ipcSecret ? { ipcSecret } : {}),
     }
-    const tmpPath = toolsFilePath + ".tmp"
+    const tmpPath = `${toolsFilePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
     writeFileSync(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
     renameSync(tmpPath, toolsFilePath)
     return toolNames
@@ -664,11 +684,66 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
       parsed.ipcPort = ipcPort
       if (ipcSecret) parsed.ipcSecret = ipcSecret
-      const tmpPath = toolsFilePath + ".tmp"
+      const tmpPath = `${toolsFilePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
       writeFileSync(tmpPath, JSON.stringify(parsed, null, 2), { mode: 0o600 })
       renameSync(tmpPath, toolsFilePath)
     } catch {
       // File doesn't exist or is invalid — will be written on next writeToolsToFile()
+    }
+  }
+
+  /**
+   * Validate the tools file has all expected tool definitions and correct IPC wiring.
+   * If stale or incomplete, attempts one repair by rewriting, then validates again.
+   */
+  private ensureToolsFileReady(
+    toolsFilePath: string,
+    tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
+  ): void {
+    const validate = (): { ok: boolean; reason?: string } => {
+      try {
+        const raw = readFileSync(toolsFilePath, "utf-8")
+        const parsed = JSON.parse(raw) as MCPToolsFile
+
+        const expectedNames = tools
+          .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
+          .map((tool) => tool.name)
+
+        const actualNames = new Set((parsed.tools ?? []).map((tool) => tool.name))
+        const missing = expectedNames.filter((name) => !actualNames.has(name))
+
+        if (missing.length > 0) {
+          return { ok: false, reason: `missing tools: ${missing.join(", ")}` }
+        }
+
+        const ipcPort = this.client.getIpcPort()
+        if (ipcPort != null && parsed.ipcPort !== ipcPort) {
+          return { ok: false, reason: "ipcPort mismatch" }
+        }
+
+        const ipcSecret = this.client.getIpcSecret()
+        if (ipcSecret && parsed.ipcSecret !== ipcSecret) {
+          return { ok: false, reason: "ipcSecret mismatch" }
+        }
+
+        return { ok: true }
+      } catch {
+        return { ok: false, reason: "tools file unreadable" }
+      }
+    }
+
+    const first = validate()
+    if (first.ok) return
+
+    // One repair attempt — rewrite the entire file
+    this.writeToolsToFile(toolsFilePath, tools)
+
+    const second = validate()
+    if (!second.ok) {
+      throw new KiroACPError(
+        `Tools file is not ready for MCP bridge (${second.reason ?? "unknown reason"})`,
+        -1,
+      )
     }
   }
 
@@ -849,7 +924,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * backed by its own ACPClient (separate kiro-cli process).
    *
    * The isolated client is reused across turns for the same affinityId
-   * (tool call → tool result → continuation) and cleaned up after 60s idle.
+   * (tool call → tool result → continuation) and cleaned up after 3 minutes idle.
    */
   private async doStreamIsolated(
     options: LanguageModelV3CallOptions,

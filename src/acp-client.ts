@@ -226,6 +226,7 @@ export class ACPClient {
    */
   async start(toolsFilePath?: string): Promise<InitializeResult> {
     if (this.running) throw new KiroACPConnectionError("Client is already running")
+    this.stderrBuffer = ""
 
     // Validate cwd is an absolute path to an existing directory
     const cwd = this.options.cwd
@@ -242,6 +243,8 @@ export class ACPClient {
 
     if (this.options.agent) {
       this.setupAgentConfig(toolsFilePath)
+      // Clean up stale agent config files from crashed processes
+      this.cleanupStaleAgentConfigs()
     }
 
     // Ensure MCP tool timeout is sufficient for long-running subagent tasks.
@@ -258,7 +261,8 @@ export class ACPClient {
     const args = ["acp"]
     if (this.options.agent) {
       const sanitizedAgent = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_")
-      args.push("--agent", sanitizedAgent)
+      const uniqueAgent = `${sanitizedAgent}-${this.instanceId}`
+      args.push("--agent", uniqueAgent)
     }
     if (this.options.trustAllTools) args.push("--trust-all-tools")
 
@@ -285,9 +289,10 @@ export class ACPClient {
 
       const rejectPending = () => {
         for (const [id, pending] of this.pending) {
+          const detail = pending.method === "initialize" ? this.formatRecentStderr() : ""
           pending.reject(
             new KiroACPConnectionError(
-              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}`,
+              `Process exited (code=${code}, signal=${signal}) while waiting for ${pending.method}${detail}`,
             ),
           )
           clearTimeout(pending.timer ?? undefined)
@@ -305,7 +310,8 @@ export class ACPClient {
     this.process.on("error", (err) => {
       this.running = false
       for (const [id, pending] of this.pending) {
-        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}`))
+        const detail = pending.method === "initialize" ? this.formatRecentStderr() : ""
+        pending.reject(new KiroACPConnectionError(`Process error: ${err.message}${detail}`))
         clearTimeout(pending.timer ?? undefined)
         this.pending.delete(id)
       }
@@ -393,6 +399,13 @@ export class ACPClient {
       }
     }
     this.sessionToolsFiles.clear()
+
+    // Remove our per-instance agent config file
+    if (this.options.agent) {
+      const safeName = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_")
+      const configPath = join(this.options.cwd, ".kiro", "agents", `${safeName}-${this.instanceId}.json`)
+      try { unlinkSync(configPath) } catch { /* already gone */ }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -531,6 +544,22 @@ export class ACPClient {
     return this.stderrBuffer
   }
 
+  private formatRecentStderr(): string {
+    const stderr = this.stderrBuffer.trim()
+    return stderr ? `\n\nkiro-cli stderr:\n${stderr}` : ""
+  }
+
+  private createTimeoutError(method: string, timeoutMs: number): KiroACPError {
+    const parts = [`Request timed out after ${timeoutMs}ms: ${method}`]
+    if (method === "initialize" || method === "session/new") {
+      const detail = this.formatRecentStderr()
+      if (detail) {
+        parts.push(detail.trimStart())
+      }
+    }
+    return new KiroACPError(parts.join("\n\n"), -1)
+  }
+
   getCwd(): string {
     return this.options.cwd
   }
@@ -622,7 +651,7 @@ export class ACPClient {
           cwd: this.options.cwd,
           prompt: this.options.agentPrompt,
         })
-        writeAgentConfig(this.options.cwd, this.options.agent, config)
+        writeAgentConfig(this.options.cwd, this.options.agent, config, this.instanceId)
       }
 
       return await this.sendNewSession()
@@ -700,6 +729,35 @@ export class ACPClient {
   }
 
   // -------------------------------------------------------------------------
+  // Internal: Agent config cleanup
+  // -------------------------------------------------------------------------
+
+  /**
+   * Remove stale per-instance agent config files left by crashed processes.
+   * Only removes files matching the `{sanitizedAgent}-*.json` pattern that
+   * are older than 1 hour and don't belong to this instance.
+   */
+  private cleanupStaleAgentConfigs(): void {
+    if (!this.options.agent) return
+    const sanitizedAgent = this.options.agent.replace(/[^a-zA-Z0-9_-]/g, "_")
+    const agentsDir = join(this.options.cwd, ".kiro", "agents")
+    try {
+      const prefix = `${sanitizedAgent}-`
+      const ownFile = `${sanitizedAgent}-${this.instanceId}.json`
+      for (const entry of readdirSync(agentsDir)) {
+        if (entry.startsWith(prefix) && entry !== ownFile) {
+          const fullPath = join(agentsDir, entry)
+          const stat = statSync(fullPath)
+          // Only clean up files older than 1 hour
+          if (Date.now() - stat.mtimeMs > 3_600_000) {
+            unlinkSync(fullPath)
+          }
+        }
+      }
+    } catch { /* best-effort */ }
+  }
+
+  // -------------------------------------------------------------------------
   // Internal: Agent config setup
   // -------------------------------------------------------------------------
 
@@ -725,7 +783,7 @@ export class ACPClient {
           if (parsed.ipcPort !== this.ipcPort || (secret && parsed.ipcSecret !== secret)) {
             ;(parsed as Record<string, unknown>).ipcPort = this.ipcPort
             if (secret) (parsed as Record<string, unknown>).ipcSecret = secret
-            const tmpPath = toolsFile + ".tmp"
+            const tmpPath = `${toolsFile}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
             writeFileSync(tmpPath, JSON.stringify(parsed, null, 2), { mode: 0o600 })
             renameSync(tmpPath, toolsFile)
           }
@@ -742,7 +800,7 @@ export class ACPClient {
         ...(this.ipcPort != null ? { ipcPort: this.ipcPort } : {}),
         ...(secret ? { ipcSecret: secret } : {}),
       }
-      const tmpPath = toolsFile + ".tmp"
+      const tmpPath = `${toolsFile}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
       writeFileSync(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
       renameSync(tmpPath, toolsFile)
     }
@@ -755,7 +813,7 @@ export class ACPClient {
       prompt: this.options.agentPrompt,
     })
 
-    writeAgentConfig(this.options.cwd, this.options.agent!, config)
+    writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
   }
 
   /**
@@ -916,7 +974,7 @@ export class ACPClient {
                 return
               }
             }
-            reject(new KiroACPError(`Request timed out after ${timeoutMs}ms: ${method}`, -1))
+            reject(this.createTimeoutError(method, timeoutMs))
           }, timeoutMs)
         : null
 
