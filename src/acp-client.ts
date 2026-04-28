@@ -568,7 +568,8 @@ export class ACPClient {
   }
 
   getAgentName(): string | undefined {
-    return this.options.agent
+    if (!this.options.agent) return undefined
+    return this.uniqueAgentName
   }
 
   /** Return a copy of the construction options (for cloning). */
