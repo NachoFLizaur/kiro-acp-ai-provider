@@ -77,6 +77,13 @@ describe("stderr diagnostics", () => {
     expect(error.message).not.toContain("kiro-cli stderr:")
   })
 
+  // NOTE: The exit/error handlers in ACPClient (handleProcessExit, handleProcessError)
+  // also include stderr for connection-phase methods (initialize, session/new).
+  // These handlers are difficult to unit test because they require a real spawned
+  // child process to emit 'exit' or 'error' events. The timeout path tested above
+  // exercises the same formatRecentStderr() + method-gating logic, providing
+  // equivalent coverage of the stderr-inclusion decision.
+
   test("stderrBuffer is reset on start", async () => {
     // Arrange: use a non-existent absolute path so start() fails early
     // (after resetting the buffer but before spawning kiro-cli)
