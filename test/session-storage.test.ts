@@ -1,8 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test"
 import { mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
-import { tmpdir } from "node:os"
-import { getSessionFilePath, persistSession, loadPersistedSession } from "../src/session-storage"
+import { tmpdir, homedir } from "node:os"
+import { getSessionFilePath, persistSession, loadPersistedSession, getXdgDataHome } from "../src/session-storage"
 
 describe("session-storage", () => {
   let testDir: string
@@ -165,5 +165,86 @@ describe("session-storage", () => {
     expect(path1).not.toBe(path2)
     expect(path1).toContain("affinity-a.json")
     expect(path2).toContain("affinity-b.json")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 03: XDG Windows fallback — getXdgDataHome() tests
+// ---------------------------------------------------------------------------
+
+describe("getXdgDataHome", () => {
+  let originalXdgDataHome: string | undefined
+  let originalLocalAppData: string | undefined
+
+  beforeEach(() => {
+    originalXdgDataHome = process.env.XDG_DATA_HOME
+    originalLocalAppData = process.env.LOCALAPPDATA
+  })
+
+  afterEach(() => {
+    // Restore env vars
+    if (originalXdgDataHome !== undefined) {
+      process.env.XDG_DATA_HOME = originalXdgDataHome
+    } else {
+      delete process.env.XDG_DATA_HOME
+    }
+    if (originalLocalAppData !== undefined) {
+      process.env.LOCALAPPDATA = originalLocalAppData
+    } else {
+      delete process.env.LOCALAPPDATA
+    }
+  })
+
+  test("getXdgDataHome returns XDG_DATA_HOME when set", () => {
+    // Arrange
+    process.env.XDG_DATA_HOME = "/custom/data/home"
+
+    // Act
+    const result = getXdgDataHome()
+
+    // Assert
+    expect(result).toBe("/custom/data/home")
+  })
+
+  test("getXdgDataHome returns LOCALAPPDATA on Windows when XDG_DATA_HOME is unset", () => {
+    // Arrange
+    delete process.env.XDG_DATA_HOME
+    process.env.LOCALAPPDATA = "C:\\Users\\testuser\\AppData\\Local"
+
+    // Act & Assert
+    // We can't mock process.platform in Bun, so we test the logic:
+    // - If XDG_DATA_HOME is set, it takes priority (tested above)
+    // - If platform is win32 AND LOCALAPPDATA is set, it returns LOCALAPPDATA
+    // - Otherwise, it returns ~/.local/share
+    //
+    // On non-Windows (where this test runs), LOCALAPPDATA won't be used
+    // because process.platform !== "win32". We verify the env var is set
+    // and the function returns the correct fallback for the current platform.
+    const result = getXdgDataHome()
+
+    if (process.platform === "win32") {
+      expect(result).toBe("C:\\Users\\testuser\\AppData\\Local")
+    } else {
+      // On non-Windows, LOCALAPPDATA is ignored — falls through to default
+      expect(result).toBe(join(homedir(), ".local", "share"))
+    }
+  })
+
+  test("getXdgDataHome returns ~/.local/share as default", () => {
+    // Arrange
+    delete process.env.XDG_DATA_HOME
+    delete process.env.LOCALAPPDATA
+
+    // Act
+    const result = getXdgDataHome()
+
+    // Assert
+    expect(result).toBe(join(homedir(), ".local", "share"))
+  })
+
+  test("getXdgDataHome is exported", () => {
+    // Assert — the function is importable and callable
+    expect(typeof getXdgDataHome).toBe("function")
+    expect(getXdgDataHome()).toBeTruthy()
   })
 })
