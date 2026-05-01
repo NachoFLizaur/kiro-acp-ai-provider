@@ -434,13 +434,26 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * If initialization fails, subsequent calls will retry.
    */
   private async ensureClient(toolsFilePath?: string): Promise<void> {
-    if (this.client.isRunning()) return
+    // If client was started without tools (e.g., title generation) and now
+    // we have tools, restart it so the MCP bridge gets the correct config.
+    if (this.client.isRunning() && toolsFilePath && this.client.startedToolless) {
+      await this.client.stop()
+      this.client.startedToolless = false
+      this.initPromise = null
+      // Fall through to start with tools
+    } else if (this.client.isRunning()) {
+      return
+    }
 
     if (this.initPromise) {
       await this.initPromise
       if (this.client.isRunning()) return
       // Client died after init succeeded — clear and reinitialize
       this.initPromise = null
+    }
+
+    if (!toolsFilePath) {
+      this.client.startedToolless = true
     }
 
     this.initPromise = this.client.start(toolsFilePath).then(() => {})
@@ -888,7 +901,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     const isChild = typeof options.headers?.["x-parent-session-id"] === "string"
     const hasTools = (options.tools ?? []).length > 0
-
     // Subagent with tools → use isolated client (separate kiro-cli process)
     // to prevent tool leakage from the parent session.
     if (isChild && hasTools && affinityId) {

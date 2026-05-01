@@ -189,6 +189,7 @@ export class ACPClient {
   private readonly metadata = new Map<string, SessionMetadata>()
   private readonly promptCallbacks = new Map<string, (update: SessionUpdate) => void>()
   private running = false
+  startedToolless = false
   private stderrBuffer = ""
   private toolsFilePath: string | null = null
   private ipcServer: IPCServer | null = null
@@ -767,17 +768,14 @@ export class ACPClient {
         }
       }
     } else {
-      toolsFile = this.getOrCreateToolsFilePath()
-      const secret = this.ipcServer?.getSecret()
-      const toolsData = {
-        tools: [],
-        cwd: this.options.cwd,
-        ...(this.ipcPort != null ? { ipcPort: this.ipcPort } : {}),
-        ...(secret ? { ipcSecret: secret } : {}),
-      }
-      const tmpPath = `${toolsFile}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
-      writeFileSync(tmpPath, JSON.stringify(toolsData, null, 2), { mode: 0o600 })
-      renameSync(tmpPath, toolsFile)
+      // No tools provided (e.g., title generation call) — write a toolless config
+      // so kiro-cli doesn't spawn a dead MCP bridge that blocks later tool loading.
+      const config = generateToollessAgentConfig({
+        name: this.uniqueAgentName,
+        prompt: this.options.agentPrompt,
+      })
+      writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
+      return // Early return — no MCP bridge needed for toolless startup
     }
 
     const config = generateAgentConfig({
