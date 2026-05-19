@@ -19,14 +19,14 @@ function makeTempDir(): string {
   return dir
 }
 
-/** Create a fake mcp-bridge.js at the standard node_modules path. */
+/** Create a fake mcp-bridge.mjs at the standard node_modules path. */
 function plantBridge(baseDir: string): string {
   const bridgePath = join(
     baseDir,
     "node_modules",
     "kiro-acp-ai-provider",
     "dist",
-    "mcp-bridge.js",
+    "mcp-bridge.mjs",
   )
   mkdirSync(join(baseDir, "node_modules", "kiro-acp-ai-provider", "dist"), {
     recursive: true,
@@ -131,7 +131,7 @@ describe("findBridgeInAncestors", () => {
       "dist",
     )
     mkdirSync(bunCacheEntry, { recursive: true })
-    const bridgePath = join(bunCacheEntry, "mcp-bridge.js")
+    const bridgePath = join(bunCacheEntry, "mcp-bridge.mjs")
     writeFileSync(bridgePath, "// fake bridge in bun cache")
 
     const client = new ACPClient({ cwd: root })
@@ -152,7 +152,7 @@ describe("Strategy 5 — XDG bridge extraction", () => {
       const priv = client as any
 
       expect(() => priv.resolveBridgePath()).toThrow(
-        "Could not find mcp-bridge.js",
+        "Could not find mcp-bridge.mjs",
       )
     } finally {
       rmSync(root, { recursive: true, force: true })

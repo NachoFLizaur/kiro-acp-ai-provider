@@ -790,13 +790,13 @@ export class ACPClient {
   }
 
   /**
-   * Walk up parent directories from `startDir`, checking for mcp-bridge.js
+   * Walk up parent directories from `startDir`, checking for mcp-bridge.mjs
    * in node_modules (both standard and Bun's .bun cache).
    */
   private findBridgeInAncestors(startDir: string, maxDepth = 10): string | undefined {
     let dir = startDir
     for (let i = 0; i < maxDepth; i++) {
-      const candidate = join(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
+      const candidate = join(dir, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.mjs")
       if (existsSync(candidate)) return candidate
 
       const bunDir = join(dir, "node_modules", ".bun")
@@ -804,7 +804,7 @@ export class ACPClient {
         try {
           for (const entry of readdirSync(bunDir)) {
             if (entry.includes("kiro-acp-ai-provider")) {
-              const cached = join(bunDir, entry, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
+              const cached = join(bunDir, entry, "node_modules", "kiro-acp-ai-provider", "dist", "mcp-bridge.mjs")
               if (existsSync(cached)) return cached
             }
           }
@@ -832,7 +832,7 @@ export class ACPClient {
     try {
       if (typeof import.meta?.url === "string" && import.meta.url) {
         const currentDir = dirname(fileURLToPath(import.meta.url))
-        const directPath = join(currentDir, "mcp-bridge.js")
+        const directPath = join(currentDir, "mcp-bridge.mjs")
         if (!directPath.includes("$bunfs") && existsSync(directPath)) {
           this.resolvedBridgePath = directPath
           return directPath
@@ -845,7 +845,7 @@ export class ACPClient {
     // Strategy 2: node_modules in cwd
     const nmBase = join(this.options.cwd, "node_modules")
 
-    const directNm = join(nmBase, "kiro-acp-ai-provider", "dist", "mcp-bridge.js")
+    const directNm = join(nmBase, "kiro-acp-ai-provider", "dist", "mcp-bridge.mjs")
     if (existsSync(directNm)) {
       this.resolvedBridgePath = directNm
       return directNm
@@ -864,7 +864,7 @@ export class ACPClient {
               "node_modules",
               "kiro-acp-ai-provider",
               "dist",
-              "mcp-bridge.js",
+              "mcp-bridge.mjs",
             )
             if (existsSync(cached)) {
               this.resolvedBridgePath = cached
@@ -898,7 +898,7 @@ export class ACPClient {
     if (MCP_BRIDGE_SOURCE) {
       const dataDir = getXdgDataHome()
       const bridgeDir = join(dataDir, "kiro-acp-ai-provider")
-      const bridgePath = join(bridgeDir, "mcp-bridge.js")
+      const bridgePath = join(bridgeDir, "mcp-bridge.mjs")
 
       if (existsSync(bridgePath)) {
         try {
@@ -910,6 +910,15 @@ export class ACPClient {
       }
 
       mkdirSync(bridgeDir, { recursive: true, mode: 0o700 })
+
+      // Best-effort cleanup of the legacy `.js` extraction (pre-1.7.8).
+      // The old file fails to load under Node because the XDG dir has no
+      // package.json declaring `"type": "module"`. Removing it avoids
+      // confusion and keeps the directory tidy.
+      try {
+        unlinkSync(join(bridgeDir, "mcp-bridge.js"))
+      } catch { /* not present, ignore */ }
+
       const tmpPath = `${bridgePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
       writeFileSync(tmpPath, MCP_BRIDGE_SOURCE, { mode: 0o600, flag: "wx" })
       renameSync(tmpPath, bridgePath)
@@ -919,7 +928,7 @@ export class ACPClient {
     }
 
     throw new KiroACPConnectionError(
-      "Could not find mcp-bridge.js. Ensure kiro-acp-ai-provider is installed.",
+      "Could not find mcp-bridge.mjs. Ensure kiro-acp-ai-provider is installed.",
     )
   }
 

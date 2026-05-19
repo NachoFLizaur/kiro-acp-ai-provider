@@ -2,7 +2,7 @@
 // MCP Bridge Server — Standalone script spawned by kiro-cli
 // ---------------------------------------------------------------------------
 //
-// Usage: node mcp-bridge.js --tools /path/to/tools.json [--cwd /path]
+// Usage: node mcp-bridge.mjs --tools /path/to/tools.json [--cwd /path]
 //
 // Reads tool definitions from a JSON file and serves them via MCP protocol
 // over newline-delimited JSON-RPC on stdio. All tool calls are delegated
