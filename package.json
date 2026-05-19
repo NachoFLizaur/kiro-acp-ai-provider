@@ -17,15 +17,15 @@
       }
     },
     "./mcp-bridge": {
-      "import": "./dist/mcp-bridge.js"
+      "import": "./dist/mcp-bridge.mjs"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
+    "build": "tsup --config tsup.bridge.config.ts && tsup",
+    "dev": "tsup --config tsup.bridge.config.ts && tsup --watch",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run build"
