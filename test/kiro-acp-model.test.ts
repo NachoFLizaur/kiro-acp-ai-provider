@@ -34,7 +34,24 @@ function createMockIPCServer(overrides: Partial<IPCServer> = {}): IPCServer {
 /** Create a minimal mock ACPClient. */
 function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
   const mockLaneRouter = new LaneRouter()
+  // Real promise-chain mutex (mirrors ACPClient.withEnsureClientLock) so that
+  // ensureClient() serializes concurrent callers in tests just like production.
+  let ensureClientLock: Promise<void> = Promise.resolve()
   return {
+    startedToolless: false,
+    withEnsureClientLock: mock(async <T,>(fn: () => Promise<T>): Promise<T> => {
+      const previousLock = ensureClientLock
+      let releaseLock!: () => void
+      ensureClientLock = new Promise<void>((resolve) => {
+        releaseLock = resolve
+      })
+      try {
+        await previousLock
+        return await fn()
+      } finally {
+        releaseLock()
+      }
+    }),
     isRunning: mock(() => false),
     start: mock(() =>
       Promise.resolve({
@@ -3265,6 +3282,136 @@ describe("KiroACPLanguageModel", () => {
 
       // Only one prompt call should have been made (the second doStream resumes)
       expect(promptCallCount).toBe(1)
+    })
+  })
+
+  describe("ensureClient concurrency", () => {
+    /**
+     * Build a mock client whose `start` blocks on a manually-resolved gate.
+     * This lets a test deterministically sequence two concurrent `doStream`
+     * calls without any real timers — ordering is driven purely by resolving
+     * the returned `resolveStart` function.
+     */
+    function createDeferredStartClient() {
+      let running = false
+      let startedToolless = false
+      let stopCalls = 0
+      const startCalls: (string | undefined)[] = []
+      const toolsDir = createTempToolsDir()
+
+      // Manually-resolved gate that the test releases to let `start` complete.
+      let resolveStart!: () => void
+      const startGate = new Promise<void>((resolve) => {
+        resolveStart = resolve
+      })
+
+      const client = createMockClient({
+        isRunning: mock(() => running),
+        createSessionToolsFilePath: mock((id: string) => join(toolsDir, `tools-${id}.json`)),
+        getCwd: mock(() => "/tmp/project"),
+        start: mock(async (toolsFilePath?: string) => {
+          startCalls.push(toolsFilePath)
+          await startGate
+          running = true
+          return {
+            agentInfo: { name: "kiro-cli", version: "1.0.0" },
+            agentCapabilities: {},
+          }
+        }),
+        stop: mock(async () => {
+          stopCalls++
+          running = false
+          startedToolless = false
+        }),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({
+            sessionUpdate: "agent_message_chunk",
+            content: { text: "ok" },
+          })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      // Expose `startedToolless` as a getter/setter so reads/writes performed by
+      // ensureClient() are observed against this mock's closure state.
+      Object.defineProperty(client, "startedToolless", {
+        get: () => startedToolless,
+        set: (v: boolean) => {
+          startedToolless = v
+        },
+        configurable: true,
+      })
+
+      return {
+        client,
+        startCalls,
+        resolveStart,
+        getStartedToolless: () => startedToolless,
+        getStopCalls: () => stopCalls,
+      }
+    }
+
+    test("tooled call arriving during a pending toolless start ends up tooled", async () => {
+      // Arrange: one shared model + one deferred mock client, gate unresolved.
+      const { client, startCalls, resolveStart, getStartedToolless, getStopCalls } =
+        createDeferredStartClient()
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const tool: LanguageModelV3FunctionTool = {
+        type: "function",
+        name: "bash",
+        description: "Execute a bash command",
+        inputSchema: {
+          type: "object",
+          properties: { command: { type: "string" } },
+          required: ["command"],
+        },
+      }
+
+      // Act A: kick off a toolless doStream — do NOT await. Its ensureClient()
+      // acquires the lock and calls start(undefined), then blocks on startGate.
+      const promiseA = model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "toolless" }] }]),
+      )
+
+      // Let A reach the blocked start() before B arrives. Microtask flush is
+      // enough — start() is invoked synchronously up to the `await startGate`.
+      await Promise.resolve()
+      await Promise.resolve()
+
+      // Act B: while A's start is pending, kick off a tooled doStream — do NOT
+      // await yet. Its ensureClient() must wait on the client-level lock.
+      const promiseB = model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "tooled" }] }],
+          { tools: [tool] },
+        ),
+      )
+
+      await Promise.resolve()
+      await Promise.resolve()
+
+      // Act: release the gate so A's start() completes; then drain both streams.
+      resolveStart()
+
+      const resA = await promiseA
+      await collectStream(resA.stream)
+      const resB = await promiseB
+      await collectStream(resB.stream)
+
+      // Assert: the effective tooled start carried a DEFINED toolsFilePath AND
+      // stop() was called to restart the toolless client with tools.
+      const definedStart = startCalls.find((p) => p !== undefined)
+      expect(definedStart).toBeDefined()
+      expect(getStopCalls()).toBeGreaterThanOrEqual(1)
+
+      // The first start was the toolless one (undefined), proving the race
+      // ordering was exercised and the fix restarted with tools afterward.
+      expect(startCalls[0]).toBeUndefined()
+
+      // Assert: startedToolless ends false (reset by stop() during restart).
+      expect(getStartedToolless()).toBe(false)
     })
   })
 })
