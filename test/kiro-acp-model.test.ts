@@ -3414,4 +3414,76 @@ describe("KiroACPLanguageModel", () => {
       expect(getStartedToolless()).toBe(false)
     })
   })
+
+  describe("ephemeral client routing", () => {
+    test("toolless doStream uses ephemeral client; tooled doStream uses main client", async () => {
+      // Arrange: two independent mock clients — main + ephemeral. Each has
+      // its own start/prompt mocks so we can observe which one was hit.
+      const mainPrompt = mock(async (opts: PromptOptions) => {
+        opts.onUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { text: "main" },
+        })
+        return { stopReason: "end_turn" }
+      })
+      const ephemeralPrompt = mock(async (opts: PromptOptions) => {
+        opts.onUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { text: "ephemeral" },
+        })
+        return { stopReason: "end_turn" }
+      })
+
+      const mainClient = createMockClient({
+        prompt: mainPrompt,
+        createSessionToolsFilePath: mock((id: string) => join(createTempToolsDir(), `tools-${id}.json`)),
+      } as unknown as Partial<ACPClient>)
+      const ephemeralClient = createMockClient({
+        prompt: ephemeralPrompt,
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", {
+        client: mainClient,
+        getEphemeralClient: () => ephemeralClient,
+      })
+
+      const tool: LanguageModelV3FunctionTool = {
+        type: "function",
+        name: "bash",
+        description: "Execute a bash command",
+        inputSchema: {
+          type: "object",
+          properties: { command: { type: "string" } },
+          required: ["command"],
+        },
+      }
+
+      // Act 1: toolless doStream → must route to ephemeral client.
+      const tolessResult = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "title pls" }] }]),
+      )
+      await collectStream(tolessResult.stream)
+
+      // Assert 1: ephemeral client was used; main client untouched.
+      expect((ephemeralClient.start as ReturnType<typeof mock>).mock.calls.length).toBeGreaterThan(0)
+      expect(ephemeralPrompt.mock.calls.length).toBe(1)
+      expect((mainClient.start as ReturnType<typeof mock>).mock.calls.length).toBe(0)
+      expect(mainPrompt.mock.calls.length).toBe(0)
+
+      // Act 2: tooled doStream → must route to main client.
+      const tooledResult = await model.doStream(
+        makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "use the tool" }] }],
+          { tools: [tool] },
+        ),
+      )
+      await collectStream(tooledResult.stream)
+
+      // Assert 2: main client was used for the tooled call; ephemeral counters
+      // unchanged from after the toolless call.
+      expect((mainClient.start as ReturnType<typeof mock>).mock.calls.length).toBeGreaterThan(0)
+      expect(mainPrompt.mock.calls.length).toBe(1)
+      expect(ephemeralPrompt.mock.calls.length).toBe(1) // unchanged
+    })
+  })
 })

@@ -63,6 +63,19 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
   }
 
   const client = new ACPClient(clientOptions)
+
+  // Lazy-init isolated ACPClient for ephemeral (toolless) flows — e.g.
+  // opencode title generation. Created on first toolless doStream so projects
+  // that never use toolless flows pay no extra process cost. Stopped from
+  // provider.shutdown() if it was created.
+  let ephemeralClient: ACPClient | null = null
+  const getEphemeralClient = (): ACPClient => {
+    if (!ephemeralClient) {
+      ephemeralClient = new ACPClient(clientOptions)
+    }
+    return ephemeralClient
+  }
+
   let lastModel: KiroACPLanguageModel | null = null
 
   const createModel = (modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3 => {
@@ -70,6 +83,7 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
       client,
       sessionId: settings.sessionId,
       contextWindow: overrides?.contextWindow ?? settings.contextWindow,
+      getEphemeralClient,
     })
     lastModel = model
     return model
@@ -83,6 +97,9 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
 
   provider.shutdown = async (): Promise<void> => {
     await client.stop()
+    if (ephemeralClient) {
+      await ephemeralClient.stop()
+    }
   }
 
   provider.getClient = (): ACPClient => {
