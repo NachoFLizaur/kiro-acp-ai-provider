@@ -224,6 +224,15 @@ export class ACPClient {
    */
   private sessionCreationLock: Promise<void> = Promise.resolve()
 
+  /**
+   * Mutex for serializing the start/stop/restart decision in the model's
+   * ensureClient(). Because the ACPClient is a per-provider singleton shared
+   * by multiple model instances (each with its own per-model initPromise),
+   * a client-level lock is required to prevent a tooled call from returning
+   * early against a still-starting toolless client.
+   */
+  private ensureClientLock: Promise<void> = Promise.resolve()
+
   constructor(options: ACPClientOptions) {
     this.options = options
   }
@@ -386,6 +395,7 @@ export class ACPClient {
     this.promptCallbacks.clear()
     this.toolsReadyListeners.clear()
     this.availableTools = []
+    this.startedToolless = false
 
     if (this.ipcServer) {
       await this.ipcServer.stop()
@@ -660,6 +670,28 @@ export class ACPClient {
       }
 
       return await this.sendNewSession()
+    } finally {
+      releaseLock!()
+    }
+  }
+
+  /**
+   * Run `fn` under the client-level ensureClient mutex. Serializes
+   * start/stop/restart decisions across model instances sharing this client.
+   *
+   * NOTE: Callers MUST NOT call createSessionWithToolsPath() from within `fn`.
+   * ensureClient() runs strictly before createSessionWithToolsPath() in the
+   * acquireSession flow (never nested), so the two locks cannot deadlock.
+   */
+  async withEnsureClientLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previousLock = this.ensureClientLock
+    let releaseLock: () => void
+    this.ensureClientLock = new Promise<void>((resolve) => {
+      releaseLock = resolve
+    })
+    try {
+      await previousLock
+      return await fn()
     } finally {
       releaseLock!()
     }
