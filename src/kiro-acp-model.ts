@@ -96,6 +96,14 @@ export interface KiroACPModelConfig {
   sessionId?: string
   /** Max context window in tokens. Default: 1_000_000. */
   contextWindow?: number
+  /**
+   * Lazy accessor for an isolated ACPClient used to serve ephemeral
+   * (toolless) calls — e.g. opencode title generation. When provided,
+   * `doStream` calls without tools route to a child KiroACPLanguageModel
+   * backed by this client, isolating them from the main shared kiro-cli
+   * process. Optional: when absent, all calls use `client` (legacy behavior).
+   */
+  getEphemeralClient?: () => ACPClient
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +418,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     model: KiroACPLanguageModel
     timer: ReturnType<typeof setTimeout> | null
   }>()
+
+  /**
+   * Cached ephemeral child model (lazy-initialized on first toolless call).
+   * Backed by the provider-owned ephemeral ACPClient, this model serves
+   * toolless flows on a separate kiro-cli process — preventing contention
+   * with the main client used by tooled flows.
+   */
+  private ephemeralModel: KiroACPLanguageModel | null = null
 
   constructor(modelId: string, config: KiroACPModelConfig) {
     this.modelId = modelId
@@ -903,6 +919,16 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     const isChild = typeof options.headers?.["x-parent-session-id"] === "string"
     const hasTools = (options.tools ?? []).length > 0
+
+    // Toolless calls (e.g. opencode title generation) → route to an isolated
+    // ephemeral kiro-cli process so they can't be killed by a tooled call's
+    // restart on the main client. Only active when the provider supplied a
+    // getEphemeralClient (test paths constructing the model directly fall
+    // through to legacy behavior on the main client).
+    if (!hasTools && this.config.getEphemeralClient) {
+      return this.doStreamEphemeral(options)
+    }
+
     // Subagent with tools → use isolated client (separate kiro-cli process)
     // to prevent tool leakage from the parent session.
     if (isChild && hasTools && affinityId) {
@@ -925,6 +951,32 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     }
 
     return this.startFreshPrompt(options, reset)
+  }
+
+  // -------------------------------------------------------------------------
+  // Ephemeral (toolless) isolation — separate kiro-cli process for toolless flows
+  // -------------------------------------------------------------------------
+
+  /**
+   * Route a toolless doStream() call to an isolated KiroACPLanguageModel
+   * backed by the provider-owned ephemeral ACPClient (separate kiro-cli
+   * process). The ephemeral child model is constructed WITHOUT a
+   * getEphemeralClient in its config — so its own doStream() falls through
+   * to the normal (non-ephemeral) path and serves the request on the
+   * ephemeral client directly. The ephemeral client is owned by the provider
+   * and stopped in provider.shutdown(); no per-call cleanup is needed.
+   */
+  private async doStreamEphemeral(
+    options: LanguageModelV3CallOptions,
+  ): Promise<LanguageModelV3StreamResult> {
+    if (!this.ephemeralModel) {
+      const ephemeralClient = this.config.getEphemeralClient!()
+      this.ephemeralModel = new KiroACPLanguageModel(this.modelId, {
+        client: ephemeralClient,
+        contextWindow: this.config.contextWindow,
+      })
+    }
+    return this.ephemeralModel.doStream(options)
   }
 
   // -------------------------------------------------------------------------
