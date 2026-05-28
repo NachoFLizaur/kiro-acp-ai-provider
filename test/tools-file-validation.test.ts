@@ -40,7 +40,24 @@ function createMockIPCServer(overrides: Partial<IPCServer> = {}): IPCServer {
 
 function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
   const mockLaneRouter = new LaneRouter()
+  // Real promise-chain mutex (mirrors ACPClient.withEnsureClientLock) so that
+  // ensureClient() serializes concurrent callers in tests just like production.
+  let ensureClientLock: Promise<void> = Promise.resolve()
   return {
+    startedToolless: false,
+    withEnsureClientLock: mock(async <T,>(fn: () => Promise<T>): Promise<T> => {
+      const previousLock = ensureClientLock
+      let releaseLock!: () => void
+      ensureClientLock = new Promise<void>((resolve) => {
+        releaseLock = resolve
+      })
+      try {
+        await previousLock
+        return await fn()
+      } finally {
+        releaseLock()
+      }
+    }),
     isRunning: mock(() => false),
     start: mock(() =>
       Promise.resolve({
