@@ -1,0 +1,54 @@
+import { describe, test, expect } from "bun:test"
+import { readFileSync } from "node:fs"
+import { join } from "node:path"
+import * as root from "../src/index"
+import * as ipc from "../src/ipc"
+
+// ---------------------------------------------------------------------------
+// Export-surface regression (task 05 / F4).
+//
+// opencode's SDK auto-discovery (`resolveSDK`, provider.ts:1786-1817) takes
+// the FIRST key of the SORTED root namespace matching `create*` as the
+// provider factory. A root-level `createIPCServer` sorts before
+// `createKiroAcp` ("I" < "K") and would shadow it, breaking languageModel
+// resolution on stock opencode. The factory therefore lives on the
+// `kiro-acp-ai-provider/ipc` subpath; only types stay at the root.
+// ---------------------------------------------------------------------------
+
+describe("root export surface", () => {
+  test("sorted root create* keys are exactly [\"createKiroAcp\"]", () => {
+    const createKeys = Object.keys(root)
+      .filter((key) => key.startsWith("create"))
+      .sort()
+
+    expect(createKeys).toEqual(["createKiroAcp"])
+    expect(typeof root.createKiroAcp).toBe("function")
+  })
+
+  test("createIPCServer is NOT a runtime key of the root namespace", () => {
+    expect("createIPCServer" in root).toBe(false)
+  })
+
+  test("task 04/05 additions are exported from the root", () => {
+    expect(typeof root.interceptSessionAffinity).toBe("function")
+    expect(typeof root.hashPromptMessages).toBe("function")
+    expect(typeof root.diverged).toBe("function")
+    expect(typeof root.listModels).toBe("function")
+  })
+})
+
+describe("./ipc subpath", () => {
+  test("exposes createIPCServer as a function", () => {
+    expect(typeof ipc.createIPCServer).toBe("function")
+  })
+
+  test("package.json maps the ./ipc subpath for import and require", () => {
+    const pkg = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", "package.json"), "utf-8"),
+    ) as { exports: Record<string, { import?: string; require?: { default?: string } }> }
+
+    expect(pkg.exports["./ipc"]).toBeDefined()
+    expect(pkg.exports["./ipc"].import).toBe("./dist/ipc.js")
+    expect(pkg.exports["./ipc"].require?.default).toBe("./dist/ipc.cjs")
+  })
+})

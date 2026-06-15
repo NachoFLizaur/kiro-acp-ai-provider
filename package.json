@@ -1,6 +1,6 @@
 {
   "name": "kiro-acp-ai-provider",
-  "version": "1.7.10",
+  "version": "2.0.0",
   "description": "Kiro ACP (AWS) provider for Vercel AI SDK",
   "license": "MIT",
   "type": "module",
@@ -14,6 +14,14 @@
       "require": {
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
+      }
+    },
+    "./ipc": {
+      "types": "./dist/ipc.d.ts",
+      "import": "./dist/ipc.js",
+      "require": {
+        "types": "./dist/ipc.d.cts",
+        "default": "./dist/ipc.cjs"
       }
     },
     "./mcp-bridge": {

@@ -948,6 +948,7 @@ describe("KiroACPLanguageModel", () => {
             contextUsagePercentage: 0.035,
             turnDurationMs: 2500,
             credits: 0.03,
+            creditsUnit: "credit",
           },
         })
       }
@@ -984,6 +985,7 @@ describe("KiroACPLanguageModel", () => {
             contextUsagePercentage: null,
             turnDurationMs: 3200,
             credits: null,
+            creditsUnit: null,
           },
         })
       }
