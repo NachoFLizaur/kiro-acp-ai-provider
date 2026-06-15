@@ -16,8 +16,14 @@ export interface KiroACPProviderSettings {
   env?: Record<string, string>
   clientInfo?: { name: string; version: string; title?: string }
   sessionId?: string
-  /** Max context window in tokens. Default: 1_000_000. */
+  /**
+   * Max context window in tokens, applied to every model from this provider.
+   * Used when no per-call `contextWindow` override and no matching
+   * `contextWindows[modelId]` entry is given. Falls back to 1_000_000.
+   */
   contextWindow?: number
+  /** Per-model context windows keyed by model id, e.g. relayed from a host's model catalog (models.dev). Used when no per-call `contextWindow` override is given. */
+  contextWindows?: Record<string, number>
   /** MCP tool call timeout in minutes. Default: 30. */
   mcpTimeout?: number
 }
@@ -65,9 +71,9 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
   const client = new ACPClient(clientOptions)
 
   // Lazy-init isolated ACPClient for ephemeral (toolless) flows — e.g.
-  // opencode title generation. Created on first toolless doStream so projects
-  // that never use toolless flows pay no extra process cost. Stopped from
-  // provider.shutdown() if it was created.
+  // toolless title-generation calls (from a host like opencode). Created on
+  // first toolless doStream so projects that never use toolless flows pay no
+  // extra process cost. Stopped from provider.shutdown() if it was created.
   let ephemeralClient: ACPClient | null = null
   const getEphemeralClient = (): ACPClient => {
     if (!ephemeralClient) {
@@ -78,12 +84,26 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
 
   let lastModel: KiroACPLanguageModel | null = null
 
+  // Session-affinity intercept state (tracked message hashes per affinity
+  // key), shared by ALL models created from this provider instance so
+  // cross-model continuation within one session is detected correctly —
+  // one shared map per provider, never per model.
+  const affinityPrompts = new Map<string, string[]>()
+
   const createModel = (modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3 => {
     const model = new KiroACPLanguageModel(modelId, {
       client,
       sessionId: settings.sessionId,
-      contextWindow: overrides?.contextWindow ?? settings.contextWindow,
+      // Resolution order: explicit per-call override → per-model relay map
+      // (e.g. host catalog from models.dev) → provider-level setting → 1M
+      // flat fallback for unknown model ids.
+      contextWindow:
+        overrides?.contextWindow ??
+        settings.contextWindows?.[modelId] ??
+        settings.contextWindow ??
+        1_000_000,
       getEphemeralClient,
+      affinityPrompts,
     })
     lastModel = model
     return model

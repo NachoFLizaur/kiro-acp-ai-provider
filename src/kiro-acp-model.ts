@@ -10,11 +10,13 @@ import type {
   LanguageModelV3StreamResult,
   LanguageModelV3Usage,
   LanguageModelV3Prompt,
+  SharedV3ProviderMetadata,
 } from "@ai-sdk/provider"
-import { readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
+import { appendFileSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
-import { KiroACPError, type ACPClient, type ACPSession, type SessionUpdate, type ContentBlock } from "./acp-client"
+import { KiroACPError, type ACPClient, type ACPSession, type SessionUpdate, type ContentBlock, type SessionMetadata } from "./acp-client"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
+import { interceptSessionAffinity } from "./session-affinity"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
@@ -98,12 +100,21 @@ export interface KiroACPModelConfig {
   contextWindow?: number
   /**
    * Lazy accessor for an isolated ACPClient used to serve ephemeral
-   * (toolless) calls — e.g. opencode title generation. When provided,
+   * (toolless) calls — e.g. title generation. When provided,
    * `doStream` calls without tools route to a child KiroACPLanguageModel
    * backed by this client, isolating them from the main shared kiro-cli
    * process. Optional: when absent, all calls use `client` (legacy behavior).
    */
   getEphemeralClient?: () => ACPClient
+  /**
+   * Provider-level shared session-affinity intercept state (tracked message
+   * hashes per affinity key). When provided, `doStream`/`doGenerate` apply
+   * the session-affinity/reset intercept as a pre-step. Models created
+   * internally (ephemeral/subagent children) are constructed WITHOUT it so
+   * the intercept runs exactly once at the provider-created model boundary,
+   * never on inner models.
+   */
+  affinityPrompts?: Map<string, string[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -231,12 +242,78 @@ function mapStopReason(stopReason: string): LanguageModelV3FinishReason {
 }
 
 // ---------------------------------------------------------------------------
+// Credits metering
+// ---------------------------------------------------------------------------
+
+/**
+ * Metering unit kiro-cli reports cost in. Single internal source for the
+ * unit literal — every emission echoes the unit FROM the metering data
+ * (`creditsUnit`), so downstream consumers read value + unit from emitted
+ * metadata instead of hardcoding a unit anywhere.
+ */
+const KIRO_METERING_UNIT = "credit"
+
+/** Extract the credit metering entry from ACP session metadata, if present. */
+function findCreditEntry(
+  metadata: SessionMetadata | undefined,
+): { unit: string; value: number } | undefined {
+  return metadata?.meteringUsage?.find((m) => m.unit === KIRO_METERING_UNIT)
+}
+
+/**
+ * Build the part-level `{ kiro: { credits, creditsUnit } }` provider metadata
+ * for a completed turn, or undefined when credits are unknown — so parts
+ * never carry an empty/NaN `kiro` key.
+ */
+function creditsProviderMetadata(
+  creditEntry: { unit: string; value: number } | undefined,
+): SharedV3ProviderMetadata | undefined {
+  if (!creditEntry || !Number.isFinite(creditEntry.value)) return undefined
+  return { kiro: { credits: creditEntry.value, creditsUnit: creditEntry.unit } }
+}
+
+// ---------------------------------------------------------------------------
 // Error message extraction
 // ---------------------------------------------------------------------------
 
 function extractErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message
   return String(err)
+}
+
+// ---------------------------------------------------------------------------
+// E2E debug observability (env-gated, zero effect when unset)
+// ---------------------------------------------------------------------------
+
+/**
+ * Append one JSONL record per intercepted call to `$KIRO_ACP_DEBUG_FILE`,
+ * capturing the affinity headers BEFORE and AFTER the session-affinity
+ * intercept — the only way to observe `x-session-reset` at the header level
+ * from outside (a host consumes the rewritten options in-process).
+ *
+ * Strictly best-effort and inert unless the env var is set; never throws.
+ */
+function debugLogIntercept(
+  modelId: string,
+  before: LanguageModelV3CallOptions,
+  after: LanguageModelV3CallOptions,
+): void {
+  const file = process.env.KIRO_ACP_DEBUG_FILE
+  if (!file) return
+  try {
+    const record = {
+      ts: new Date().toISOString(),
+      model: modelId,
+      affinityIn: before.headers?.["x-session-affinity"] ?? null,
+      affinityOut: after.headers?.["x-session-affinity"] ?? null,
+      reset: after.headers?.["x-session-reset"] === "true",
+      tools: (before.tools ?? []).length,
+      promptRoles: before.prompt.map((m) => m.role).join(","),
+    }
+    appendFileSync(file, JSON.stringify(record) + "\n")
+  } catch {
+    // Observability must never affect the call path
+  }
 }
 
 /**
@@ -863,7 +940,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
               continue
             }
 
-            // Handle deprecated "media" type (opencode sends this format)
+            // Handle deprecated "media" type (some hosts, e.g. opencode, send this format)
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const anyPart = contentPart as any
             if (anyPart.type === "media" && isImageMediaType(anyPart.mediaType)) {
@@ -912,6 +989,33 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   async doStream(
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3StreamResult> {
+    return this.doStreamInner(this.interceptOptions(options))
+  }
+
+  /**
+   * Session-affinity/reset intercept pre-step. Applied at the top of both
+   * `doStream` and `doGenerate`, BEFORE any header/affinity reading. No-op
+   * (options returned untouched, same reference) when the model has no
+   * provider-level affinity state — directly constructed models and
+   * internal child models — or when the request carries no
+   * `x-session-affinity` header.
+   */
+  private interceptOptions(options: LanguageModelV3CallOptions): LanguageModelV3CallOptions {
+    if (!this.config.affinityPrompts) return options
+    const intercepted = interceptSessionAffinity(options, this.config.affinityPrompts)
+    debugLogIntercept(this.modelId, options, intercepted)
+    return intercepted
+  }
+
+  /**
+   * Central routing logic shared by `doStream`/`doGenerate`, running AFTER
+   * the intercept pre-step: options are rewritten exactly once at the public
+   * boundary, then the SDK's own affinity/reset bookkeeping below consumes
+   * the rewritten headers unchanged.
+   */
+  private async doStreamInner(
+    options: LanguageModelV3CallOptions,
+  ): Promise<LanguageModelV3StreamResult> {
     const affinityId = typeof options.headers?.["x-session-affinity"] === "string"
       ? options.headers["x-session-affinity"]
       : undefined
@@ -920,7 +1024,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const isChild = typeof options.headers?.["x-parent-session-id"] === "string"
     const hasTools = (options.tools ?? []).length > 0
 
-    // Toolless calls (e.g. opencode title generation) → route to an isolated
+    // Toolless calls (e.g. title generation) → route to an isolated
     // ephemeral kiro-cli process so they can't be killed by a tooled call's
     // restart on the main client. Only active when the provider supplied a
     // getEphemeralClient (test paths constructing the model directly fall
@@ -1250,14 +1354,48 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             return
           }
 
+          const cancelled = result.stopReason === "cancelled"
+
+          // Turn metering is known here — the ACP prompt has settled. Read it
+          // ONCE: this credit entry is the single source for both the
+          // part-level metadata below and the finish-event mirror. Skipped on
+          // cancel, where metering would be absent or stale (kiro-cli reports
+          // it at turn end).
+          const metadata = cancelled ? undefined : this.client.getMetadata(sessionId)
+          const creditEntry = findCreditEntry(metadata)
+
+          // DUAL EMISSION (deliberate): attach the SAME
+          // `{ kiro: { credits, creditsUnit } }` object to BOTH the final
+          // text-end AND the reasoning-end (when reasoning occurred):
+          // - TEXT: some hosts (e.g. opencode) persist part-level
+          //   providerMetadata on the final text part — this is what such
+          //   consumers read TODAY via `part.metadata.kiro`.
+          // - REASONING: a host's schema may instead keep provider metadata
+          //   only on reasoning parts (as opencode does post-migration) and
+          //   drop it from text parts — but not every kiro model emits
+          //   reasoning, so the reasoning path alone is insufficient and the
+          //   text path alone is not future-proof.
+          // Both parts carry the same turn total — consumers MUST dedupe per
+          // assistant message or they will double count. When credits are
+          // unknown (or the turn was cancelled) no `kiro` key is attached.
+          const partMetadata = creditsProviderMetadata(creditEntry)
+
           if (reasoningStarted) {
-            writePart({ type: "reasoning-end", id: reasoningId })
+            writePart({
+              type: "reasoning-end",
+              id: reasoningId,
+              ...(partMetadata ? { providerMetadata: partMetadata } : {}),
+            })
           }
           if (textStarted) {
-            writePart({ type: "text-end", id: textId })
+            writePart({
+              type: "text-end",
+              id: textId,
+              ...(partMetadata ? { providerMetadata: partMetadata } : {}),
+            })
           }
 
-          if (result.stopReason === "cancelled") {
+          if (cancelled) {
             writePart({ type: "error", error: new Error("Request was cancelled by user") })
 
             removeAbortListener()
@@ -1275,11 +1413,13 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             return
           }
 
-          const metadata = this.client.getMetadata(sessionId)
-          const turnCredits =
-            metadata?.meteringUsage?.find((m) => m.unit === "credit")?.value ?? 0
-          this.totalCredits += turnCredits
+          this.totalCredits += creditEntry?.value ?? 0
 
+          // Finish-event mirror (kept deliberately): some hosts (e.g.
+          // opencode) consume finish metadata for cost accounting and DROP it
+          // (never persisted), so it is harmless there — while plain AI-SDK
+          // consumers (and any host that reads finish metadata) get the full
+          // turn picture in one event.
           writePart({
             type: "finish",
             finishReason: mapStopReason(result.stopReason),
@@ -1289,7 +1429,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
                   kiro: {
                     contextUsagePercentage: metadata.contextUsagePercentage ?? null,
                     turnDurationMs: metadata.turnDurationMs ?? null,
-                    credits: metadata.meteringUsage?.find((m) => m.unit === "credit")?.value ?? null,
+                    credits: creditEntry?.value ?? null,
+                    creditsUnit: creditEntry?.unit ?? null,
                   },
                 }
               : undefined,
@@ -1617,7 +1758,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   async doGenerate(
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3GenerateResult> {
-    const result = await this.doStream(options)
+    // Intercept pre-step applied here (not via this.doStream) so it runs
+    // exactly once per public call — the inner this.doStream call must not
+    // re-run the intercept.
+    const result = await this.doStreamInner(this.interceptOptions(options))
 
     const content: LanguageModelV3Content[] = []
     const textParts: string[] = []
@@ -1625,17 +1769,28 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const toolInputs = new Map<string, { name: string; input: string }>()
     let finishReason: LanguageModelV3FinishReason = { unified: "other", raw: undefined }
     let usage: LanguageModelV3Usage = emptyUsage()
+    let providerMetadata: SharedV3ProviderMetadata | undefined
 
-    const flushText = (): void => {
+    // Mirror the stream's part-level provider metadata (credits dual
+    // emission) onto the corresponding result content parts.
+    const flushText = (partMetadata?: SharedV3ProviderMetadata): void => {
       if (textParts.length > 0) {
-        content.push({ type: "text", text: textParts.join("") })
+        content.push({
+          type: "text",
+          text: textParts.join(""),
+          ...(partMetadata ? { providerMetadata: partMetadata } : {}),
+        })
         textParts.length = 0
       }
     }
 
-    const flushReasoning = (): void => {
+    const flushReasoning = (partMetadata?: SharedV3ProviderMetadata): void => {
       if (reasoningParts.length > 0) {
-        content.push({ type: "reasoning", text: reasoningParts.join("") })
+        content.push({
+          type: "reasoning",
+          text: reasoningParts.join(""),
+          ...(partMetadata ? { providerMetadata: partMetadata } : {}),
+        })
         reasoningParts.length = 0
       }
     }
@@ -1652,7 +1807,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           break
 
         case "text-end":
-          flushText()
+          flushText(value.providerMetadata)
           break
 
         case "reasoning-delta":
@@ -1660,7 +1815,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           break
 
         case "reasoning-end":
-          flushReasoning()
+          flushReasoning(value.providerMetadata)
           break
 
         case "tool-input-start":
@@ -1691,6 +1846,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         case "finish":
           finishReason = value.finishReason
           usage = value.usage
+          providerMetadata = value.providerMetadata
           break
       }
     }
@@ -1702,6 +1858,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       content,
       finishReason,
       usage,
+      ...(providerMetadata ? { providerMetadata } : {}),
       warnings: [],
       request: result.request,
       response: {

@@ -46,7 +46,10 @@ function embedBridgePlugin(): Plugin {
 }
 
 export default defineConfig({
-  entry: ["src/index.ts"],
+  // `src/ipc.ts` is a separate entry: `createIPCServer` must NOT be a root
+  // export (it would shadow `createKiroAcp` in opencode's sorted `create*`
+  // SDK factory auto-discovery), so it ships on the `./ipc` subpath.
+  entry: ["src/index.ts", "src/ipc.ts"],
   format: ["cjs", "esm"],
   dts: true,
   clean: false,
