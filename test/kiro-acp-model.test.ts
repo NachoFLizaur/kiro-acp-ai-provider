@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, beforeEach } from "bun:test"
+import { describe, test, expect, mock, beforeEach, spyOn } from "bun:test"
 import { KiroACPLanguageModel, type KiroACPModelConfig } from "../src/kiro-acp-model"
 import { KiroACPError, KiroACPConnectionError } from "../src/acp-client"
 import type { ACPClient, ACPSession, SessionUpdate, PromptOptions } from "../src/acp-client"
@@ -13,6 +13,25 @@ import type {
 import { readFileSync, mkdirSync, mkdtempSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import * as childProcess from "node:child_process"
+
+// `extractErrorMessage` corroborates -32603 via `verifyAuth()`, which spawns
+// `kiro-cli`. Mock execFileSync so the auth probe is deterministic (no real
+// kiro-cli spawn): `whoami --format json` returns the chosen fixture and
+// `--version` succeeds so kiro-cli reads as installed. Returns the spy.
+const WHOAMI_LOGGED_IN_LINE =
+  '{"accountType":"IamIdentityCenter","email":"user@example.com","region":"eu-west-1","startUrl":"https://d-0000000000.awsapps.com/start"}'
+function mockWhoami(whoami: string) {
+  const impl = (_file: string, args?: readonly string[]) => {
+    const argv = args ?? []
+    if (argv.includes("--version")) return "kiro-cli 2.7.1"
+    if (argv.includes("whoami")) return whoami
+    return ""
+  }
+  return spyOn(childProcess, "execFileSync").mockImplementation(
+    impl as unknown as typeof childProcess.execFileSync,
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -709,56 +728,102 @@ describe("KiroACPLanguageModel", () => {
       }
     })
 
-    test("maps -32603 Internal error to an actionable re-auth message", async () => {
-      const client = createMockClient({
-        prompt: mock(async () => {
-          throw new KiroACPError("Internal error", -32603)
-        }),
-      } as unknown as Partial<ACPClient>)
+    test("maps -32603 to an actionable diagnostic ONLY when whoami is NOT logged in", async () => {
+      // Corroboration: whoami reports logged out, so -32603 is treated as an
+      // auth problem and the message points at the diagnostics. It must NOT
+      // assert a blanket "token expired" (kiro-cli auto-re-authenticates).
+      const spy = mockWhoami('{"account":null}')
+      try {
+        const client = createMockClient({
+          prompt: mock(async () => {
+            throw new KiroACPError("Internal error", -32603)
+          }),
+        } as unknown as Partial<ACPClient>)
 
-      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+        const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
 
-      const result = await model.doStream(
-        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
-      )
+        const result = await model.doStream(
+          makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+        )
 
-      const parts = await collectStream(result.stream)
-      const errorPart = parts.find((p) => p.type === "error")
+        const parts = await collectStream(result.stream)
+        const errorPart = parts.find((p) => p.type === "error")
 
-      expect(errorPart).toBeDefined()
-      if (errorPart?.type === "error") {
-        const message = (errorPart.error as Error).message
-        // Names the recovery action and preserves the original detail.
-        expect(message).toContain("kiro-cli login")
-        expect(message).toContain("Re-authenticate")
-        expect(message).toContain("expired")
-        expect(message).toContain("Internal error")
+        expect(errorPart).toBeDefined()
+        if (errorPart?.type === "error") {
+          const message = (errorPart.error as Error).message
+          // Names the diagnostics and preserves the original detail.
+          expect(message).toContain("kiro-cli whoami")
+          expect(message).toContain("kiro-cli doctor")
+          expect(message).toContain("Internal error")
+          // Does NOT assert the old over-broad "token expired" claim.
+          expect(message).not.toContain("expired")
+        }
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
+    test("passes the original -32603 message through when whoami IS logged in", async () => {
+      // Not corroborated: whoami is logged in, so the generic Internal error is
+      // surfaced as-is rather than being misattributed to an auth problem.
+      const spy = mockWhoami(WHOAMI_LOGGED_IN_LINE)
+      try {
+        const client = createMockClient({
+          prompt: mock(async () => {
+            throw new KiroACPError("Backend stream aborted", -32603)
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+        const result = await model.doStream(
+          makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+        )
+
+        const parts = await collectStream(result.stream)
+        const errorPart = parts.find((p) => p.type === "error")
+
+        expect(errorPart).toBeDefined()
+        if (errorPart?.type === "error") {
+          const message = (errorPart.error as Error).message
+          expect(message).toBe("Backend stream aborted")
+          expect(message).not.toContain("kiro-cli doctor")
+        }
+      } finally {
+        spy.mockRestore()
       }
     })
 
     test("map_32603_message_no_emdash", async () => {
-      const client = createMockClient({
-        prompt: mock(async () => {
-          throw new KiroACPError("Internal error", -32603)
-        }),
-      } as unknown as Partial<ACPClient>)
+      // Force the corroborated (logged-out) branch so the actionable message is
+      // emitted, then assert ASCII-punctuation only: no em-dash (U+2014) and no
+      // en-dash (U+2013).
+      const spy = mockWhoami('{"account":null}')
+      try {
+        const client = createMockClient({
+          prompt: mock(async () => {
+            throw new KiroACPError("Internal error", -32603)
+          }),
+        } as unknown as Partial<ACPClient>)
 
-      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+        const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
 
-      const result = await model.doStream(
-        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
-      )
+        const result = await model.doStream(
+          makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+        )
 
-      const parts = await collectStream(result.stream)
-      const errorPart = parts.find((p) => p.type === "error")
+        const parts = await collectStream(result.stream)
+        const errorPart = parts.find((p) => p.type === "error")
 
-      expect(errorPart).toBeDefined()
-      if (errorPart?.type === "error") {
-        const message = (errorPart.error as Error).message
-        // The re-auth message must stay ASCII-punctuation only: no em-dash
-        // (U+2014) and no en-dash (U+2013).
-        expect(message).not.toContain("\u2014")
-        expect(message).not.toContain("\u2013")
+        expect(errorPart).toBeDefined()
+        if (errorPart?.type === "error") {
+          const message = (errorPart.error as Error).message
+          expect(message).not.toContain("\u2014")
+          expect(message).not.toContain("\u2013")
+        }
+      } finally {
+        spy.mockRestore()
       }
     })
 

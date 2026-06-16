@@ -84,6 +84,71 @@ describe("stderr diagnostics", () => {
   // exercises the same formatRecentStderr() + method-gating logic, providing
   // equivalent coverage of the stderr-inclusion decision.
 
+  test("-32603 JSON-RPC response appends recent kiro-cli stderr to the error", () => {
+    // -32603 is the generic JSON-RPC "Internal error"; the real cause lives in
+    // kiro-cli's stderr, which must now be surfaced on the response path too.
+    const client = new ACPClient({ cwd: "/tmp" })
+    const priv = getPrivate(client)
+    priv.stderrBuffer = "error: backend rejected request (quota exceeded)"
+
+    let rejected: unknown
+    priv.pending.set(7, {
+      resolve: () => {},
+      reject: (e: Error) => { rejected = e },
+      method: "session/prompt",
+      timer: null,
+    })
+
+    priv.handleResponse({ jsonrpc: "2.0", id: 7, error: { code: -32603, message: "Internal error" } })
+
+    expect(rejected).toBeInstanceOf(KiroACPError)
+    const error = rejected as KiroACPError
+    expect(error.code).toBe(-32603)
+    expect(error.message).toContain("Internal error")
+    expect(error.message).toContain("kiro-cli stderr:")
+    expect(error.message).toContain("quota exceeded")
+  })
+
+  test("-32603 response with empty stderr buffer leaves the message clean", () => {
+    const client = new ACPClient({ cwd: "/tmp" })
+    const priv = getPrivate(client)
+    priv.stderrBuffer = ""
+
+    let rejected: unknown
+    priv.pending.set(8, {
+      resolve: () => {},
+      reject: (e: Error) => { rejected = e },
+      method: "session/prompt",
+      timer: null,
+    })
+
+    priv.handleResponse({ jsonrpc: "2.0", id: 8, error: { code: -32603, message: "Internal error" } })
+
+    expect(rejected).toBeInstanceOf(KiroACPError)
+    expect((rejected as KiroACPError).message).toBe("Internal error")
+    expect((rejected as KiroACPError).message).not.toContain("kiro-cli stderr:")
+  })
+
+  test("non -32603 JSON-RPC response does NOT append stderr", () => {
+    const client = new ACPClient({ cwd: "/tmp" })
+    const priv = getPrivate(client)
+    priv.stderrBuffer = "error: unrelated noise"
+
+    let rejected: unknown
+    priv.pending.set(9, {
+      resolve: () => {},
+      reject: (e: Error) => { rejected = e },
+      method: "session/prompt",
+      timer: null,
+    })
+
+    priv.handleResponse({ jsonrpc: "2.0", id: 9, error: { code: -32000, message: "Some other error" } })
+
+    expect(rejected).toBeInstanceOf(KiroACPError)
+    expect((rejected as KiroACPError).message).toBe("Some other error")
+    expect((rejected as KiroACPError).message).not.toContain("kiro-cli stderr:")
+  })
+
   test("stderrBuffer is reset on start", async () => {
     // Arrange: use a non-existent absolute path so start() fails early
     // (after resetting the buffer but before spawning kiro-cli)
