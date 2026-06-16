@@ -709,6 +709,82 @@ describe("KiroACPLanguageModel", () => {
       }
     })
 
+    test("maps -32603 Internal error to an actionable re-auth message", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPError("Internal error", -32603)
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        const message = (errorPart.error as Error).message
+        // Names the recovery action and preserves the original detail.
+        expect(message).toContain("kiro-cli login")
+        expect(message).toContain("Re-authenticate")
+        expect(message).toContain("expired")
+        expect(message).toContain("Internal error")
+      }
+    })
+
+    test("map_32603_message_no_emdash", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPError("Internal error", -32603)
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        const message = (errorPart.error as Error).message
+        // The re-auth message must stay ASCII-punctuation only: no em-dash
+        // (U+2014) and no en-dash (U+2013).
+        expect(message).not.toContain("\u2014")
+        expect(message).not.toContain("\u2013")
+      }
+    })
+
+    test("does NOT rewrite non -32603 KiroACPError codes", async () => {
+      const client = createMockClient({
+        prompt: mock(async () => {
+          throw new KiroACPError("Internal error", -32000)
+        }),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+      const result = await model.doStream(
+        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+      )
+
+      const parts = await collectStream(result.stream)
+      const errorPart = parts.find((p) => p.type === "error")
+
+      expect(errorPart).toBeDefined()
+      if (errorPart?.type === "error") {
+        // Code is not -32603, so the message passes through verbatim.
+        expect((errorPart.error as Error).message).toBe("Internal error")
+      }
+    })
+
     test("passes through KiroACPError service timeout message from acp-client", async () => {
       const client = createMockClient({
         prompt: mock(async () => {

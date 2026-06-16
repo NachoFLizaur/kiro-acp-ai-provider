@@ -277,6 +277,13 @@ function creditsProviderMetadata(
 // ---------------------------------------------------------------------------
 
 function extractErrorMessage(err: unknown): string {
+  // kiro-cli surfaces an expired or otherwise invalid token as a JSON-RPC
+  // -32603 "Internal error" with no recovery hint. Translate that one code
+  // into an actionable re-auth message while preserving the original detail
+  // for debugging. ASCII punctuation only (no em/en dashes) by contract.
+  if (err instanceof KiroACPError && err.code === -32603) {
+    return `Kiro token expired or invalid. Re-authenticate: run 'kiro-cli login' (or /connect in opencode). Original: ${err.message}`
+  }
   if (err instanceof Error) return err.message
   return String(err)
 }
