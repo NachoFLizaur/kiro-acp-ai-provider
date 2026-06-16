@@ -15,6 +15,7 @@ import type {
 import { appendFileSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
 import { KiroACPError, type ACPClient, type ACPSession, type SessionUpdate, type ContentBlock, type SessionMetadata } from "./acp-client"
+import { verifyAuth } from "./kiro-auth"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
 import { interceptSessionAffinity } from "./session-affinity"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
@@ -277,12 +278,19 @@ function creditsProviderMetadata(
 // ---------------------------------------------------------------------------
 
 function extractErrorMessage(err: unknown): string {
-  // kiro-cli surfaces an expired or otherwise invalid token as a JSON-RPC
-  // -32603 "Internal error" with no recovery hint. Translate that one code
-  // into an actionable re-auth message while preserving the original detail
-  // for debugging. ASCII punctuation only (no em/en dashes) by contract.
+  // -32603 is the GENERIC JSON-RPC "Internal error", NOT a token-expiry signal.
+  // Only claim an auth problem when kiro-cli itself reports NOT logged in (per
+  // the whoami --format json detection rule in kiro-auth); otherwise surface
+  // kiro-cli's original message, which carries the real cause. Even when
+  // corroborated, point the user at the diagnostics rather than asserting
+  // "token expired" (kiro-cli auto-re-authenticates, so a stale token is rarely
+  // the real cause). verifyAuth() is synchronous with a bounded timeout and
+  // runs only on this error path. ASCII punctuation only (no em/en dashes).
   if (err instanceof KiroACPError && err.code === -32603) {
-    return `Kiro token expired or invalid. Re-authenticate: run 'kiro-cli login' (or /connect in opencode). Original: ${err.message}`
+    if (!verifyAuth().authenticated) {
+      return `Kiro could not complete the request and does not appear logged in. Run 'kiro-cli whoami' to check auth and 'kiro-cli doctor' to diagnose installation, credential, or environment issues; then 'kiro-cli login' if needed (or /connect in opencode). Original: ${err.message}`
+    }
+    return err.message || `Kiro internal error (-32603)`
   }
   if (err instanceof Error) return err.message
   return String(err)

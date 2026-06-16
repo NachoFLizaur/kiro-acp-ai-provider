@@ -269,12 +269,18 @@ export class ACPClient {
       this.setupAgentConfig(toolsFilePath)
     }
 
+    // On win32 a bare spawn/execFileSync of "kiro-cli" does not resolve
+    // kiro-cli.exe via PATHEXT and uses no shell, so it can fail with ENOENT.
+    // shell:true on Windows resolves the .exe; elsewhere it is a no-op default.
+    const isWin = process.platform === "win32"
+
     // Ensure MCP tool timeout is sufficient for long-running subagent tasks.
     // Default is 5 minutes which is too short for complex planning operations.
     try {
       execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
         timeout: 5000,
         stdio: "ignore",
+        shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
       })
     } catch {
       // Best-effort — setting may already be configured
@@ -290,6 +296,7 @@ export class ACPClient {
       cwd: this.options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...this.options.env },
+      shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
     })
 
     this.running = true
@@ -1061,7 +1068,13 @@ export class ACPClient {
     this.pending.delete(msg.id)
 
     if (msg.error) {
-      const errorMessage = msg.error.message || `JSON-RPC error (code: ${msg.error.code ?? "unknown"})`
+      let errorMessage = msg.error.message || `JSON-RPC error (code: ${msg.error.code ?? "unknown"})`
+      // -32603 is the generic JSON-RPC "Internal error"; the real cause is in
+      // kiro-cli's stderr, which is otherwise only surfaced on timeouts/exits.
+      // formatRecentStderr() returns "" when the buffer is empty and never throws.
+      if (msg.error.code === -32603) {
+        errorMessage += this.formatRecentStderr()
+      }
       pending.reject(new KiroACPError(errorMessage, msg.error.code, msg.error.data))
     } else {
       pending.resolve(msg.result)

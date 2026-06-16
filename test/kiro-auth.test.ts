@@ -1,78 +1,183 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test"
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
+import { describe, test, expect, spyOn, afterEach } from "bun:test"
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
-import { tmpdir } from "node:os"
-import { isTokenValid, verifyAuth, type AuthStatus } from "../src/kiro-auth"
+import * as os from "node:os"
+import * as childProcess from "node:child_process"
+import { verifyAuth, type AuthStatus } from "../src/kiro-auth"
 
 // ---------------------------------------------------------------------------
-// verifyAuth() expiry gate (task 14 / SDK 2.0.1).
+// verifyAuth() auth authority = `kiro-cli whoami --format json` (SDK 2.0.2).
 //
-// kiro-cli `whoami` reports "Logged in" off mere token PRESENCE, so an expired
-// cached token still looks authenticated. `isTokenValid` is the expiry gate
-// verifyAuth() delegates to: it must reject expired, missing, and unparseable
-// `expiresAt` values while accepting a future timestamp. These tests exercise
-// the gate against real token-file fixtures in a temp dir (no kiro-cli spawn,
-// no backend) per the repo's filesystem-fixture convention.
+// CORRECTS SDK 2.0.1: the on-disk token file `expiresAt` is NOT the live-auth
+// signal (kiro-cli auto-re-authenticates and keeps the live token in the OS
+// credential store), so the old file-expiry gate misclassified a logged-in user
+// as expired. verifyAuth now derives `authenticated` SOLELY from the first
+// "{"-line of `kiro-cli whoami --format json` requiring a non-empty
+// `accountType`, and never consults the file's expiry. These tests mock
+// execFileSync with the EMPIRICAL kiro-cli 2.7.1 fixtures (no real spawn, no
+// backend) per the repo's bun-test conventions.
 // ---------------------------------------------------------------------------
 
-describe("isTokenValid", () => {
-  let testDir: string
+// EMPIRICAL FIXTURES (kiro-cli 2.7.1, captured on a real machine; verbatim).
 
-  beforeEach(() => {
-    testDir = mkdtempSync(join(tmpdir(), "kiro-auth-test-"))
-  })
+// LOGGED-IN stdout: a single compact JSON line FOLLOWED by a NON-JSON "Profile:"
+// trailer. EXIT=0. The parser must read ONLY the first "{"-line and ignore the
+// trailer (never JSON.parse the whole stdout).
+const WHOAMI_LOGGED_IN = `{"accountType":"IamIdentityCenter","email":"nflizaur+test@amazon.com","region":"eu-west-1","startUrl":"https://d-9367551e3b.awsapps.com/start"}
+
+Profile:
+KiroProfile-eu-central-1
+arn:aws:codewhisperer:eu-central-1:375170955021:profile/AVPGDXYUY7AU`
+
+// LOGGED-OUT stdout (right after `kiro-cli logout`): no `accountType`.
+const WHOAMI_LOGGED_OUT = `{"account":null}`
+
+const VERSION_STDOUT = "kiro-cli 2.7.1"
+
+// Mock `execFileSync` so `verifyAuth()` sees controlled `--version` and
+// `whoami --format json` output. A value is returned as stdout; an Error is
+// thrown (spawn error / timeout). Returns the spy for restoration.
+function mockKiroCli(opts: { version?: string | Error; whoami?: string | Error }) {
+  const impl = (_file: string, args?: readonly string[]) => {
+    const argv = args ?? []
+    if (argv.includes("--version")) {
+      if (opts.version instanceof Error) throw opts.version
+      return opts.version ?? VERSION_STDOUT
+    }
+    if (argv.includes("whoami")) {
+      if (opts.whoami instanceof Error) throw opts.whoami
+      return opts.whoami ?? ""
+    }
+    return ""
+  }
+  return spyOn(childProcess, "execFileSync").mockImplementation(
+    impl as unknown as typeof childProcess.execFileSync,
+  )
+}
+
+describe("verifyAuth: whoami --format json detection rule", () => {
+  const spies: Array<{ mockRestore: () => void }> = []
+  const tempHomes: string[] = []
 
   afterEach(() => {
-    try { rmSync(testDir, { recursive: true, force: true }) } catch {}
+    while (spies.length) spies.pop()!.mockRestore()
+    while (tempHomes.length) {
+      try { rmSync(tempHomes.pop()!, { recursive: true, force: true }) } catch {}
+    }
   })
 
-  /** Write a token fixture and return its path. */
-  function writeToken(contents: unknown): string {
-    const tokenPath = join(testDir, "kiro-auth-token.json")
-    const raw = typeof contents === "string" ? contents : JSON.stringify(contents)
-    writeFileSync(tokenPath, raw)
+  /** Point `homedir()` at a fresh temp dir; return its path. */
+  function mockHome(): string {
+    const tempHome = mkdtempSync(join(os.tmpdir(), "kiro-home-"))
+    tempHomes.push(tempHome)
+    spies.push(spyOn(os, "homedir").mockReturnValue(tempHome))
+    return tempHome
+  }
+
+  /** Write a stale token file under a mocked home; return its absolute path. */
+  function writeStaleToken(tempHome: string): string {
+    const cacheDir = join(tempHome, ".aws", "sso", "cache")
+    mkdirSync(cacheDir, { recursive: true })
+    const tokenPath = join(cacheDir, "kiro-auth-token.json")
+    // Stale: the real expired value that triggered the 2.0.1 -32603 failures.
+    writeFileSync(tokenPath, JSON.stringify({ expiresAt: "2025-04-01T00:00:00.000Z" }))
     return tokenPath
   }
 
-  test("valid token (expiresAt in the future) is valid", () => {
-    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString()
-    expect(isTokenValid(writeToken({ expiresAt: future }))).toBe(true)
+  test("logged-in fixture WITH trailing Profile block => authenticated true (parser ignores the non-JSON trailer)", () => {
+    spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
+    mockHome()
+    const status = verifyAuth()
+    expect(status.installed).toBe(true)
+    expect(status.authenticated).toBe(true)
+    expect(status.version).toBe(VERSION_STDOUT)
   })
 
-  test("expired token (expiresAt in the past) is NOT valid", () => {
-    // The real-world expired value that triggered the -32603 failures.
-    expect(isTokenValid(writeToken({ expiresAt: "2025-04-01T00:00:00.000Z" }))).toBe(false)
+  test('logged-out fixture {"account":null} => authenticated false', () => {
+    spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_OUT }))
+    mockHome()
+    expect(verifyAuth().authenticated).toBe(false)
   })
 
-  test("expiresAt exactly now is NOT valid (strict future required)", () => {
-    const now = new Date(Date.now()).toISOString()
-    // The fixture timestamp is <= Date.now() by the time we evaluate it.
-    expect(isTokenValid(writeToken({ expiresAt: now }))).toBe(false)
+  test("CORE REGRESSION: logged-in whoami WITH a STALE on-disk token file => authenticated true", () => {
+    // SDK 2.0.1 would have flipped this to false via the file-expiry override.
+    const tempHome = mockHome()
+    const tokenPath = writeStaleToken(tempHome)
+    spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
+
+    const status = verifyAuth()
+    expect(status.authenticated).toBe(true) // stale expiresAt must NOT downgrade
+    expect(status.tokenPath).toBe(tokenPath) // file still reported as a refresh source
   })
 
-  test("missing expiresAt field is NOT valid", () => {
-    expect(isTokenValid(writeToken({ accessToken: "abc" }))).toBe(false)
+  test("logged-in whoami with a MISSING token file => authenticated true (file is not authoritative)", () => {
+    mockHome() // no token file written under the temp home
+    spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
+
+    const status = verifyAuth()
+    expect(status.authenticated).toBe(true)
+    expect(status.tokenPath).toBeUndefined()
   })
 
-  test("non-string (garbage) expiresAt is NOT valid", () => {
-    expect(isTokenValid(writeToken({ expiresAt: 12345 }))).toBe(false)
+  test("does NOT decide on exit code alone: logged-in (EXIT=0) stays authenticated", () => {
+    // execFileSync returns stdout (success/EXIT=0) for both fixtures; only the
+    // parsed accountType distinguishes them, never the exit code.
+    spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
+    mockHome()
+    expect(verifyAuth().authenticated).toBe(true)
   })
 
-  test("unparseable expiresAt string is NOT valid", () => {
-    expect(isTokenValid(writeToken({ expiresAt: "not-a-date" }))).toBe(false)
+  test("spawn error on whoami => authenticated false", () => {
+    const err = Object.assign(new Error("spawn kiro-cli ENOENT"), { code: "ENOENT" })
+    spies.push(mockKiroCli({ whoami: err }))
+    mockHome()
+    expect(verifyAuth().authenticated).toBe(false)
   })
 
-  test("malformed JSON is NOT valid and does not throw", () => {
-    expect(isTokenValid(writeToken("this is not valid json {{{"))).toBe(false)
+  test("timeout on whoami => authenticated false", () => {
+    const err = Object.assign(new Error("Command timed out"), { code: "ETIMEDOUT", signal: "SIGTERM" })
+    spies.push(mockKiroCli({ whoami: err }))
+    mockHome()
+    expect(verifyAuth().authenticated).toBe(false)
   })
 
-  test("missing token file is NOT valid and does not throw", () => {
-    expect(isTokenValid(join(testDir, "does-not-exist.json"))).toBe(false)
+  test("empty whoami output => authenticated false", () => {
+    spies.push(mockKiroCli({ whoami: "" }))
+    mockHome()
+    expect(verifyAuth().authenticated).toBe(false)
   })
-})
 
-describe("verifyAuth", () => {
+  test("non-JSON whoami output (no brace line) => authenticated false", () => {
+    spies.push(mockKiroCli({ whoami: "error: not a terminal\nspinner..." }))
+    mockHome()
+    expect(verifyAuth().authenticated).toBe(false)
+  })
+
+  test("unparseable first brace-line => authenticated false", () => {
+    spies.push(mockKiroCli({ whoami: "{not valid json" }))
+    mockHome()
+    expect(verifyAuth().authenticated).toBe(false)
+  })
+
+  test('whoami JSON with empty-string accountType => authenticated false', () => {
+    spies.push(mockKiroCli({ whoami: '{"accountType":"   "}' }))
+    mockHome()
+    expect(verifyAuth().authenticated).toBe(false)
+  })
+
+  test("kiro-cli not installed (--version throws) => installed/authenticated false, never throws", () => {
+    spies.push(mockKiroCli({ version: new Error("spawn kiro-cli ENOENT") }))
+    let status: AuthStatus | undefined
+    expect(() => {
+      status = verifyAuth()
+    }).not.toThrow()
+    expect(status!.installed).toBe(false)
+    expect(status!.authenticated).toBe(false)
+  })
+
   test("never throws and returns an AuthStatus value", () => {
+    spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_OUT }))
+    mockHome()
     let status: AuthStatus | undefined
     expect(() => {
       status = verifyAuth()
