@@ -8,7 +8,7 @@
 npm install kiro-acp-ai-provider @ai-sdk/provider
 ```
 
-> **Note**: Your application also needs the `ai` package (Vercel AI SDK) — install it separately if you haven't already:
+> **Note**: Your application also needs the `ai` package (Vercel AI SDK). Install it separately if you haven't already:
 > ```bash
 > npm install ai
 > ```
@@ -20,7 +20,7 @@ npm install kiro-acp-ai-provider @ai-sdk/provider
   ```bash
   kiro-cli login
   ```
-- **Kiro subscription** (Pro, Pro+, or Power)
+- **Kiro subscription** (Pro, Pro+, Pro Max, or Power)
 
 ## Quick Start
 
@@ -50,7 +50,7 @@ Your App → AI SDK → kiro-acp-ai-provider → kiro-cli (ACP) → AWS Models
                     MCP Bridge (per-session)
 ```
 
-The provider translates AI SDK calls into ACP messages sent to a `kiro-cli` subprocess over JSON-RPC stdio. Tool calls are relayed through an MCP bridge back to your application via IPC — the bridge does **not** execute tools, your application does.
+The provider translates AI SDK calls into ACP messages sent to a `kiro-cli` subprocess over JSON-RPC stdio. Tool calls are relayed through an MCP bridge back to your application via IPC. The bridge does **not** execute tools, your application does.
 
 ## Configuration
 
@@ -117,13 +117,15 @@ const models = await listModels({ cwd: process.cwd() })
 const quota = await getQuota({ client: kiro.getClient() })
 ```
 
+`verifyAuth()` determines authentication solely from `kiro-cli whoami`, which abstracts the per-OS credential store. The on-disk SSO token file and its expiry are not consulted for the auth decision, so a stale token file never misreports a logged-in user. The returned `tokenPath` is provided only as an optional refresh hint for consumers.
+
 ## Models
 
 Available models depend on your subscription:
 
 | Model ID | Description |
 |----------|-------------|
-| `claude-opus-4.7` | Most capable |
+| `claude-opus-4.8` | Most capable |
 | `claude-sonnet-4.6` | Balanced |
 | `claude-haiku-4.5` | Fastest |
 
@@ -131,7 +133,7 @@ Use `listModels()` for the current list.
 
 ## Tools
 
-Tools work through the standard AI SDK contract. The provider includes an MCP bridge that reads tool definitions from a JSON file and relays calls to your application via IPC. Pass custom tools through the AI SDK as usual — the provider handles the MCP bridge plumbing.
+Tools work through the standard AI SDK contract. The provider includes an MCP bridge that reads tool definitions from a JSON file and relays calls to your application via IPC. Pass custom tools through the AI SDK as usual; the provider handles the MCP bridge plumbing.
 
 ## Image Support
 
@@ -139,7 +141,7 @@ The provider supports images in two paths:
 
 ### User-attached images
 
-Images pasted in chat are sent as `ContentBlock[]` with the prompt via ACP's `session/prompt`. This is the native path — kiro-cli handles image optimization and the model sees them directly.
+Images pasted in chat are sent as `ContentBlock[]` with the prompt via ACP's `session/prompt`. This is the native path: kiro-cli handles image optimization and the model sees them directly.
 
 ### Tool-returned images
 
@@ -149,7 +151,7 @@ When a tool (e.g., a file read tool) returns an image, the provider uses a follo
 2. The first model response is aborted
 3. A follow-up `session/prompt` is sent with the images as `ContentBlock[]`, including the original user request for context
 
-This is necessary because kiro-cli's MCP tool result path doesn't reliably handle large images — sending them through the user-message path (`session/prompt`) ensures proper image processing.
+This is necessary because kiro-cli's MCP tool result path doesn't reliably handle large images; sending them through the user-message path (`session/prompt`) ensures proper image processing.
 
 > **Note**: The follow-up approach adds a small latency overhead (~1-2s) for tool results that contain images. Text-only tool results are unaffected.
 
@@ -163,6 +165,10 @@ This is necessary because kiro-cli's MCP tool result path doesn't reliably handl
 - **No ACP session/fork**: Kiro ACP doesn't support native fork/truncate, so reverts replay the conversation history as context text
 - **No Thinking support**: Kiro ACP doesn't support it.
 - **Tool-returned images**: Uses a follow-up prompt approach which adds ~1-2s latency and an extra synthetic message in kiro-cli's session history
+
+## Errors
+
+When kiro-cli returns a JSON-RPC `-32603` internal error and `kiro-cli whoami` reports you are logged out, the provider raises an actionable error asking you to re-authenticate with `kiro-cli login` (run `kiro-cli doctor` to help diagnose). Recent kiro-cli stderr is appended to the message to aid diagnosis.
 
 ## License
 
