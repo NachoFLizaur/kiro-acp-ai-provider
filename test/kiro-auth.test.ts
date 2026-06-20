@@ -1,9 +1,9 @@
-import { describe, test, expect, spyOn, afterEach } from "bun:test"
+import { describe, test, expect, spyOn, beforeEach, afterEach } from "bun:test"
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import * as os from "node:os"
 import * as childProcess from "node:child_process"
-import { verifyAuth, type AuthStatus } from "../src/kiro-auth"
+import { verifyAuth, resetAuthCache, type AuthStatus } from "../src/kiro-auth"
 
 // ---------------------------------------------------------------------------
 // verifyAuth() auth authority = `kiro-cli whoami --format json` (SDK 2.0.2).
@@ -58,6 +58,10 @@ function mockKiroCli(opts: { version?: string | Error; whoami?: string | Error }
 describe("verifyAuth: whoami --format json detection rule", () => {
   const spies: Array<{ mockRestore: () => void }> = []
   const tempHomes: string[] = []
+
+  // verifyAuth() memoizes for a short TTL, so without a reset one case's
+  // AuthStatus would leak into the next. Drop the cache before each case.
+  beforeEach(resetAuthCache)
 
   afterEach(() => {
     while (spies.length) spies.pop()!.mockRestore()

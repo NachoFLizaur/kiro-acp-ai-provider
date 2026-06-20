@@ -517,6 +517,10 @@ export class ACPClient {
     await this.executeCommand(sessionId, "model", { value: modelId })
   }
 
+  async setEffort(sessionId: string, level: string): Promise<CommandResult> {
+    return this.executeCommand(sessionId, "effort", { value: level })
+  }
+
   async setMode(sessionId: string, modeId: string): Promise<void> {
     await this.sendRequest("session/set_mode", { sessionId, modeId })
   }

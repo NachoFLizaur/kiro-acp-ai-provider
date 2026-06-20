@@ -1,5 +1,6 @@
 import { describe, test, expect, mock, beforeEach, spyOn } from "bun:test"
 import { KiroACPLanguageModel, type KiroACPModelConfig } from "../src/kiro-acp-model"
+import { resetAuthCache } from "../src/kiro-auth"
 import { KiroACPError, KiroACPConnectionError } from "../src/acp-client"
 import type { ACPClient, ACPSession, SessionUpdate, PromptOptions } from "../src/acp-client"
 import type { IPCServer, PendingToolCall, ToolResultRequest } from "../src/ipc-server"
@@ -302,6 +303,186 @@ describe("KiroACPLanguageModel", () => {
       await collectStream(result.stream)
 
       expect(client.setModel).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("reasoning effort (providerOptions)", () => {
+    // A prompt that streams one chunk and ends cleanly, so the no-op tests can
+    // assert the turn still succeeds regardless of effort handling.
+    const completingPrompt = () =>
+      mock(async (opts: PromptOptions) => {
+        opts.onUpdate({
+          sessionUpdate: "agent_message_chunk",
+          content: { text: "ok" },
+        })
+        return { stopReason: "end_turn" }
+      })
+
+    const effortRequest = (level: string): LanguageModelV3CallOptions =>
+      makeCallOptions(
+        [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+        { providerOptions: { kiro: { reasoningEffort: level } } },
+      )
+
+    test("applies requested effort for supported model/level", async () => {
+      const setEffort = mock(async () => ({ success: true, message: "ok" }))
+      const client = createMockClient({
+        setEffort,
+        prompt: completingPrompt(),
+      } as unknown as Partial<ACPClient>)
+
+      // opus-4.8 supports "high"; the native level relays through unchanged.
+      const model = new KiroACPLanguageModel("claude-opus-4.8", { client })
+
+      const result = await model.doStream(effortRequest("high"))
+      await collectStream(result.stream)
+
+      expect(setEffort).toHaveBeenCalledTimes(1)
+      expect(setEffort).toHaveBeenCalledWith("sess-1", "high")
+    })
+
+    test("per-request effort overrides resolved default", async () => {
+      const setEffort = mock(async () => ({ success: true, message: "ok" }))
+      const client = createMockClient({
+        setEffort,
+        prompt: completingPrompt(),
+      } as unknown as Partial<ACPClient>)
+
+      // Per-call effort must win over the resolved config.effort default.
+      const model = new KiroACPLanguageModel("claude-opus-4.8", {
+        client,
+        effort: "low",
+      })
+
+      const result = await model.doStream(effortRequest("high"))
+      await collectStream(result.stream)
+
+      expect(setEffort).toHaveBeenCalledTimes(1)
+      expect(setEffort).toHaveBeenCalledWith("sess-1", "high")
+    })
+
+    test("skips setEffort for unsupported model", async () => {
+      const setEffort = mock(async () => ({ success: true, message: "ok" }))
+      const client = createMockClient({
+        setEffort,
+        prompt: completingPrompt(),
+      } as unknown as Partial<ACPClient>)
+
+      // opus-4.5 has no effort control, so the requested level is a silent no-op.
+      const model = new KiroACPLanguageModel("claude-opus-4.5", { client })
+
+      const result = await model.doStream(effortRequest("high"))
+      const parts = await collectStream(result.stream)
+
+      expect(setEffort).not.toHaveBeenCalled()
+      // The prompt still succeeds with its normal stop reason.
+      const finish = parts.find((p) => p.type === "finish")
+      expect(finish?.type === "finish" && finish.finishReason.unified).toBe("stop")
+      expect(parts.find((p) => p.type === "error")).toBeUndefined()
+    })
+
+    test("skips setEffort for unsupported level", async () => {
+      const setEffort = mock(async () => ({ success: true, message: "ok" }))
+      const client = createMockClient({
+        setEffort,
+        prompt: completingPrompt(),
+      } as unknown as Partial<ACPClient>)
+
+      // opus-4.6 tops out at "max"; "xhigh" is out of its supported set.
+      const model = new KiroACPLanguageModel("claude-opus-4.6", { client })
+
+      const result = await model.doStream(effortRequest("xhigh"))
+      const parts = await collectStream(result.stream)
+
+      expect(setEffort).not.toHaveBeenCalled()
+      const finish = parts.find((p) => p.type === "finish")
+      expect(finish?.type === "finish" && finish.finishReason.unified).toBe("stop")
+      expect(parts.find((p) => p.type === "error")).toBeUndefined()
+    })
+
+    test("does not throw when setEffort returns success false", async () => {
+      const setEffort = mock(async () => ({
+        success: false,
+        message: "unsupported",
+      }))
+      const client = createMockClient({
+        setEffort,
+        prompt: completingPrompt(),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-opus-4.8", { client })
+
+      const result = await model.doStream(effortRequest("high"))
+      const parts = await collectStream(result.stream)
+
+      // setEffort was attempted, but a false result must not break the turn.
+      expect(setEffort).toHaveBeenCalledTimes(1)
+      const finish = parts.find((p) => p.type === "finish")
+      expect(finish?.type === "finish" && finish.finishReason.unified).toBe("stop")
+      expect(parts.find((p) => p.type === "error")).toBeUndefined()
+    })
+
+    test("skips redundant setEffort when currentEffort matches", async () => {
+      const setEffort = mock(async () => ({ success: true, message: "ok" }))
+      const client = createMockClient({
+        setEffort,
+        prompt: completingPrompt(),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-opus-4.8", { client })
+
+      // Same level across two turns: the currentEffort guard suppresses the 2nd call.
+      await collectStream((await model.doStream(effortRequest("high"))).stream)
+      await collectStream((await model.doStream(effortRequest("high"))).stream)
+
+      expect(setEffort).toHaveBeenCalledTimes(1)
+    })
+
+    test("does not throw when setEffort rejects (swallows the rejection)", async () => {
+      const setEffort = mock(async () => {
+        throw new Error("setEffort transport failure")
+      })
+      const client = createMockClient({
+        setEffort,
+        prompt: completingPrompt(),
+      } as unknown as Partial<ACPClient>)
+
+      const model = new KiroACPLanguageModel("claude-opus-4.8", { client })
+
+      const result = await model.doStream(effortRequest("high"))
+      const parts = await collectStream(result.stream)
+
+      // A rejected setEffort (vs the success:false case) must also be swallowed:
+      // the turn finishes normally and no error part leaks into the stream.
+      expect(setEffort).toHaveBeenCalledTimes(1)
+      const finish = parts.find((p) => p.type === "finish")
+      expect(finish?.type === "finish" && finish.finishReason.unified).toBe("stop")
+      expect(parts.find((p) => p.type === "error")).toBeUndefined()
+    })
+
+    test("resets to the model's native default effort when a later turn is unset (non-sticky)", async () => {
+      const setEffort = mock(async () => ({ success: true, message: "ok" }))
+      const client = createMockClient({
+        setEffort,
+        prompt: completingPrompt(),
+      } as unknown as Partial<ACPClient>)
+
+      // opus-4.8's native default effort is "max".
+      const model = new KiroACPLanguageModel("claude-opus-4.8", { client })
+
+      // Turn 1: explicit per-request "high" is applied to the session.
+      await collectStream((await model.doStream(effortRequest("high"))).stream)
+      expect(setEffort).toHaveBeenNthCalledWith(1, "sess-1", "high")
+
+      // Turn 2: same session, no per-request effort and no config.effort, must
+      // reset to the native default ("max") rather than staying stuck at "high".
+      await collectStream(
+        (await model.doStream(
+          makeCallOptions([{ role: "user", content: [{ type: "text", text: "hi" }] }]),
+        )).stream,
+      )
+      expect(setEffort).toHaveBeenNthCalledWith(2, "sess-1", "max")
+      expect(setEffort).toHaveBeenCalledTimes(2)
     })
   })
 
@@ -639,6 +820,10 @@ describe("KiroACPLanguageModel", () => {
   })
 
   describe("doStream() — error handling", () => {
+    // verifyAuth() memoizes for a short TTL, so without a reset one case's
+    // AuthStatus would leak into the next. Drop the cache before each case.
+    beforeEach(resetAuthCache)
+
     test("preserves original error message for non-KiroACPError errors", async () => {
       const client = createMockClient({
         prompt: mock(async () => {

@@ -10,33 +10,131 @@ export interface AuthStatus {
   tokenPath?: string
 }
 
-// Bounded timeout for the whoami auth probe. whoami may perform a network
-// refresh, so it must never block or hang process startup.
-const WHOAMI_TIMEOUT_MS = 8000
+// Bounded timeouts for the two synchronous probes. `--version` is a local print;
+// `whoami` may do a network token refresh, so it keeps more margin. Generous
+// enough that a slow-but-logged-in machine never reports logged-out.
+const VERSION_TIMEOUT_MS = 3000
+const WHOAMI_TIMEOUT_MS = 5000
+
+// Short-TTL memoization of verifyAuth(). It runs two blocking spawns on the hot
+// -32603 error path, so a burst of failures would otherwise re-spawn every time.
+// TTL is short so a real login/logout is reflected almost immediately.
+const AUTH_CACHE_TTL_MS = 5000
+let authCache: { value: AuthStatus; expiresAt: number } | null = null
+
+/** Drop the memoized verifyAuth() result so the next call re-probes. */
+export function resetAuthCache(): void {
+  authCache = null
+}
 
 /**
- * Decide auth state from `kiro-cli whoami --format json` stdout.
+ * Extract the first balanced JSON object from text via brace matching.
  *
- * The logged-in output appends a NON-JSON "Profile:\n<name>\n<arn>" trailer
- * after the JSON line, so we never JSON.parse the whole stdout. Take the FIRST
- * line whose trimmed text starts with "{" and parse THAT line only.
- *
- * authenticated is true IFF the parse succeeds AND `accountType` is a non-empty
- * string (e.g. "IamIdentityCenter"). Logged out is `{"account":null}` (no
- * accountType). Empty / non-JSON / no-brace output is treated as logged out.
- * Never throws.
+ * `whoami --format json` appends a non-JSON "Profile:" trailer, so we cannot
+ * parse the whole output. String literals are tracked (with escape handling) so
+ * a "}" inside a value cannot close the object early. Returns the object
+ * substring, or null when there is no balanced close.
  */
-function parseWhoamiAuthenticated(stdout: string): boolean {
-  const line = stdout
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .find((l) => l.startsWith("{"))
-  if (!line) return false // no JSON object line (covers empty / non-JSON output)
+function extractFirstJsonObject(text: string): string | null {
+  const start = text.indexOf("{")
+  if (start === -1) return null
+
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === "\\") escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+    if (ch === "{") {
+      depth++
+    } else if (ch === "}") {
+      depth--
+      if (depth === 0) return text.slice(start, i + 1)
+    }
+  }
+  return null // no balanced close
+}
+
+/**
+ * True IFF `text` has a parseable auth object with a non-empty `accountType`.
+ * Logged out is `{"account":null}`; non-JSON/unparseable is treated as logged out.
+ */
+function hasAuthenticatedAccount(text: string): boolean {
+  const json = extractFirstJsonObject(text)
+  if (!json) return false
   try {
-    const parsed = JSON.parse(line) as { accountType?: unknown }
+    const parsed = JSON.parse(json) as { accountType?: unknown }
     return typeof parsed.accountType === "string" && parsed.accountType.trim() !== ""
   } catch {
-    return false // unparseable first line
+    return false // not valid JSON
+  }
+}
+
+/**
+ * Decide auth state from whoami output. stdout is primary; fall back to stderr
+ * in case a future kiro-cli writes the JSON there.
+ */
+function parseWhoamiAuthenticated(stdout: string, stderr = ""): boolean {
+  return hasAuthenticatedAccount(stdout) || hasAuthenticatedAccount(stderr)
+}
+
+/**
+ * Spawn `kiro-cli --version` then `whoami --format json` and derive an
+ * AuthStatus. Factored out of verifyAuth so the cache covers every return path.
+ */
+function probeAuth(): AuthStatus {
+  const isWin = process.platform === "win32"
+
+  let installed = false
+  let version: string | undefined
+  try {
+    version = execFileSync("kiro-cli", ["--version"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: VERSION_TIMEOUT_MS,
+      shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
+    })
+      .toString()
+      .trim()
+    installed = true
+  } catch {
+    return { installed: false, authenticated: false }
+  }
+
+  // Authority = whoami --format json; require a non-empty accountType. We never
+  // decide on exit code alone. On the throw path execFileSync attaches captured
+  // stdout/stderr, so parse both before concluding logged-out.
+  let authenticated = false
+  try {
+    const stdout = execFileSync("kiro-cli", ["whoami", "--format", "json"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: WHOAMI_TIMEOUT_MS,
+      shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
+    }).toString()
+    authenticated = parseWhoamiAuthenticated(stdout)
+  } catch (err) {
+    const e = err as { stdout?: Buffer | string | null; stderr?: Buffer | string | null }
+    const out = e?.stdout != null ? e.stdout.toString() : ""
+    const errOut = e?.stderr != null ? e.stderr.toString() : ""
+    authenticated = parseWhoamiAuthenticated(out, errOut)
+  }
+
+  const tokenPath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json")
+  const hasToken = existsSync(tokenPath)
+
+  return {
+    installed,
+    authenticated,
+    version,
+    tokenPath: hasToken ? tokenPath : undefined,
   }
 }
 
@@ -49,49 +147,16 @@ function parseWhoamiAuthenticated(stdout: string): boolean {
  * consulted for the auth decision: kiro-cli auto-re-authenticates, so a stale
  * file `expiresAt` is meaningless and previously misclassified a logged-in user
  * as expired. The returned `tokenPath` is reported only as an OPTIONAL refresh
- * source for consumers. Never throws.
+ * source for consumers.
+ *
+ * Memoized for a short TTL (see authCache) and kept synchronous so callers are
+ * untouched. Never throws.
  */
 export function verifyAuth(): AuthStatus {
-  const isWin = process.platform === "win32"
-
-  let installed = false
-  let version: string | undefined
-  try {
-    version = execFileSync("kiro-cli", ["--version"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 5000,
-      shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
-    })
-      .toString()
-      .trim()
-    installed = true
-  } catch {
-    return { installed: false, authenticated: false }
+  if (authCache && Date.now() < authCache.expiresAt) {
+    return authCache.value // fresh; reuse without re-spawning
   }
-
-  // Authority = kiro-cli whoami --format json. Parse the first "{"-line only and
-  // require a non-empty accountType (see parseWhoamiAuthenticated). A spawn
-  // error or a timeout means NOT authenticated; we never decide on the exit code
-  // alone (logged-in is EXIT=0; the logged-out exit code is unconfirmed).
-  let authenticated = false
-  try {
-    const stdout = execFileSync("kiro-cli", ["whoami", "--format", "json"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: WHOAMI_TIMEOUT_MS,
-      shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
-    }).toString()
-    authenticated = parseWhoamiAuthenticated(stdout)
-  } catch {
-    authenticated = false
-  }
-
-  const tokenPath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json")
-  const hasToken = existsSync(tokenPath)
-
-  return {
-    installed,
-    authenticated,
-    version,
-    tokenPath: hasToken ? tokenPath : undefined,
-  }
+  const value = probeAuth()
+  authCache = { value, expiresAt: Date.now() + AUTH_CACHE_TTL_MS }
+  return value
 }
