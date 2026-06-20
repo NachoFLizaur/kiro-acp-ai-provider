@@ -141,3 +141,4 @@ docs/
 
 # Corvus task planning artifacts
 .corvus/
+.kiro/
