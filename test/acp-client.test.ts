@@ -647,6 +647,22 @@ describe("ACPClient", () => {
       expect(tools).toHaveLength(1)
     })
   })
+
+  describe("setEffort()", () => {
+    test("issues an effort command with the requested native level", async () => {
+      // setEffort relays the level verbatim through executeCommand.
+      const client = new ACPClient({ cwd: "/tmp" })
+      const executeCommand = mock(async () => ({ success: true, message: "ok" }))
+      ;(client as any).executeCommand = executeCommand
+
+      const result = await client.setEffort("sess-1", "low")
+
+      expect(executeCommand).toHaveBeenCalledWith("sess-1", "effort", {
+        value: "low",
+      })
+      expect(result).toEqual({ success: true, message: "ok" })
+    })
+  })
 })
 
 describe("generateAgentConfig consumer-agnostic", () => {

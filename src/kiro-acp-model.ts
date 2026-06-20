@@ -15,6 +15,7 @@ import type {
 import { appendFileSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
 import { KiroACPError, type ACPClient, type ACPSession, type SessionUpdate, type ContentBlock, type SessionMetadata } from "./acp-client"
+import { reasoningEffortsFor, defaultEffortFor } from "./kiro-effort"
 import { verifyAuth } from "./kiro-auth"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
 import { interceptSessionAffinity } from "./session-affinity"
@@ -99,6 +100,8 @@ export interface KiroACPModelConfig {
   sessionId?: string
   /** Max context window in tokens. Default: 1_000_000. */
   contextWindow?: number
+  /** Default reasoning effort, resolved by the provider. Per-call `providerOptions.kiro.reasoningEffort` overrides it. */
+  effort?: string
   /**
    * Lazy accessor for an isolated ACPClient used to serve ephemeral
    * (toolless) calls — e.g. title generation. When provided,
@@ -332,6 +335,32 @@ function debugLogIntercept(
 }
 
 /**
+ * Log a swallowed `setEffort` failure to `$KIRO_ACP_DEBUG_FILE` so it stays
+ * diagnosable. Best-effort, inert unless the env var is set; never throws.
+ */
+function debugLogEffortFailure(
+  modelId: string,
+  sessionId: string,
+  requested: string,
+  err: unknown,
+): void {
+  const file = process.env.KIRO_ACP_DEBUG_FILE
+  if (!file) return
+  try {
+    const record = {
+      ts: new Date().toISOString(),
+      model: modelId,
+      sessionId,
+      effortRequested: requested,
+      effortError: err instanceof Error ? err.message : String(err),
+    }
+    appendFileSync(file, JSON.stringify(record) + "\n")
+  } catch {
+    // Observability must never affect the call path
+  }
+}
+
+/**
  * Extract system prompt and latest user message from a LanguageModelV3Prompt.
  *
  * Assistant and tool messages are skipped — kiro-cli's ACP session maintains
@@ -483,6 +512,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private readonly client: ACPClient
   private readonly config: KiroACPModelConfig
   private currentModelId: string | null = null
+  private currentEffort: string | null = null
   private initPromise: Promise<void> | null = null
   private totalCredits = 0
   private currentAffinityId: string | undefined
@@ -714,6 +744,46 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     await this.client.setModel(session.sessionId, this.modelId)
     this.currentModelId = this.modelId
+  }
+
+  /**
+   * Resolve requested effort: per-call `providerOptions.kiro.reasoningEffort`,
+   * else `config.effort`, else the model's native default. The native-default
+   * fallback resets an unset turn instead of leaving effort sticky.
+   */
+  private resolveRequestedEffort(options: LanguageModelV3CallOptions): string | undefined {
+    const fromRequest = options.providerOptions?.kiro?.reasoningEffort
+    if (typeof fromRequest === "string") return fromRequest
+    return this.config.effort ?? defaultEffortFor(this.modelId)
+  }
+
+  /**
+   * Apply an effort level to the session. Never throws and never changes the
+   * stop reason: unsupported models/levels and any setEffort failure are
+   * silent no-ops.
+   */
+  private async ensureEffort(session: ACPSession, requested: string | undefined): Promise<void> {
+    if (!requested) return
+
+    // Validate against the supported set before sending; out-of-set is a no-op.
+    const supported = reasoningEffortsFor(this.modelId)
+    if (supported.length === 0 || !supported.some((level) => level === requested)) {
+      return
+    }
+
+    // Skip redundant calls (mirrors the currentModelId guard).
+    if (this.currentEffort === requested) return
+
+    try {
+      const result = await this.client.setEffort(session.sessionId, requested)
+      if (result.success) {
+        this.currentEffort = requested
+      }
+      // success:false (unsupported model/level): leave currentEffort untouched.
+    } catch (err) {
+      // Swallow any setEffort error; log it env-gated for diagnosis.
+      debugLogEffortFailure(this.modelId, session.sessionId, requested, err)
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1093,6 +1163,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       this.ephemeralModel = new KiroACPLanguageModel(this.modelId, {
         client: ephemeralClient,
         contextWindow: this.config.contextWindow,
+        // Propagate the provider default so ephemeral turns inherit it.
+        effort: this.config.effort,
       })
     }
     return this.ephemeralModel.doStream(options)
@@ -1122,6 +1194,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       const model = new KiroACPLanguageModel(this.modelId, {
         client,
         contextWindow: this.config.contextWindow,
+        // Propagate the provider default so subagent turns inherit it.
+        effort: this.config.effort,
       })
       entry = { client, model, timer: null }
       this.subClients.set(affinityId, entry)
@@ -1506,6 +1580,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   ): Promise<LanguageModelV3StreamResult> {
     const session = await this.acquireSession(options.tools)
     await this.ensureModel(session)
+    await this.ensureEffort(session, this.resolveRequestedEffort(options))
 
     let promptBlocks: ContentBlock[]
 

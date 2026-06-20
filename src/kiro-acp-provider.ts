@@ -24,12 +24,18 @@ export interface KiroACPProviderSettings {
   contextWindow?: number
   /** Per-model context windows keyed by model id, e.g. relayed from a host's model catalog (models.dev). Used when no per-call `contextWindow` override is given. */
   contextWindows?: Record<string, number>
+  /** Default reasoning effort for every model from this provider. Mirrors `contextWindow`. */
+  effort?: string
+  /** Per-model default effort levels keyed by model id. Mirrors `contextWindows`. */
+  efforts?: Record<string, string>
   /** MCP tool call timeout in minutes. Default: 30. */
   mcpTimeout?: number
 }
 
 export interface KiroACPModelOverrides {
   contextWindow?: number
+  /** Per-call default native kiro reasoning effort level. Overrides the provider-level `effort`/`efforts` settings. */
+  effort?: string
 }
 
 export interface KiroACPProvider {
@@ -102,6 +108,12 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
         settings.contextWindows?.[modelId] ??
         settings.contextWindow ??
         1_000_000,
+      // Same precedence ladder as contextWindow: per-call -> per-model -> provider.
+      effort:
+        overrides?.effort ??
+        settings.efforts?.[modelId] ??
+        settings.effort ??
+        undefined,
       getEphemeralClient,
       affinityPrompts,
     })

@@ -61,10 +61,14 @@ export {
   type ToolExecuteResponse,
 } from "./ipc-server"
 
+// Reasoning effort: per-model native kiro effort vocabularies.
+export { reasoningEffortsFor, defaultEffortFor, type KiroEffortLevel } from "./kiro-effort"
+
 // Utilities
 export { verifyAuth, type AuthStatus } from "./kiro-auth"
 export {
   listModels,
   type ListModelsOptions,
+  type ModelWithEfforts,
 } from "./kiro-models"
 export { getQuota, type QuotaInfo, type GetQuotaOptions } from "./kiro-quota"

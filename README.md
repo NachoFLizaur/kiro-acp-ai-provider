@@ -104,7 +104,7 @@ kiro.getTotalCredits()                       // Total credits consumed
 Standalone functions that don't require a running provider:
 
 ```typescript
-import { verifyAuth, listModels, getQuota } from "kiro-acp-ai-provider"
+import { verifyAuth, listModels, getQuota, reasoningEffortsFor } from "kiro-acp-ai-provider"
 
 // Check if kiro-cli is installed and authenticated
 const status = verifyAuth()
@@ -115,6 +115,10 @@ const models = await listModels({ cwd: process.cwd() })
 
 // Get per-session credit usage
 const quota = await getQuota({ client: kiro.getClient() })
+
+// Native reasoning effort levels for a model, low to high ([] when unsupported)
+const levels = reasoningEffortsFor("claude-opus-4.8")
+// ["low", "medium", "high", "xhigh", "max"]
 ```
 
 `verifyAuth()` determines authentication solely from `kiro-cli whoami`, which abstracts the per-OS credential store. The on-disk SSO token file and its expiry are not consulted for the auth decision, so a stale token file never misreports a logged-in user. The returned `tokenPath` is provided only as an optional refresh hint for consumers.
@@ -130,6 +134,34 @@ Available models depend on your subscription:
 | `claude-haiku-4.5` | Fastest |
 
 Use `listModels()` for the current list.
+
+## Reasoning effort
+
+Reasoning effort is a supported per-turn option. Set it per request through `providerOptions`, keyed by the provider id `kiro`:
+
+```typescript
+const result = streamText({
+  model: kiro("claude-opus-4.8"),
+  prompt: "Explain the tradeoffs",
+  providerOptions: { kiro: { reasoningEffort: "high" } },
+})
+```
+
+The same option works on `generateText`. You can also set a default at the provider level with `createKiroAcp({ effort: "high" })` or per model with `kiro("claude-opus-4.8", { effort: "high" })`; a per-request `providerOptions.kiro.reasoningEffort` wins over both.
+
+Levels are per model, and not every model has them:
+
+| Model | Levels |
+|-------|--------|
+| `claude-opus-4.8`, `claude-opus-4.7` | `low`, `medium`, `high`, `xhigh`, `max` |
+| `claude-opus-4.6`, `claude-sonnet-4.6` | `low`, `medium`, `high`, `max` (no `xhigh`) |
+| everything else | none |
+
+`reasoningEffortsFor(modelId)` returns a model's levels low to high (or `[]` when it has no effort control); `defaultEffortFor(modelId)` returns its native default (e.g. `claude-opus-4.8` is `max`).
+
+- **Resets to the default**: when a turn requests no effort, the SDK reapplies the model's native default instead of leaving the session stuck at the last value.
+- **Graceful no-op**: an unsupported model or level is ignored. It never throws and never changes the result.
+- **No off switch**: the lowest level still produces a reasoning trail; reasoning cannot be disabled.
 
 ## Tools
 
@@ -158,12 +190,12 @@ This is necessary because kiro-cli's MCP tool result path doesn't reliably handl
 ## Known Limitations
 
 - **System prompt**: Kiro's base context is always present; yours is injected via `<system_instructions>` tags
-- **No per-turn options**: Temperature, thinking toggle, etc. are controlled by kiro-cli
+- **Limited per-turn options**: Temperature and similar sampling parameters are controlled by kiro-cli. Reasoning effort is the exception (see Reasoning effort)
 - **Estimated token counts**: Input tokens estimated from context usage %, output from character count
 - **Process model**: One kiro-cli per provider instance (subagent sessions get their own isolated process); concurrent sessions use lane routing
 - **Revert-to-message**: Requires the consumer to signal session reset via `x-session-reset` header as Kiro ACP doesn't support Checkpointing.
 - **No ACP session/fork**: Kiro ACP doesn't support native fork/truncate, so reverts replay the conversation history as context text
-- **No Thinking support**: Kiro ACP doesn't support it.
+- **Reasoning**: Kiro always streams reasoning and it cannot be disabled. Effort is configurable per model (see Reasoning effort)
 - **Tool-returned images**: Uses a follow-up prompt approach which adds ~1-2s latency and an extra synthetic message in kiro-cli's session history
 
 ## Errors
