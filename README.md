@@ -157,7 +157,7 @@ Levels are per model, and not every model has them:
 | `claude-opus-4.6`, `claude-sonnet-4.6` | `low`, `medium`, `high`, `max` (no `xhigh`) |
 | everything else | none |
 
-`reasoningEffortsFor(modelId)` returns a model's levels low to high (or `[]` when it has no effort control); `defaultEffortFor(modelId)` returns its native default (e.g. `claude-opus-4.8` is `max`).
+`reasoningEffortsFor(modelId)` returns a model's levels low to high (or `[]` when it has no effort control); `defaultEffortFor(modelId)` returns its native default (e.g. `claude-opus-4.8` is `high`).
 
 - **Resets to the default**: when a turn requests no effort, the SDK reapplies the model's native default instead of leaving the session stuck at the last value.
 - **Graceful no-op**: an unsupported model or level is ignored. It never throws and never changes the result.

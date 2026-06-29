@@ -25,7 +25,7 @@ export function reasoningEffortsFor(modelId: string): KiroEffortLevel[] {
 
 /** Per-model native default effort, matching kiro-cli's own defaults. */
 const PER_MODEL_DEFAULT_EFFORTS: Record<string, KiroEffortLevel> = {
-  "claude-opus-4.8": "max",
+  "claude-opus-4.8": "high",
   "claude-opus-4.7": "xhigh",
   "claude-opus-4.6": "high",
   "claude-sonnet-4.6": "high",
