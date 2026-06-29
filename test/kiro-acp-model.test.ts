@@ -467,21 +467,21 @@ describe("KiroACPLanguageModel", () => {
         prompt: completingPrompt(),
       } as unknown as Partial<ACPClient>)
 
-      // opus-4.8's native default effort is "max".
+      // opus-4.8's native default effort is "high".
       const model = new KiroACPLanguageModel("claude-opus-4.8", { client })
 
-      // Turn 1: explicit per-request "high" is applied to the session.
-      await collectStream((await model.doStream(effortRequest("high"))).stream)
-      expect(setEffort).toHaveBeenNthCalledWith(1, "sess-1", "high")
+      // Turn 1: explicit per-request "max" is applied to the session.
+      await collectStream((await model.doStream(effortRequest("max"))).stream)
+      expect(setEffort).toHaveBeenNthCalledWith(1, "sess-1", "max")
 
       // Turn 2: same session, no per-request effort and no config.effort, must
-      // reset to the native default ("max") rather than staying stuck at "high".
+      // reset to the native default ("high") rather than staying stuck at "max".
       await collectStream(
         (await model.doStream(
           makeCallOptions([{ role: "user", content: [{ type: "text", text: "hi" }] }]),
         )).stream,
       )
-      expect(setEffort).toHaveBeenNthCalledWith(2, "sess-1", "max")
+      expect(setEffort).toHaveBeenNthCalledWith(2, "sess-1", "high")
       expect(setEffort).toHaveBeenCalledTimes(2)
     })
   })
