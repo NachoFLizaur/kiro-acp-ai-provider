@@ -10,11 +10,10 @@ export interface AuthStatus {
   tokenPath?: string
 }
 
-// Bounded timeouts for the two synchronous probes. `--version` is a local print;
-// `whoami` may do a network token refresh, so it keeps more margin. Generous
-// enough that a slow-but-logged-in machine never reports logged-out.
-const VERSION_TIMEOUT_MS = 3000
-const WHOAMI_TIMEOUT_MS = 5000
+// Bounded timeouts for the two synchronous probes. Cold Windows launches can be
+// slow even for `--version`; `whoami` may also do a network token refresh.
+const VERSION_TIMEOUT_MS = 10000
+const WHOAMI_TIMEOUT_MS = 10000
 
 // Short-TTL memoization of verifyAuth(). It runs two blocking spawns on the hot
 // -32603 error path, so a burst of failures would otherwise re-spawn every time.
@@ -87,6 +86,11 @@ function parseWhoamiAuthenticated(stdout: string, stderr = ""): boolean {
   return hasAuthenticatedAccount(stdout) || hasAuthenticatedAccount(stderr)
 }
 
+function isTimeoutError(err: unknown): boolean {
+  const e = err as { code?: unknown; signal?: unknown }
+  return e?.code === "ETIMEDOUT" || e?.signal === "SIGTERM"
+}
+
 /**
  * Spawn `kiro-cli --version` then `whoami --format json` and derive an
  * AuthStatus. Factored out of verifyAuth so the cache covers every return path.
@@ -105,8 +109,11 @@ function probeAuth(): AuthStatus {
       .toString()
       .trim()
     installed = true
-  } catch {
-    return { installed: false, authenticated: false }
+  } catch (err) {
+    if (!isTimeoutError(err)) return { installed: false, authenticated: false }
+    // A timeout means the command launched but did not answer quickly enough;
+    // do not report this as a missing install.
+    installed = true
   }
 
   // Authority = whoami --format json; require a non-empty accountType. We never
