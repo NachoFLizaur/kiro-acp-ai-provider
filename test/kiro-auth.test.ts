@@ -179,6 +179,18 @@ describe("verifyAuth: whoami --format json detection rule", () => {
     expect(status!.authenticated).toBe(false)
   })
 
+  test("timeout on --version still treats kiro-cli as installed and checks whoami", () => {
+    const err = Object.assign(new Error("Command timed out"), { code: "ETIMEDOUT", signal: "SIGTERM" })
+    spies.push(mockKiroCli({ version: err, whoami: WHOAMI_LOGGED_IN }))
+    mockHome()
+
+    const status = verifyAuth()
+
+    expect(status.installed).toBe(true)
+    expect(status.authenticated).toBe(true)
+    expect(status.version).toBeUndefined()
+  })
+
   test("never throws and returns an AuthStatus value", () => {
     spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_OUT }))
     mockHome()
