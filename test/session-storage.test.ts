@@ -73,6 +73,18 @@ describe("session-storage", () => {
     expect(loaded!.lastUsed).toBeGreaterThan(0)
   })
 
+  test("persistSession preserves the toolset fingerprint", () => {
+    const cwd = "/project/toolset-round-trip"
+    const affinityId = "aff-tools"
+
+    persistSession(cwd, "sess-tools", affinityId, "sha256:toolset")
+
+    expect(loadPersistedSession(cwd, affinityId)).toMatchObject({
+      kiroSessionId: "sess-tools",
+      toolsetHash: "sha256:toolset",
+    })
+  })
+
   test("loadPersistedSession returns null for stale session", () => {
     // Arrange — persist a session, then manually overwrite with a stale timestamp
     const cwd = "/project/stale"
@@ -135,7 +147,7 @@ describe("session-storage", () => {
     expect(data.kiroSessionId).toBe("sess-newdir")
   })
 
-  test("persisted data contains only kiroSessionId and lastUsed", () => {
+  test("persisted data omits the optional toolsetHash when none is provided", () => {
     // Arrange
     const cwd = "/project/minimal-data"
     const affinityId = "aff-minimal"
