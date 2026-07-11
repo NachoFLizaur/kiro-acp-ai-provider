@@ -11,10 +11,11 @@ import type {
   LanguageModelV3Prompt,
   LanguageModelV3FunctionTool,
 } from "@ai-sdk/provider"
-import { readFileSync, mkdirSync, mkdtempSync, existsSync } from "node:fs"
+import { readFileSync, mkdirSync, mkdtempSync, existsSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import * as childProcess from "node:child_process"
+import { persistSession } from "../src/session-storage"
 
 // `extractErrorMessage` corroborates -32603 via `verifyAuth()`, which spawns
 // `kiro-cli`. Mock execFileSync so the auth probe is deterministic (no real
@@ -103,6 +104,7 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     ),
     getMetadata: mock(() => undefined),
     getStderr: mock(() => ""),
+    getToolsRevision: mock(() => 0),
     getToolsFilePath: mock(() => null),
     getCwd: mock(() => "/tmp/test"),
     getAgentName: mock(() => undefined),
@@ -111,7 +113,11 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     getIPCServer: mock(() => createMockIPCServer()),
     getLaneRouter: mock(() => mockLaneRouter),
     setPromptCallback: mock(() => {}),
-    waitForToolsReady: mock(() => Promise.resolve()),
+    waitForToolsReady: mock((options?: { expectedTools?: string[] }) =>
+      Promise.resolve(
+        (options?.expectedTools ?? []).map((name) => ({ name, source: "mcp:test" })),
+      ),
+    ),
     getOrCreateToolsFilePath: mock(() => "/tmp/tools.json"),
     createSessionToolsFilePath: mock((id: string) => `/tmp/kiro-acp/tools-test-${id}.json`),
     removeSessionToolsFile: mock(() => {}),
@@ -546,6 +552,124 @@ describe("KiroACPLanguageModel", () => {
       // Mode already matches from session creation — ensureSessionMode skips
       expect(client.setMode).not.toHaveBeenCalled()
       expect(client.waitForToolsReady).not.toHaveBeenCalled()
+    })
+
+    test("verifies the exact function tools after session creation", async () => {
+      const toolsDir = createTempToolsDir()
+      const client = createMockClient({
+        getAgentName: mock(() => "test-agent"),
+        getToolsRevision: mock(() => 4),
+        createSessionToolsFilePath: mock((id: string) => join(toolsDir, `tools-${id}.json`)),
+        createSessionWithToolsPath: mock(() =>
+          Promise.resolve({
+            sessionId: "sess-tools",
+            modes: { currentModeId: "test-agent", availableModes: [] },
+            models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+          } satisfies ACPSession),
+        ),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "ready" } })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const tools: LanguageModelV3FunctionTool[] = [{
+        type: "function",
+        name: "agent-teams_task_complete",
+        description: "Complete a task",
+        inputSchema: { type: "object", properties: {} },
+      }]
+
+      await collectStream((await model.doStream(makeCallOptions(
+        [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        { tools },
+      ))).stream)
+
+      expect(client.waitForToolsReady).toHaveBeenCalledWith({
+        timeoutMs: 5000,
+        expectedTools: ["agent-teams_task_complete"],
+        afterRevision: 4,
+      })
+    })
+
+    test("fails instead of silently running when Kiro never exposes expected tools", async () => {
+      const toolsDir = createTempToolsDir()
+      const client = createMockClient({
+        getAgentName: mock(() => "test-agent"),
+        getToolsRevision: mock(() => 2),
+        waitForToolsReady: mock(() => Promise.resolve([])),
+        createSessionToolsFilePath: mock((id: string) => join(toolsDir, `tools-${id}.json`)),
+        createSessionWithToolsPath: mock(() =>
+          Promise.resolve({
+            sessionId: "sess-missing-tools",
+            modes: { currentModeId: "test-agent", availableModes: [] },
+            models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+          } satisfies ACPSession),
+        ),
+      } as unknown as Partial<ACPClient>)
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const tools: LanguageModelV3FunctionTool[] = [{
+        type: "function",
+        name: "agent-teams_task_complete",
+        description: "Complete a task",
+        inputSchema: { type: "object", properties: {} },
+      }]
+
+      await expect(model.doStream(makeCallOptions(
+        [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        { tools },
+      ))).rejects.toThrow("Kiro session did not expose the expected MCP tools")
+
+      expect(client.setMode).toHaveBeenCalledWith("sess-missing-tools", "test-agent")
+      expect(client.waitForToolsReady).toHaveBeenCalledTimes(2)
+    })
+
+    test("recreates an affinity session when its persisted toolset changed", async () => {
+      const storageDir = createTempToolsDir()
+      const previousXdgDataHome = process.env.XDG_DATA_HOME
+      process.env.XDG_DATA_HOME = storageDir
+      try {
+        const cwd = join(storageDir, "project")
+        mkdirSync(cwd, { recursive: true })
+        persistSession(cwd, "sess-stale-tools", "affinity-tools", "stale-toolset")
+
+        const client = createMockClient({
+          getCwd: mock(() => cwd),
+          getAgentName: mock(() => "test-agent"),
+          getToolsRevision: mock(() => 1),
+          createSessionToolsFilePath: mock((id: string) => join(storageDir, `tools-${id}.json`)),
+          createSessionWithToolsPath: mock(() =>
+            Promise.resolve({
+              sessionId: "sess-fresh-tools",
+              modes: { currentModeId: "test-agent", availableModes: [] },
+              models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+            } satisfies ACPSession),
+          ),
+          prompt: mock(async (opts: PromptOptions) => {
+            opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "ready" } })
+            return { stopReason: "end_turn" }
+          }),
+        } as unknown as Partial<ACPClient>)
+        const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+        const tools: LanguageModelV3FunctionTool[] = [{
+          type: "function",
+          name: "agent-teams_task_complete",
+          description: "Complete a task",
+          inputSchema: { type: "object", properties: {} },
+        }]
+
+        await collectStream((await model.doStream(makeCallOptions(
+          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          { tools, headers: { "x-session-affinity": "affinity-tools" } },
+        ))).stream)
+
+        expect(client.loadSession).not.toHaveBeenCalled()
+        expect(client.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
+      } finally {
+        if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
+        else process.env.XDG_DATA_HOME = previousXdgDataHome
+        rmSync(storageDir, { recursive: true, force: true })
+      }
     })
   })
 

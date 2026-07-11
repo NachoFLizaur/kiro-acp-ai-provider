@@ -13,8 +13,16 @@ import type {
   SharedV3ProviderMetadata,
 } from "@ai-sdk/provider"
 import { appendFileSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
-import { randomBytes } from "node:crypto"
-import { KiroACPError, type ACPClient, type ACPSession, type SessionUpdate, type ContentBlock, type SessionMetadata } from "./acp-client"
+import { createHash, randomBytes } from "node:crypto"
+import {
+  KiroACPConnectionError,
+  KiroACPError,
+  type ACPClient,
+  type ACPSession,
+  type SessionUpdate,
+  type ContentBlock,
+  type SessionMetadata,
+} from "./acp-client"
 import { reasoningEffortsFor, defaultEffortFor } from "./kiro-effort"
 import { verifyAuth } from "./kiro-auth"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
@@ -22,6 +30,21 @@ import { interceptSessionAffinity } from "./session-affinity"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
+
+const TOOL_READY_TIMEOUT_MS = 5000
+
+function functionToolNames(
+  tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool> | undefined,
+): string[] {
+  return (tools ?? [])
+    .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
+    .map((tool) => tool.name)
+    .sort()
+}
+
+function toolsetHash(toolNames: string[]): string {
+  return createHash("sha256").update(toolNames.join("\0")).digest("hex")
+}
 
 // ---------------------------------------------------------------------------
 // Data conversion helpers
@@ -521,7 +544,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * Per-session tools file paths. Each ACP session gets its own file
    * so concurrent sessions don't overwrite each other's tool definitions.
    */
-  private sessionToolsFiles = new Map<string, { filePath: string; toolNames: string }>()
+  private sessionToolsFiles = new Map<
+    string,
+    { filePath: string; toolNames: string; toolsetHash: string }
+  >()
 
   /**
    * Per-session state for prompts paused waiting for tool results.
@@ -616,6 +642,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private async acquireSession(
     tools?: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
   ): Promise<ACPSession> {
+    const expectedToolNames = functionToolNames(tools)
+    const expectedToolsetHash = toolsetHash(expectedToolNames)
+
     // Write tools BEFORE creating the session so the MCP bridge
     // has them from the very first `tools/list` query.
     let toolsFilePath: string | undefined
@@ -642,17 +671,27 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     if (this.currentAffinityId) {
       if (this.config.sessionId) {
         try {
+          const toolsRevision = this.client.getToolsRevision?.() ?? 0
           const loaded = await this.client.loadSession(this.config.sessionId)
           const sessionId = loaded.sessionId || this.config.sessionId
           if (!loaded.sessionId) loaded.sessionId = sessionId
-          await this.ensureSessionMode(loaded)
+          await this.ensureSessionMode(loaded, expectedToolNames, toolsRevision)
           if (this.currentModelId === null) {
             this.currentModelId = loaded.models.currentModelId
           }
           if (toolsFilePath) {
-            this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
+            this.sessionToolsFiles.set(sessionId, {
+              filePath: toolsFilePath,
+              toolNames,
+              toolsetHash: expectedToolsetHash,
+            })
           }
-          persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
+          persistSession(
+            this.client.getCwd(),
+            sessionId,
+            this.currentAffinityId,
+            expectedToolsetHash,
+          )
           return loaded
         } catch (err) {
           // Fall through to persisted session or create new
@@ -661,23 +700,38 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
       const persisted = loadPersistedSession(this.client.getCwd(), this.currentAffinityId)
       if (persisted) {
-        try {
-          const session = await this.client.loadSession(persisted.kiroSessionId)
-          const sessionId = session.sessionId || persisted.kiroSessionId
-          if (!session.sessionId) session.sessionId = sessionId
-          if (session) {
-            await this.ensureSessionMode(session)
-            if (this.currentModelId === null) {
-              this.currentModelId = session.models?.currentModelId ?? null
+        if (persisted.toolsetHash !== expectedToolsetHash) {
+          clearPersistedSession(this.client.getCwd(), this.currentAffinityId)
+        } else {
+          try {
+            const toolsRevision = this.client.getToolsRevision?.() ?? 0
+            const session = await this.client.loadSession(persisted.kiroSessionId)
+            const sessionId = session.sessionId || persisted.kiroSessionId
+            if (!session.sessionId) session.sessionId = sessionId
+            if (session) {
+              await this.ensureSessionMode(session, expectedToolNames, toolsRevision)
+              if (this.currentModelId === null) {
+                this.currentModelId = session.models?.currentModelId ?? null
+              }
+              if (toolsFilePath) {
+                this.sessionToolsFiles.set(sessionId, {
+                  filePath: toolsFilePath,
+                  toolNames,
+                  toolsetHash: expectedToolsetHash,
+                })
+              }
+              persistSession(
+                this.client.getCwd(),
+                sessionId,
+                this.currentAffinityId,
+                expectedToolsetHash,
+              )
+              return session
             }
-            if (toolsFilePath) {
-              this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
-            }
-            persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
-            return session
+          } catch (err: unknown) {
+            clearPersistedSession(this.client.getCwd(), this.currentAffinityId)
+            // Fall through to create new session
           }
-        } catch (err: unknown) {
-          // Fall through to create new session
         }
       }
     }
@@ -685,20 +739,30 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     // Create a new session with this stream's tools file path.
     // createSessionWithToolsPath() atomically rewrites the agent config
     // before calling session/new.
+    const toolsRevision = this.client.getToolsRevision?.() ?? 0
     const session = toolsFilePath
       ? await this.client.createSessionWithToolsPath(toolsFilePath)
       : await this.client.createSession()
-    await this.ensureSessionMode(session)
+    await this.ensureSessionMode(session, expectedToolNames, toolsRevision)
     if (this.currentModelId === null) {
       this.currentModelId = session.models.currentModelId
     }
 
     if (toolsFilePath) {
-      this.sessionToolsFiles.set(session.sessionId, { filePath: toolsFilePath, toolNames })
+      this.sessionToolsFiles.set(session.sessionId, {
+        filePath: toolsFilePath,
+        toolNames,
+        toolsetHash: expectedToolsetHash,
+      })
     }
 
     if (this.currentAffinityId) {
-      persistSession(this.client.getCwd(), session.sessionId, this.currentAffinityId)
+      persistSession(
+        this.client.getCwd(),
+        session.sessionId,
+        this.currentAffinityId,
+        expectedToolsetHash,
+      )
     }
 
     return session
@@ -712,7 +776,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private cleanupAfterStream(sessionId: string): void {
     if (this.currentAffinityId) {
-      persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
+      const persistedToolsetHash =
+        this.sessionToolsFiles.get(sessionId)?.toolsetHash ?? toolsetHash([])
+      persistSession(
+        this.client.getCwd(),
+        sessionId,
+        this.currentAffinityId,
+        persistedToolsetHash,
+      )
       // Keep tools file alive — the MCP bridge still references it between turns.
       // Only ephemeral (no affinity) sessions delete their tools file.
     } else {
@@ -727,15 +798,57 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * Subsequent sessions default to `kiro_default`, so we explicitly
    * set the mode after creation/loading.
    */
-  private async ensureSessionMode(session: ACPSession): Promise<void> {
+  private async ensureSessionMode(
+    session: ACPSession,
+    expectedToolNames: string[] = [],
+    afterRevision?: number,
+  ): Promise<void> {
     const agentName = this.client.getAgentName()
     if (!agentName) return
 
-    if (session.modes.currentModeId !== agentName) {
+    const modeChanged = session.modes.currentModeId !== agentName
+    if (modeChanged) {
       await this.client.setMode(session.sessionId, agentName)
       session.modes.currentModeId = agentName
-      await this.client.waitForToolsReady({ timeoutMs: 5000 })
     }
+
+    if (expectedToolNames.length === 0) {
+      if (modeChanged) {
+        await this.client.waitForToolsReady({ timeoutMs: TOOL_READY_TIMEOUT_MS })
+      }
+      return
+    }
+
+    let observed = await this.client.waitForToolsReady({
+      timeoutMs: TOOL_READY_TIMEOUT_MS,
+      expectedTools: expectedToolNames,
+      afterRevision,
+    })
+    let missing = this.missingExpectedTools(observed, expectedToolNames)
+
+    if (missing.length > 0) {
+      const refreshRevision = this.client.getToolsRevision?.() ?? 0
+      await this.client.setMode(session.sessionId, agentName)
+      observed = await this.client.waitForToolsReady({
+        timeoutMs: TOOL_READY_TIMEOUT_MS,
+        expectedTools: expectedToolNames,
+        afterRevision: refreshRevision,
+      })
+      missing = this.missingExpectedTools(observed, expectedToolNames)
+    }
+
+    if (missing.length > 0) {
+      const preview = missing.slice(0, 10).join(", ")
+      const remainder = missing.length > 10 ? ` (+${missing.length - 10} more)` : ""
+      throw new KiroACPConnectionError(
+        `Kiro session did not expose the expected MCP tools: ${preview}${remainder}`,
+      )
+    }
+  }
+
+  private missingExpectedTools(observed: Array<{ name: string }>, expected: string[]): string[] {
+    const names = new Set(observed.map((tool) => tool.name))
+    return expected.filter((name) => !names.has(name))
   }
 
   /** Switch model on a session if the requested modelId differs. */

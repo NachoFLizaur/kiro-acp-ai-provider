@@ -195,6 +195,7 @@ export class ACPClient {
   private ipcServer: IPCServer | null = null
   private ipcPort: number | null = null
   private availableTools: AvailableTool[] = []
+  private toolsRevision = 0
   private toolsReadyListeners = new Set<(tools: AvailableTool[]) => void>()
 
   /**
@@ -402,6 +403,7 @@ export class ACPClient {
     this.promptCallbacks.clear()
     this.toolsReadyListeners.clear()
     this.availableTools = []
+    this.toolsRevision = 0
     this.startedToolless = false
 
     if (this.ipcServer) {
@@ -611,6 +613,10 @@ export class ACPClient {
     return [...this.availableTools]
   }
 
+  getToolsRevision(): number {
+    return this.toolsRevision
+  }
+
   getToolsFilePath(): string | null {
     return this.toolsFilePath
   }
@@ -739,13 +745,22 @@ export class ACPClient {
   waitForToolsReady(options?: {
     timeoutMs?: number
     expectedTools?: string[]
+    afterRevision?: number
   }): Promise<AvailableTool[]> {
-    const { timeoutMs = 5000, expectedTools } = options ?? {}
+    const { timeoutMs = 5000, expectedTools, afterRevision } = options ?? {}
+
+    if (this.hasExpectedTools(this.availableTools, expectedTools, afterRevision)) {
+      return Promise.resolve(this.getAvailableTools())
+    }
 
     return new Promise<AvailableTool[]>((resolve) => {
       const timer = setTimeout(() => {
         this.removeToolsReadyListener(handler)
-        resolve(this.availableTools)
+        const tools =
+          afterRevision !== undefined && this.toolsRevision <= afterRevision
+            ? []
+            : this.availableTools
+        resolve(tools)
       }, timeoutMs)
 
       const handler = (tools: AvailableTool[]): void => {
@@ -756,9 +771,7 @@ export class ACPClient {
           return
         }
 
-        const names = new Set(tools.map((t) => t.name))
-        const allPresent = expectedTools.every((name) => names.has(name))
-        if (allPresent) {
+        if (this.hasExpectedTools(tools, expectedTools, afterRevision)) {
           clearTimeout(timer)
           this.removeToolsReadyListener(handler)
           resolve(tools)
@@ -766,6 +779,17 @@ export class ACPClient {
       }
       this.addToolsReadyListener(handler)
     })
+  }
+
+  private hasExpectedTools(
+    tools: AvailableTool[],
+    expectedTools?: string[],
+    afterRevision?: number,
+  ): boolean {
+    if (afterRevision !== undefined && this.toolsRevision <= afterRevision) return false
+    if (!expectedTools || expectedTools.length === 0) return tools.length > 0
+    const names = new Set(tools.map((tool) => tool.name))
+    return expectedTools.every((name) => names.has(name))
   }
 
   addToolsReadyListener(listener: (tools: AvailableTool[]) => void): void {
@@ -1130,6 +1154,7 @@ export class ACPClient {
       case "_kiro.dev/commands/available": {
         const tools = (Array.isArray(params.tools) ? params.tools : []) as AvailableTool[]
         this.availableTools = tools
+        this.toolsRevision++
         for (const listener of this.toolsReadyListeners) {
           listener(tools)
         }

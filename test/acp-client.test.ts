@@ -629,6 +629,84 @@ describe("ACPClient", () => {
       expect(listeners.size).toBe(0)
     })
 
+    test("resolves immediately when expected tools were already observed", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [
+              { name: "agent-teams_task_get", source: "mcp:agent-teams" },
+              { name: "agent-teams_task_complete", source: "mcp:agent-teams" },
+            ],
+          },
+        }),
+      )
+
+      const startedAt = Date.now()
+      const tools = await client.waitForToolsReady({
+        timeoutMs: 5000,
+        expectedTools: ["agent-teams_task_get", "agent-teams_task_complete"],
+      })
+
+      expect(Date.now() - startedAt).toBeLessThan(100)
+      expect(tools).toHaveLength(2)
+      expect((client as any).toolsReadyListeners.size).toBe(0)
+    })
+
+    test("requires a fresh tools notification when afterRevision is provided", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+      const notification = JSON.stringify({
+        jsonrpc: "2.0",
+        method: "_kiro.dev/commands/available",
+        params: {
+          tools: [{ name: "agent-teams_task_get", source: "mcp:agent-teams" }],
+        },
+      })
+
+      handleLine(notification)
+      const revision = client.getToolsRevision()
+      const promise = client.waitForToolsReady({
+        timeoutMs: 5000,
+        expectedTools: ["agent-teams_task_get"],
+        afterRevision: revision,
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect((client as any).toolsReadyListeners.size).toBe(1)
+
+      handleLine(notification)
+      expect(await promise).toHaveLength(1)
+      expect(client.getToolsRevision()).toBe(revision + 1)
+    })
+
+    test("does not return stale tools when the fresh-notification wait times out", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [{ name: "agent-teams_task_complete", source: "mcp:agent-teams" }],
+          },
+        }),
+      )
+
+      const tools = await client.waitForToolsReady({
+        timeoutMs: 10,
+        expectedTools: ["agent-teams_task_complete"],
+        afterRevision: client.getToolsRevision(),
+      })
+
+      expect(tools).toEqual([])
+    })
+
     test("resolves with defaults when no options provided", async () => {
       const client = new ACPClient({ cwd: "/tmp" })
       const handleLine = (client as any).handleLine.bind(client)
