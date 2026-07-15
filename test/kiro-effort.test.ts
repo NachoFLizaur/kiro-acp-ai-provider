@@ -24,6 +24,17 @@ describe("reasoningEffortsFor", () => {
       "max",
     ])
 
+    // The GPT-5.6 family exposes the same full native effort ladder.
+    for (const modelId of ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]) {
+      expect(reasoningEffortsFor(modelId)).toEqual([
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ])
+    }
+
     // opus-4.6 / sonnet-4.6 top out at "max" (no "xhigh").
     expect(reasoningEffortsFor("claude-opus-4.6")).toEqual([
       "low",

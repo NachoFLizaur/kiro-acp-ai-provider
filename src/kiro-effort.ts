@@ -12,6 +12,9 @@ export type KiroEffortLevel = "low" | "medium" | "high" | "xhigh" | "max"
  * an SDK update.
  */
 const PER_MODEL_EFFORTS: Record<string, readonly KiroEffortLevel[]> = {
+  "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max"],
+  "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max"],
+  "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-4.8": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-4.7": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-4.6": ["low", "medium", "high", "max"],
