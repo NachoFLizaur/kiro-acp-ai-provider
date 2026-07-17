@@ -14,6 +14,7 @@ export {
   type PermissionDecision,
   type InitializeResult,
   type CommandResult,
+  type EffortOptionsResult,
   type SessionMetadata,
   type PromptOptions,
 } from "./acp-client"
@@ -61,8 +62,8 @@ export {
   type ToolExecuteResponse,
 } from "./ipc-server"
 
-// Reasoning effort: per-model native kiro effort vocabularies.
-export { reasoningEffortsFor, defaultEffortFor, type KiroEffortLevel } from "./kiro-effort"
+// Opaque effort values discovered from and relayed to the Kiro runtime.
+export type { KiroEffort } from "./kiro-effort"
 
 // Utilities
 export { verifyAuth, type AuthStatus } from "./kiro-auth"

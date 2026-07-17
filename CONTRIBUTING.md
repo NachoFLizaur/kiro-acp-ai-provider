@@ -35,7 +35,7 @@ Run `bun run typecheck` and `bun test` before opening a PR.
 - Make sure `bun test` and `bun run typecheck` pass.
 - Explain what changed and how you verified it.
 
-Behavioral changes to the effort or model mapping (`src/kiro-effort.ts`, `src/kiro-models.ts`) must include a test.
+Behavioral changes to runtime effort discovery (`src/kiro-effort.ts`, `src/kiro-models.ts`) must include a test.
 
 ## Commit style
 
@@ -48,4 +48,4 @@ Use conventional commit titles, title only (no long body required):
 - `refactor:` no behavior change
 - `test:` tests
 
-Example: `fix: reset reasoning effort to model default`.
+Example: `fix: handle unavailable runtime effort options`.
