@@ -15,7 +15,7 @@ import type {
 import { appendFileSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
 import { KiroACPError, type ACPClient, type ACPSession, type SessionUpdate, type ContentBlock, type SessionMetadata } from "./acp-client"
-import { reasoningEffortsFor, defaultEffortFor } from "./kiro-effort"
+import type { KiroEffort } from "./kiro-effort"
 import { verifyAuth } from "./kiro-auth"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
 import { interceptSessionAffinity } from "./session-affinity"
@@ -100,8 +100,8 @@ export interface KiroACPModelConfig {
   sessionId?: string
   /** Max context window in tokens. Default: 1_000_000. */
   contextWindow?: number
-  /** Default reasoning effort, resolved by the provider. Per-call `providerOptions.kiro.reasoningEffort` overrides it. */
-  effort?: string
+  /** Explicit configured effort. Per-call `providerOptions.kiro.reasoningEffort` overrides it. */
+  effort?: KiroEffort
   /**
    * Lazy accessor for an isolated ACPClient used to serve ephemeral
    * (toolless) calls — e.g. title generation. When provided,
@@ -341,7 +341,7 @@ function debugLogIntercept(
 function debugLogEffortFailure(
   modelId: string,
   sessionId: string,
-  requested: string,
+  requested: KiroEffort,
   err: unknown,
 ): void {
   const file = process.env.KIRO_ACP_DEBUG_FILE
@@ -512,7 +512,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private readonly client: ACPClient
   private readonly config: KiroACPModelConfig
   private currentModelId: string | null = null
-  private currentEffort: string | null = null
+  private currentEffort: KiroEffort | null = null
   private initPromise: Promise<void> | null = null
   private totalCredits = 0
   private currentAffinityId: string | undefined
@@ -747,29 +747,22 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   /**
-   * Resolve requested effort: per-call `providerOptions.kiro.reasoningEffort`,
-   * else `config.effort`, else the model's native default. The native-default
-   * fallback resets an unset turn instead of leaving effort sticky.
+   * Resolve explicitly supplied effort from the request or model configuration.
    */
-  private resolveRequestedEffort(options: LanguageModelV3CallOptions): string | undefined {
+  private resolveRequestedEffort(options: LanguageModelV3CallOptions): KiroEffort | undefined {
     const fromRequest = options.providerOptions?.kiro?.reasoningEffort
-    if (typeof fromRequest === "string") return fromRequest
-    return this.config.effort ?? defaultEffortFor(this.modelId)
+    if (typeof fromRequest === "string" && fromRequest.length > 0) return fromRequest
+    return this.config.effort && this.config.effort.length > 0
+      ? this.config.effort
+      : undefined
   }
 
   /**
-   * Apply an effort level to the session. Never throws and never changes the
-   * stop reason: unsupported models/levels and any setEffort failure are
-   * silent no-ops.
+   * Apply an opaque effort value to the session. Never throws and never changes
+   * the stop reason: rejected values and any setEffort failure are silent no-ops.
    */
-  private async ensureEffort(session: ACPSession, requested: string | undefined): Promise<void> {
+  private async ensureEffort(session: ACPSession, requested: KiroEffort | undefined): Promise<void> {
     if (!requested) return
-
-    // Validate against the supported set before sending; out-of-set is a no-op.
-    const supported = reasoningEffortsFor(this.modelId)
-    if (supported.length === 0 || !supported.some((level) => level === requested)) {
-      return
-    }
 
     // Skip redundant calls (mirrors the currentModelId guard).
     if (this.currentEffort === requested) return
