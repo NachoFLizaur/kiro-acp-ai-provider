@@ -177,8 +177,8 @@ interface PendingRequest {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 300_000 // 5 minutes (prompts can be long)
-// Cold Kiro starts can spend more than 30s loading an agent and its MCP bridge.
-const INITIALIZE_TIMEOUT_MS = 60_000
+// Cold Kiro starts can spend more than a minute loading an agent and its MCP bridge.
+const INITIALIZE_TIMEOUT_MS = 120_000
 const STOP_TIMEOUT_MS = 10_000
 
 export class ACPClient {
