@@ -629,6 +629,84 @@ describe("ACPClient", () => {
       expect(listeners.size).toBe(0)
     })
 
+    test("resolves immediately when expected tools were already observed", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [
+              { name: "agent-teams_task_get", source: "mcp:agent-teams" },
+              { name: "agent-teams_task_complete", source: "mcp:agent-teams" },
+            ],
+          },
+        }),
+      )
+
+      const startedAt = Date.now()
+      const tools = await client.waitForToolsReady({
+        timeoutMs: 5000,
+        expectedTools: ["agent-teams_task_get", "agent-teams_task_complete"],
+      })
+
+      expect(Date.now() - startedAt).toBeLessThan(100)
+      expect(tools).toHaveLength(2)
+      expect((client as any).toolsReadyListeners.size).toBe(0)
+    })
+
+    test("requires a fresh tools notification when afterRevision is provided", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+      const notification = JSON.stringify({
+        jsonrpc: "2.0",
+        method: "_kiro.dev/commands/available",
+        params: {
+          tools: [{ name: "agent-teams_task_get", source: "mcp:agent-teams" }],
+        },
+      })
+
+      handleLine(notification)
+      const revision = client.getToolsRevision()
+      const promise = client.waitForToolsReady({
+        timeoutMs: 5000,
+        expectedTools: ["agent-teams_task_get"],
+        afterRevision: revision,
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect((client as any).toolsReadyListeners.size).toBe(1)
+
+      handleLine(notification)
+      expect(await promise).toHaveLength(1)
+      expect(client.getToolsRevision()).toBe(revision + 1)
+    })
+
+    test("does not return stale tools when the fresh-notification wait times out", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: {
+            tools: [{ name: "agent-teams_task_complete", source: "mcp:agent-teams" }],
+          },
+        }),
+      )
+
+      const tools = await client.waitForToolsReady({
+        timeoutMs: 10,
+        expectedTools: ["agent-teams_task_complete"],
+        afterRevision: client.getToolsRevision(),
+      })
+
+      expect(tools).toEqual([])
+    })
+
     test("resolves with defaults when no options provided", async () => {
       const client = new ACPClient({ cwd: "/tmp" })
       const handleLine = (client as any).handleLine.bind(client)
@@ -763,7 +841,7 @@ describe("generateAgentConfig consumer-agnostic", () => {
 
     expect(config.mcpServers).toBeDefined()
     const mcpServers = config.mcpServers as Record<string, unknown>
-    expect(mcpServers["my-editor-tools"]).toBeDefined()
+    expect(mcpServers.kacp).toBeDefined()
   })
 
   test("generateAgentConfig defaults to kiro-acp", () => {
@@ -772,11 +850,11 @@ describe("generateAgentConfig consumer-agnostic", () => {
     expect(config.name).toBe("kiro-acp")
   })
 
-  test("generateAgentConfig default MCP server is kiro-acp-tools", () => {
+  test("generateAgentConfig uses a compact default MCP server name", () => {
     const config = generateAgentConfig({ ...baseOptions, name: undefined })
 
     const mcpServers = config.mcpServers as Record<string, unknown>
-    expect(mcpServers["kiro-acp-tools"]).toBeDefined()
+    expect(mcpServers.kacp).toBeDefined()
   })
 
   test("generateAgentConfig includes stream suffix from tools file path", () => {
@@ -788,10 +866,10 @@ describe("generateAgentConfig consumer-agnostic", () => {
 
     const mcpServers = config.mcpServers as Record<string, unknown>
     // Server name should include the session/instance suffix
-    expect(mcpServers["my-editor-tools-760ededf"]).toBeDefined()
+    expect(mcpServers["kacp_760ededf"]).toBeDefined()
     // tools and allowedTools should reference the unique server name
-    expect(config.tools).toEqual(["@my-editor-tools-760ededf"])
-    expect(config.allowedTools).toEqual(["@my-editor-tools-760ededf"])
+    expect(config.tools).toEqual(["@kacp_760ededf"])
+    expect(config.allowedTools).toEqual(["@kacp_760ededf"])
   })
 
   test("generateAgentConfig uses default name with stream suffix", () => {
@@ -802,8 +880,8 @@ describe("generateAgentConfig consumer-agnostic", () => {
     })
 
     const mcpServers = config.mcpServers as Record<string, unknown>
-    expect(mcpServers["kiro-acp-tools-deadbeef"]).toBeDefined()
-    expect(config.tools).toEqual(["@kiro-acp-tools-deadbeef"])
+    expect(mcpServers["kacp_deadbeef"]).toBeDefined()
+    expect(config.tools).toEqual(["@kacp_deadbeef"])
   })
 
   test("generateAgentConfig produces unique server names for different sessions", () => {
@@ -819,7 +897,7 @@ describe("generateAgentConfig consumer-agnostic", () => {
     const servers1 = Object.keys(config1.mcpServers as Record<string, unknown>)
     const servers2 = Object.keys(config2.mcpServers as Record<string, unknown>)
     expect(servers1[0]).not.toBe(servers2[0])
-    expect(servers1[0]).toBe("kiro-acp-tools-aaaaaaaa")
-    expect(servers2[0]).toBe("kiro-acp-tools-bbbbbbbb")
+    expect(servers1[0]).toBe("kacp_aaaaaaaa")
+    expect(servers2[0]).toBe("kacp_bbbbbbbb")
   })
 })

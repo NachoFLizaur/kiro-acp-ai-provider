@@ -50,6 +50,11 @@ function patchClientForStream(client: ACPClient, modelId: string): void {
     modes: { currentModeId: "agent", availableModes: [] },
     models: { currentModelId: modelId, availableModels: [] },
   })) as ACPClient["createSessionWithToolsPath"]
+  client.setMode = (async () => {}) as ACPClient["setMode"]
+  client.waitForToolsReady = (async () => ([{
+    name: "echo",
+    source: "mcp:stub",
+  }])) as ACPClient["waitForToolsReady"]
   client.prompt = (async () => ({ stopReason: "end_turn" })) as ACPClient["prompt"]
   client.getMetadata = ((sessionId: string) => ({
     sessionId,

@@ -10,6 +10,8 @@ import { homedir } from "node:os"
 export interface PersistedSession {
   kiroSessionId: string
   lastUsed: number
+  /** Fingerprint of the canonical function-tool definitions attached to the session. */
+  toolsetHash?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -45,7 +47,12 @@ export function getSessionFilePath(cwd: string, affinityId?: string): string {
 // ---------------------------------------------------------------------------
 
 /** Persist a session ID to disk (best-effort, failures silently ignored). */
-export function persistSession(cwd: string, sessionId: string, affinityId?: string): void {
+export function persistSession(
+  cwd: string,
+  sessionId: string,
+  affinityId?: string,
+  toolsetHash?: string,
+): void {
   try {
     const filePath = getSessionFilePath(cwd, affinityId)
     const dir = join(filePath, "..")
@@ -53,6 +60,7 @@ export function persistSession(cwd: string, sessionId: string, affinityId?: stri
     const data: PersistedSession = {
       kiroSessionId: sessionId,
       lastUsed: Date.now(),
+      ...(toolsetHash ? { toolsetHash } : {}),
     }
     const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
     writeFileSync(tmpPath, JSON.stringify(data), { mode: 0o600 })

@@ -101,7 +101,7 @@ export interface ACPClientOptions {
   onUpdate?: (sessionId: string, update: SessionUpdate) => void
   onExtension?: (method: string, params: Record<string, unknown>) => void
   clientInfo?: { name: string; version: string; title?: string }
-  /** MCP tool call timeout in minutes (default: 30). */
+  /** MCP server startup and tool call timeout in minutes (default: 120). */
   mcpTimeout?: number
 }
 
@@ -237,7 +237,9 @@ interface PendingRequest {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 300_000 // 5 minutes (prompts can be long)
-const INITIALIZE_TIMEOUT_MS = 30_000
+// Cold Kiro starts can spend more than a minute loading an agent and its MCP bridge.
+const INITIALIZE_TIMEOUT_MS = 120_000
+const DEFAULT_MCP_TIMEOUT_MINUTES = 120
 const STOP_TIMEOUT_MS = 10_000
 
 export class ACPClient {
@@ -255,6 +257,7 @@ export class ACPClient {
   private ipcServer: IPCServer | null = null
   private ipcPort: number | null = null
   private availableTools: AvailableTool[] = []
+  private toolsRevision = 0
   private toolsReadyListeners = new Set<(tools: AvailableTool[]) => void>()
 
   /**
@@ -283,6 +286,13 @@ export class ACPClient {
    * then model A creates a session reading model B's config.
    */
   private sessionCreationLock: Promise<void> = Promise.resolve()
+
+  /**
+   * Mutex for serializing the complete session setup transaction. Kiro's
+   * commands/available notification has no session ID, so only one session
+   * may load/create, switch mode, and wait for tools at a time per client.
+   */
+  private sessionSetupLock: Promise<void> = Promise.resolve()
 
   /**
    * Mutex for serializing the start/stop/restart decision in the model's
@@ -334,10 +344,11 @@ export class ACPClient {
     // shell:true on Windows resolves the .exe; elsewhere it is a no-op default.
     const isWin = process.platform === "win32"
 
-    // Ensure MCP tool timeout is sufficient for long-running subagent tasks.
-    // Default is 5 minutes which is too short for complex planning operations.
+    // Kiro applies this timeout while waiting for non-interactive MCP servers
+    // and their calls. Cold provider installs can exceed the CLI's 5-minute
+    // default before the bridge is available to the first model request.
     try {
-      execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
+      execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? DEFAULT_MCP_TIMEOUT_MINUTES)], {
         timeout: 5000,
         stdio: "ignore",
         shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
@@ -462,6 +473,7 @@ export class ACPClient {
     this.promptCallbacks.clear()
     this.toolsReadyListeners.clear()
     this.availableTools = []
+    this.toolsRevision = 0
     this.startedToolless = false
 
     if (this.ipcServer) {
@@ -682,6 +694,10 @@ export class ACPClient {
     return [...this.availableTools]
   }
 
+  getToolsRevision(): number {
+    return this.toolsRevision
+  }
+
   getToolsFilePath(): string | null {
     return this.toolsFilePath
   }
@@ -779,6 +795,25 @@ export class ACPClient {
     }
   }
 
+  /**
+   * Run a complete load/create + mode/readiness setup transaction exclusively.
+   * This prevents a shared commands/available notification from satisfying
+   * the readiness waiter for a different session on the same client.
+   */
+  async withSessionSetupLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previousLock = this.sessionSetupLock
+    let releaseLock: () => void
+    this.sessionSetupLock = new Promise<void>((resolve) => {
+      releaseLock = resolve
+    })
+    try {
+      await previousLock
+      return await fn()
+    } finally {
+      releaseLock!()
+    }
+  }
+
   getIpcPort(): number | null {
     return this.ipcPort
   }
@@ -810,13 +845,22 @@ export class ACPClient {
   waitForToolsReady(options?: {
     timeoutMs?: number
     expectedTools?: string[]
+    afterRevision?: number
   }): Promise<AvailableTool[]> {
-    const { timeoutMs = 5000, expectedTools } = options ?? {}
+    const { timeoutMs = 5000, expectedTools, afterRevision } = options ?? {}
+
+    if (this.hasExpectedTools(this.availableTools, expectedTools, afterRevision)) {
+      return Promise.resolve(this.getAvailableTools())
+    }
 
     return new Promise<AvailableTool[]>((resolve) => {
       const timer = setTimeout(() => {
         this.removeToolsReadyListener(handler)
-        resolve(this.availableTools)
+        const tools =
+          afterRevision !== undefined && this.toolsRevision <= afterRevision
+            ? []
+            : this.availableTools
+        resolve(tools)
       }, timeoutMs)
 
       const handler = (tools: AvailableTool[]): void => {
@@ -827,9 +871,7 @@ export class ACPClient {
           return
         }
 
-        const names = new Set(tools.map((t) => t.name))
-        const allPresent = expectedTools.every((name) => names.has(name))
-        if (allPresent) {
+        if (this.hasExpectedTools(tools, expectedTools, afterRevision)) {
           clearTimeout(timer)
           this.removeToolsReadyListener(handler)
           resolve(tools)
@@ -837,6 +879,17 @@ export class ACPClient {
       }
       this.addToolsReadyListener(handler)
     })
+  }
+
+  private hasExpectedTools(
+    tools: AvailableTool[],
+    expectedTools?: string[],
+    afterRevision?: number,
+  ): boolean {
+    if (afterRevision !== undefined && this.toolsRevision <= afterRevision) return false
+    if (!expectedTools || expectedTools.length === 0) return tools.length > 0
+    const names = new Set(tools.map((tool) => tool.name))
+    return expectedTools.every((name) => names.has(name))
   }
 
   addToolsReadyListener(listener: (tools: AvailableTool[]) => void): void {
@@ -1201,6 +1254,7 @@ export class ACPClient {
       case "_kiro.dev/commands/available": {
         const tools = (Array.isArray(params.tools) ? params.tools : []) as AvailableTool[]
         this.availableTools = tools
+        this.toolsRevision++
         for (const listener of this.toolsReadyListeners) {
           listener(tools)
         }
