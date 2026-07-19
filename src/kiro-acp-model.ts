@@ -33,17 +33,47 @@ import type { LaneRouter } from "./lane-router"
 
 const TOOL_READY_TIMEOUT_MS = 5000
 
-function functionToolNames(
+function functionToolDefinitions(
   tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool> | undefined,
-): string[] {
+): Array<Pick<LanguageModelV3FunctionTool, "name" | "description" | "inputSchema">> {
   return (tools ?? [])
     .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
-    .map((tool) => tool.name)
-    .sort()
+    .map((tool) => ({
+      name: tool.name,
+      description: tool.description ?? "",
+      inputSchema: tool.inputSchema,
+    }))
 }
 
-function toolsetHash(toolNames: string[]): string {
-  return createHash("sha256").update(toolNames.join("\0")).digest("hex")
+function canonicalizeForHash(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => entry === undefined ? null : canonicalizeForHash(entry))
+  }
+
+  if (value && typeof value === "object") {
+    const canonical: Record<string, unknown> = {}
+    for (const key of Object.keys(value).sort()) {
+      const entry = (value as Record<string, unknown>)[key]
+      if (entry !== undefined) canonical[key] = canonicalizeForHash(entry)
+    }
+    return canonical
+  }
+
+  if (typeof value === "number" && !Number.isFinite(value)) return null
+  return value
+}
+
+function toolsetHash(
+  definitions: Array<Pick<LanguageModelV3FunctionTool, "name" | "description" | "inputSchema">>,
+): string {
+  const canonicalDefinitions = definitions
+    .map((definition) => canonicalizeForHash(definition))
+    .sort((left, right) => {
+      const serializedLeft = JSON.stringify(left)
+      const serializedRight = JSON.stringify(right)
+      return serializedLeft < serializedRight ? -1 : serializedLeft > serializedRight ? 1 : 0
+    })
+  return createHash("sha256").update(JSON.stringify(canonicalDefinitions)).digest("hex")
 }
 
 // ---------------------------------------------------------------------------
@@ -642,8 +672,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private async acquireSession(
     tools?: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
   ): Promise<ACPSession> {
-    const expectedToolNames = functionToolNames(tools)
-    const expectedToolsetHash = toolsetHash(expectedToolNames)
+    const expectedToolDefinitions = functionToolDefinitions(tools)
+    const expectedToolNames = expectedToolDefinitions.map((tool) => tool.name).sort()
+    const expectedToolsetHash = toolsetHash(expectedToolDefinitions)
 
     // Write tools BEFORE creating the session so the MCP bridge
     // has them from the very first `tools/list` query.
@@ -667,42 +698,50 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       this.ensureToolsFileReady(toolsFilePath, tools)
     }
 
-    // Try loading an existing session (affinity-based)
-    if (this.currentAffinityId) {
-      if (this.config.sessionId) {
-        try {
-          const toolsRevision = this.client.getToolsRevision?.() ?? 0
-          const loaded = await this.client.loadSession(this.config.sessionId)
-          const sessionId = loaded.sessionId || this.config.sessionId
-          if (!loaded.sessionId) loaded.sessionId = sessionId
-          await this.ensureSessionMode(loaded, expectedToolNames, toolsRevision)
-          if (this.currentModelId === null) {
-            this.currentModelId = loaded.models.currentModelId
-          }
-          if (toolsFilePath) {
-            this.sessionToolsFiles.set(sessionId, {
-              filePath: toolsFilePath,
-              toolNames,
-              toolsetHash: expectedToolsetHash,
-            })
-          }
-          persistSession(
-            this.client.getCwd(),
-            sessionId,
-            this.currentAffinityId,
-            expectedToolsetHash,
-          )
-          return loaded
-        } catch (err) {
-          // Fall through to persisted session or create new
-        }
-      }
-
-      const persisted = loadPersistedSession(this.client.getCwd(), this.currentAffinityId)
-      if (persisted) {
-        if (persisted.toolsetHash !== expectedToolsetHash) {
+    return this.client.withSessionSetupLock(async () => {
+      // Try loading an existing session (affinity-based)
+      if (this.currentAffinityId) {
+        let persisted = loadPersistedSession(this.client.getCwd(), this.currentAffinityId)
+        if (persisted && persisted.toolsetHash !== expectedToolsetHash) {
           clearPersistedSession(this.client.getCwd(), this.currentAffinityId)
-        } else {
+          persisted = null
+        }
+
+        // A configured session ID is safe to resume only after this provider
+        // has persisted a matching definition fingerprint for it. Otherwise
+        // it is indistinguishable from a legacy session with stale tools.
+        if (this.config.sessionId && persisted?.kiroSessionId === this.config.sessionId) {
+          try {
+            const toolsRevision = this.client.getToolsRevision?.() ?? 0
+            const loaded = await this.client.loadSession(this.config.sessionId)
+            const sessionId = loaded.sessionId || this.config.sessionId
+            if (!loaded.sessionId) loaded.sessionId = sessionId
+            await this.ensureSessionMode(loaded, expectedToolNames, toolsRevision)
+            if (this.currentModelId === null) {
+              this.currentModelId = loaded.models.currentModelId
+            }
+            if (toolsFilePath) {
+              this.sessionToolsFiles.set(sessionId, {
+                filePath: toolsFilePath,
+                toolNames,
+                toolsetHash: expectedToolsetHash,
+              })
+            }
+            persistSession(
+              this.client.getCwd(),
+              sessionId,
+              this.currentAffinityId,
+              expectedToolsetHash,
+            )
+            return loaded
+          } catch (err) {
+            clearPersistedSession(this.client.getCwd(), this.currentAffinityId)
+            persisted = null
+            // Fall through to create a new session
+          }
+        }
+
+        if (persisted) {
           try {
             const toolsRevision = this.client.getToolsRevision?.() ?? 0
             const session = await this.client.loadSession(persisted.kiroSessionId)
@@ -734,38 +773,38 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           }
         }
       }
-    }
 
-    // Create a new session with this stream's tools file path.
-    // createSessionWithToolsPath() atomically rewrites the agent config
-    // before calling session/new.
-    const toolsRevision = this.client.getToolsRevision?.() ?? 0
-    const session = toolsFilePath
-      ? await this.client.createSessionWithToolsPath(toolsFilePath)
-      : await this.client.createSession()
-    await this.ensureSessionMode(session, expectedToolNames, toolsRevision)
-    if (this.currentModelId === null) {
-      this.currentModelId = session.models.currentModelId
-    }
+      // Create a new session with this stream's tools file path.
+      // createSessionWithToolsPath() atomically rewrites the agent config
+      // before calling session/new.
+      const toolsRevision = this.client.getToolsRevision?.() ?? 0
+      const session = toolsFilePath
+        ? await this.client.createSessionWithToolsPath(toolsFilePath)
+        : await this.client.createSession()
+      await this.ensureSessionMode(session, expectedToolNames, toolsRevision)
+      if (this.currentModelId === null) {
+        this.currentModelId = session.models.currentModelId
+      }
 
-    if (toolsFilePath) {
-      this.sessionToolsFiles.set(session.sessionId, {
-        filePath: toolsFilePath,
-        toolNames,
-        toolsetHash: expectedToolsetHash,
-      })
-    }
+      if (toolsFilePath) {
+        this.sessionToolsFiles.set(session.sessionId, {
+          filePath: toolsFilePath,
+          toolNames,
+          toolsetHash: expectedToolsetHash,
+        })
+      }
 
-    if (this.currentAffinityId) {
-      persistSession(
-        this.client.getCwd(),
-        session.sessionId,
-        this.currentAffinityId,
-        expectedToolsetHash,
-      )
-    }
+      if (this.currentAffinityId) {
+        persistSession(
+          this.client.getCwd(),
+          session.sessionId,
+          this.currentAffinityId,
+          expectedToolsetHash,
+        )
+      }
 
-    return session
+      return session
+    })
   }
 
   /**

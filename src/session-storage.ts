@@ -10,7 +10,7 @@ import { homedir } from "node:os"
 export interface PersistedSession {
   kiroSessionId: string
   lastUsed: number
-  /** Fingerprint of the function-tool names attached when the session was created. */
+  /** Fingerprint of the canonical function-tool definitions attached to the session. */
   toolsetHash?: string
 }
 
