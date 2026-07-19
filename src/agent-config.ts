@@ -68,11 +68,15 @@ export function generateAgentConfig(options: AgentConfigOptions): Record<string,
     : "kacp"
   const mcpServerRef = `@${mcpServerName}`
   const toolAliases = readToolAliases(options.toolsFilePath, mcpServerName)
+  const qualifiedToolRefs = Object.keys(toolAliases)
+  const configuredTools = qualifiedToolRefs.length > 0
+    ? qualifiedToolRefs
+    : [mcpServerRef]
 
   return {
     name: options.name ?? "kiro-acp",
-    tools: [mcpServerRef],
-    allowedTools: [mcpServerRef],
+    tools: configuredTools,
+    allowedTools: configuredTools,
     includeMcpJson: false,
     mcpServers: {
       [mcpServerName]: {
