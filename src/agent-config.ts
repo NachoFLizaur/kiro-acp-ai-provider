@@ -57,13 +57,14 @@ function readToolAliases(
  */
 export function generateAgentConfig(options: AgentConfigOptions): Record<string, unknown> {
   // Keep the per-session MCP server name compact: Kiro limits the complete
-  // `@server/tool` identifier to 64 characters. The stream suffix still
-  // prevents Kiro from merging tools across concurrent workspace sessions.
+  // `@server/tool` identifier to 64 characters and validates the server
+  // prefix as part of that identifier. The underscore-only stream suffix
+  // still prevents tool merging across concurrent workspace sessions.
   const toolsBaseName = basename(options.toolsFilePath, ".json")
   const segments = toolsBaseName.split("-")
   const streamSuffix = segments.length >= 3 ? segments[segments.length - 1] : ""
   const mcpServerName = streamSuffix
-    ? `kacp-${streamSuffix}`
+    ? `kacp_${streamSuffix}`
     : "kacp"
   const mcpServerRef = `@${mcpServerName}`
   const toolAliases = readToolAliases(options.toolsFilePath, mcpServerName)

@@ -780,10 +780,10 @@ describe("generateAgentConfig consumer-agnostic", () => {
 
     const mcpServers = config.mcpServers as Record<string, unknown>
     // Server name should include the session/instance suffix
-    expect(mcpServers["kacp-760ededf"]).toBeDefined()
+    expect(mcpServers["kacp_760ededf"]).toBeDefined()
     // tools and allowedTools should reference the unique server name
-    expect(config.tools).toEqual(["@kacp-760ededf"])
-    expect(config.allowedTools).toEqual(["@kacp-760ededf"])
+    expect(config.tools).toEqual(["@kacp_760ededf"])
+    expect(config.allowedTools).toEqual(["@kacp_760ededf"])
   })
 
   test("generateAgentConfig uses default name with stream suffix", () => {
@@ -794,8 +794,8 @@ describe("generateAgentConfig consumer-agnostic", () => {
     })
 
     const mcpServers = config.mcpServers as Record<string, unknown>
-    expect(mcpServers["kacp-deadbeef"]).toBeDefined()
-    expect(config.tools).toEqual(["@kacp-deadbeef"])
+    expect(mcpServers["kacp_deadbeef"]).toBeDefined()
+    expect(config.tools).toEqual(["@kacp_deadbeef"])
   })
 
   test("generateAgentConfig produces unique server names for different sessions", () => {
@@ -811,7 +811,7 @@ describe("generateAgentConfig consumer-agnostic", () => {
     const servers1 = Object.keys(config1.mcpServers as Record<string, unknown>)
     const servers2 = Object.keys(config2.mcpServers as Record<string, unknown>)
     expect(servers1[0]).not.toBe(servers2[0])
-    expect(servers1[0]).toBe("kacp-aaaaaaaa")
-    expect(servers2[0]).toBe("kacp-bbbbbbbb")
+    expect(servers1[0]).toBe("kacp_aaaaaaaa")
+    expect(servers2[0]).toBe("kacp_bbbbbbbb")
   })
 })
