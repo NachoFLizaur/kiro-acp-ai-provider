@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test"
-import { writeAgentConfig } from "../src/agent-config"
-import { mkdtempSync, readFileSync, existsSync, rmSync, statSync } from "node:fs"
+import { generateAgentConfig, writeAgentConfig } from "../src/agent-config"
+import { mkdtempSync, readFileSync, existsSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 
@@ -91,5 +91,28 @@ describe("writeAgentConfig", () => {
     expect(existsSync(agentsDir)).toBe(true)
     const stat = statSync(agentsDir)
     expect(stat.isDirectory()).toBe(true)
+  })
+
+  test("generateAgentConfig exposes stable aliases for server-qualified MCP tools", () => {
+    const dir = makeTempDir()
+    const toolsFilePath = join(dir, "tools-deadbeef-760ededf.json")
+    writeFileSync(toolsFilePath, JSON.stringify({
+      tools: [
+        { name: "agent_teams_readiness_echo" },
+        { name: "agent_teams_task_complete" },
+      ],
+    }))
+
+    const config = generateAgentConfig({
+      name: "opencode",
+      mcpBridgePath: "/tmp/mcp-bridge.mjs",
+      toolsFilePath,
+      cwd: dir,
+    })
+
+    expect(config.toolAliases).toEqual({
+      "@kacp-760ededf/agent_teams_readiness_echo": "agent_teams_readiness_echo",
+      "@kacp-760ededf/agent_teams_task_complete": "agent_teams_task_complete",
+    })
   })
 })
