@@ -114,5 +114,10 @@ describe("writeAgentConfig", () => {
       "@kacp_760ededf/agent_teams_readiness_echo": "agent_teams_readiness_echo",
       "@kacp_760ededf/agent_teams_task_complete": "agent_teams_task_complete",
     })
+    expect(config.tools).toEqual([
+      "@kacp_760ededf/agent_teams_readiness_echo",
+      "@kacp_760ededf/agent_teams_task_complete",
+    ])
+    expect(config.allowedTools).toEqual(config.tools)
   })
 })
