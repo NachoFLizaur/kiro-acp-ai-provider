@@ -104,64 +104,59 @@ kiro.getTotalCredits()                       // Total credits consumed
 Standalone functions that don't require a running provider:
 
 ```typescript
-import { verifyAuth, listModels, getQuota, reasoningEffortsFor } from "kiro-acp-ai-provider"
+import { verifyAuth, listModels, getQuota } from "kiro-acp-ai-provider"
 
 // Check if kiro-cli is installed and authenticated
 const status = verifyAuth()
 // { installed: true, authenticated: true, version: "1.2.3", tokenPath: "..." }
 
-// List available models (starts/stops kiro-cli temporarily)
+// Discover exact runtime model IDs and their effort options
 const models = await listModels({ cwd: process.cwd() })
 
 // Get per-session credit usage
 const quota = await getQuota({ client: kiro.getClient() })
-
-// Native reasoning effort levels for a model, low to high ([] when unsupported)
-const levels = reasoningEffortsFor("claude-opus-4.8")
-// ["low", "medium", "high", "xhigh", "max"]
 ```
 
 `verifyAuth()` determines authentication solely from `kiro-cli whoami`, which abstracts the per-OS credential store. The on-disk SSO token file and its expiry are not consulted for the auth decision, so a stale token file never misreports a logged-in user. The returned `tokenPath` is provided only as an optional refresh hint for consumers.
 
 ## Models
 
-Available models depend on your subscription:
+Available models depend on the current Kiro runtime and subscription. `listModels()`
+starts a temporary ACP client, returns runtime model IDs exactly as received, and
+always stops the client. It checks each model serially by switching to that exact
+ID and requesting its effort options, then best-effort restores the original model.
 
-| Model ID | Description |
-|----------|-------------|
-| `claude-opus-4.8` | Most capable |
-| `claude-sonnet-4.6` | Balanced |
-| `claude-haiku-4.5` | Fastest |
-
-Use `listModels()` for the current list.
+Every `ModelWithEfforts` owns a `runtimeEfforts` array. It contains validated opaque
+values in runtime order, or `[]` when switching or option discovery is unavailable,
+invalid, incomplete, or unsupported. `baselineEffort` is present only when the same
+validated runtime response identifies one active value that belongs to that model's
+`runtimeEfforts`. Raw model fields cannot spoof either effort field; other model
+metadata is preserved.
 
 ## Reasoning effort
 
-Reasoning effort is a supported per-turn option. Set it per request through `providerOptions`, keyed by the provider id `kiro`:
+Reasoning effort values are opaque strings discovered at runtime. Pass a nonempty
+value returned by `listModels()` unchanged through `providerOptions`, keyed by the
+provider id `kiro`:
 
 ```typescript
-const result = streamText({
-  model: kiro("claude-opus-4.8"),
-  prompt: "Explain the tradeoffs",
-  providerOptions: { kiro: { reasoningEffort: "high" } },
-})
+const [runtimeModel] = await listModels({ cwd: process.cwd() })
+const effort = runtimeModel?.runtimeEfforts[0]
+
+if (runtimeModel && effort) {
+  const result = streamText({
+    model: kiro(runtimeModel.modelId),
+    prompt: "Explain the tradeoffs",
+    providerOptions: { kiro: { reasoningEffort: effort } },
+  })
+}
 ```
 
-The same option works on `generateText`. You can also set a default at the provider level with `createKiroAcp({ effort: "high" })` or per model with `kiro("claude-opus-4.8", { effort: "high" })`; a per-request `providerOptions.kiro.reasoningEffort` wins over both.
-
-Levels are per model, and not every model has them:
-
-| Model | Levels |
-|-------|--------|
-| `claude-opus-4.8`, `claude-opus-4.7` | `low`, `medium`, `high`, `xhigh`, `max` |
-| `claude-opus-4.6`, `claude-sonnet-4.6` | `low`, `medium`, `high`, `max` (no `xhigh`) |
-| everything else | none |
-
-`reasoningEffortsFor(modelId)` returns a model's levels low to high (or `[]` when it has no effort control); `defaultEffortFor(modelId)` returns its native default (e.g. `claude-opus-4.8` is `high`).
-
-- **Resets to the default**: when a turn requests no effort, the SDK reapplies the model's native default instead of leaving the session stuck at the last value.
-- **Graceful no-op**: an unsupported model or level is ignored. It never throws and never changes the result.
-- **No off switch**: the lowest level still produces a reasoning trail; reasoning cannot be disabled.
+The same option works on `generateText`. You can explicitly configure a discovered
+value at the provider level, in the per-model `efforts` map, or in a model override;
+a nonempty per-request value wins. If neither the request nor configuration supplies
+a nonempty effort, the SDK sends no effort command. Rejected values and effort-command
+failures remain fail-soft and do not change the turn result.
 
 ## Tools
 

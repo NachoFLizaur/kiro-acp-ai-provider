@@ -1,6 +1,7 @@
 import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { ACPClient, type ACPClientOptions, type PermissionRequest, type PermissionDecision } from "./acp-client"
 import { KiroACPLanguageModel } from "./kiro-acp-model"
+import type { KiroEffort } from "./kiro-effort"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,18 +26,18 @@ export interface KiroACPProviderSettings {
   contextWindow?: number
   /** Per-model context windows keyed by model id, e.g. relayed from a host's model catalog (models.dev). Used when no per-call `contextWindow` override is given. */
   contextWindows?: Record<string, number>
-  /** Default reasoning effort for every model from this provider. Mirrors `contextWindow`. */
-  effort?: string
-  /** Per-model default effort levels keyed by model id. Mirrors `contextWindows`. */
-  efforts?: Record<string, string>
+  /** Explicit reasoning effort for every model from this provider. */
+  effort?: KiroEffort
+  /** Explicit per-model efforts keyed by model id. */
+  efforts?: Record<string, KiroEffort>
   /** MCP server startup and tool call timeout in minutes. Default: 120. */
   mcpTimeout?: number
 }
 
 export interface KiroACPModelOverrides {
   contextWindow?: number
-  /** Per-call default native kiro reasoning effort level. Overrides the provider-level `effort`/`efforts` settings. */
-  effort?: string
+  /** Explicit model effort. Overrides the provider-level `effort`/`efforts` settings. */
+  effort?: KiroEffort
 }
 
 export interface KiroACPProvider {
@@ -109,12 +110,11 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
         settings.contextWindows?.[modelId] ??
         settings.contextWindow ??
         1_000_000,
-      // Same precedence ladder as contextWindow: per-call -> per-model -> provider.
+      // Explicit effort precedence: model override -> per-model setting -> provider.
       effort:
         overrides?.effort ??
         settings.efforts?.[modelId] ??
-        settings.effort ??
-        undefined,
+        settings.effort,
       getEphemeralClient,
       affinityPrompts,
     })

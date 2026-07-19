@@ -3,6 +3,12 @@ import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import * as root from "../src/index"
 import * as ipc from "../src/ipc"
+import type {
+  EffortOptionsResult,
+  KiroEffort,
+  ListModelsOptions,
+  ModelWithEfforts,
+} from "../src/index"
 
 // ---------------------------------------------------------------------------
 // Export-surface regression (task 05 / F4).
@@ -29,11 +35,39 @@ describe("root export surface", () => {
     expect("createIPCServer" in root).toBe(false)
   })
 
-  test("task 04/05 additions are exported from the root", () => {
+  test("exports runtime utilities", () => {
     expect(typeof root.interceptSessionAffinity).toBe("function")
     expect(typeof root.hashPromptMessages).toBe("function")
     expect(typeof root.diverged).toBe("function")
     expect(typeof root.listModels).toBe("function")
+  })
+
+  test("exports the required runtime model and one opaque effort contract", () => {
+    const runtimeEffort: KiroEffort = "Future/MAX.v2+Beta!"
+    const options = { cwd: "/runtime-catalog" } satisfies ListModelsOptions
+    const model = {
+      modelId: "Runtime/Exact.ID",
+      name: "Runtime Exact ID",
+      runtimeEfforts: [runtimeEffort],
+      baselineEffort: runtimeEffort,
+    } satisfies ModelWithEfforts
+    const modelWithoutOptions = {
+      modelId: "Runtime/No-Options.ID",
+      name: "Runtime No Options ID",
+      runtimeEfforts: [],
+    } satisfies ModelWithEfforts
+    const parsed = {
+      runtimeEfforts: [runtimeEffort],
+      baselineEffort: runtimeEffort,
+    } satisfies EffortOptionsResult
+
+    expect(options.cwd).toBe("/runtime-catalog")
+    expect(model.modelId).toBe("Runtime/Exact.ID")
+    expect(modelWithoutOptions.runtimeEfforts).toEqual([])
+    expect(parsed).toEqual({
+      runtimeEfforts: [runtimeEffort],
+      baselineEffort: runtimeEffort,
+    })
   })
 })
 
