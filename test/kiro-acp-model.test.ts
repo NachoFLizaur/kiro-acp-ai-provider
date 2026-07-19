@@ -58,12 +58,26 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
   // Real promise-chain mutex (mirrors ACPClient.withEnsureClientLock) so that
   // ensureClient() serializes concurrent callers in tests just like production.
   let ensureClientLock: Promise<void> = Promise.resolve()
+  let sessionSetupLock: Promise<void> = Promise.resolve()
   return {
     startedToolless: false,
     withEnsureClientLock: mock(async <T,>(fn: () => Promise<T>): Promise<T> => {
       const previousLock = ensureClientLock
       let releaseLock!: () => void
       ensureClientLock = new Promise<void>((resolve) => {
+        releaseLock = resolve
+      })
+      try {
+        await previousLock
+        return await fn()
+      } finally {
+        releaseLock()
+      }
+    }),
+    withSessionSetupLock: mock(async <T,>(fn: () => Promise<T>): Promise<T> => {
+      const previousLock = sessionSetupLock
+      let releaseLock!: () => void
+      sessionSetupLock = new Promise<void>((resolve) => {
         releaseLock = resolve
       })
       try {
@@ -153,6 +167,83 @@ async function collectStream(
 /** Create a unique temp directory for test tools files. */
 function createTempToolsDir(): string {
   return mkdtempSync(join(tmpdir(), "kiro-acp-test-"))
+}
+
+async function withTempXdgDataHome<T>(
+  run: (storageDir: string) => Promise<T>,
+): Promise<T> {
+  const storageDir = createTempToolsDir()
+  const previousXdgDataHome = process.env.XDG_DATA_HOME
+  process.env.XDG_DATA_HOME = storageDir
+
+  try {
+    return await run(storageDir)
+  } finally {
+    if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
+    else process.env.XDG_DATA_HOME = previousXdgDataHome
+    rmSync(storageDir, { recursive: true, force: true })
+  }
+}
+
+async function waitForCondition(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (condition()) return
+    await Promise.resolve()
+  }
+  throw new Error("Condition was not reached within 100 microtasks")
+}
+
+function makeTool(
+  name: string,
+  inputSchema: LanguageModelV3FunctionTool["inputSchema"],
+  description = `Tool ${name}`,
+): LanguageModelV3FunctionTool {
+  return { type: "function", name, description, inputSchema }
+}
+
+function createAffinityToolsetHarness(storageDir: string) {
+  const cwd = join(storageDir, "project")
+  mkdirSync(cwd, { recursive: true })
+
+  let nextSession = 0
+  const createSessionWithToolsPath = mock(async () => {
+    nextSession++
+    return {
+      sessionId: `sess-${nextSession}`,
+      modes: { currentModeId: "test-agent", availableModes: [] },
+      models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+    } satisfies ACPSession
+  })
+  const loadSession = mock(async (sessionId: string) => ({
+    sessionId,
+    modes: { currentModeId: "test-agent", availableModes: [] },
+    models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+  } satisfies ACPSession))
+  const client = createMockClient({
+    getCwd: mock(() => cwd),
+    getAgentName: mock(() => "test-agent"),
+    createSessionToolsFilePath: mock((id: string) => join(storageDir, `tools-${id}.json`)),
+    createSessionWithToolsPath,
+    loadSession,
+    prompt: mock(async (opts: PromptOptions) => {
+      opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "ready" } })
+      return { stopReason: "end_turn" }
+    }),
+  } as unknown as Partial<ACPClient>)
+  const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+  const runTurn = async (
+    tools: LanguageModelV3FunctionTool[],
+    affinityId = "affinity-tools",
+  ): Promise<void> => {
+    const result = await model.doStream(makeCallOptions(
+      [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      { tools, headers: { "x-session-affinity": affinityId } },
+    ))
+    await collectStream(result.stream)
+  }
+
+  return { cwd, createSessionWithToolsPath, loadSession, runTurn }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,52 +715,114 @@ describe("KiroACPLanguageModel", () => {
       expect(client.waitForToolsReady).toHaveBeenCalledTimes(2)
     })
 
-    test("recreates an affinity session when its persisted toolset changed", async () => {
-      const storageDir = createTempToolsDir()
-      const previousXdgDataHome = process.env.XDG_DATA_HOME
-      process.env.XDG_DATA_HOME = storageDir
-      try {
-        const cwd = join(storageDir, "project")
-        mkdirSync(cwd, { recursive: true })
-        persistSession(cwd, "sess-stale-tools", "affinity-tools", "stale-toolset")
+    test("changed tool names recreate the persisted affinity session", async () => {
+      await withTempXdgDataHome(async (storageDir) => {
+        const harness = createAffinityToolsetHarness(storageDir)
 
-        const client = createMockClient({
-          getCwd: mock(() => cwd),
-          getAgentName: mock(() => "test-agent"),
-          getToolsRevision: mock(() => 1),
-          createSessionToolsFilePath: mock((id: string) => join(storageDir, `tools-${id}.json`)),
-          createSessionWithToolsPath: mock(() =>
-            Promise.resolve({
-              sessionId: "sess-fresh-tools",
-              modes: { currentModeId: "test-agent", availableModes: [] },
-              models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
-            } satisfies ACPSession),
-          ),
-          prompt: mock(async (opts: PromptOptions) => {
-            opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "ready" } })
-            return { stopReason: "end_turn" }
+        await harness.runTurn([
+          makeTool("task_get", { type: "object", properties: {} }),
+        ])
+        await harness.runTurn([
+          makeTool("task_complete", { type: "object", properties: {} }),
+        ])
+
+        expect(harness.createSessionWithToolsPath).toHaveBeenCalledTimes(2)
+        expect(harness.loadSession).not.toHaveBeenCalled()
+      })
+    })
+
+    test("changed schema with the same tool name recreates the persisted session", async () => {
+      await withTempXdgDataHome(async (storageDir) => {
+        const harness = createAffinityToolsetHarness(storageDir)
+
+        await harness.runTurn([
+          makeTool("task_complete", {
+            type: "object",
+            properties: { taskId: { type: "string" } },
+            required: ["taskId"],
           }),
-        } as unknown as Partial<ACPClient>)
-        const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
-        const tools: LanguageModelV3FunctionTool[] = [{
-          type: "function",
-          name: "agent-teams_task_complete",
-          description: "Complete a task",
-          inputSchema: { type: "object", properties: {} },
-        }]
+        ])
+        await harness.runTurn([
+          makeTool("task_complete", {
+            type: "object",
+            properties: {
+              taskId: { type: "string" },
+              summary: { type: "string" },
+            },
+            required: ["taskId", "summary"],
+          }),
+        ])
 
-        await collectStream((await model.doStream(makeCallOptions(
-          [{ role: "user", content: [{ type: "text", text: "hello" }] }],
-          { tools, headers: { "x-session-affinity": "affinity-tools" } },
-        ))).stream)
+        expect(harness.createSessionWithToolsPath).toHaveBeenCalledTimes(2)
+        expect(harness.loadSession).not.toHaveBeenCalled()
+      })
+    })
 
-        expect(client.loadSession).not.toHaveBeenCalled()
-        expect(client.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
-      } finally {
-        if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
-        else process.env.XDG_DATA_HOME = previousXdgDataHome
-        rmSync(storageDir, { recursive: true, force: true })
-      }
+    test("canonical unchanged definitions reuse the persisted session", async () => {
+      await withTempXdgDataHome(async (storageDir) => {
+        const harness = createAffinityToolsetHarness(storageDir)
+        const firstTools = [
+          makeTool("task_complete", {
+            type: "object",
+            properties: {
+              taskId: { type: "string", description: undefined },
+              result: {
+                type: "object",
+                properties: {
+                  summary: { type: "string" },
+                  status: { type: "string" },
+                },
+              },
+            },
+            required: ["taskId"],
+          } as LanguageModelV3FunctionTool["inputSchema"]),
+          makeTool("task_get", {
+            type: "object",
+            properties: { taskId: { type: "string" } },
+          }),
+        ]
+        const reorderedEquivalentTools = [
+          makeTool("task_get", {
+            properties: { taskId: { type: "string" } },
+            type: "object",
+          }),
+          makeTool("task_complete", {
+            required: ["taskId"],
+            properties: {
+              result: {
+                properties: {
+                  status: { type: "string" },
+                  summary: { type: "string" },
+                },
+                type: "object",
+              },
+              taskId: { type: "string" },
+            },
+            type: "object",
+          }),
+        ]
+
+        await harness.runTurn(firstTools)
+        await harness.runTurn(reorderedEquivalentTools)
+
+        expect(harness.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
+        expect(harness.loadSession).toHaveBeenCalledTimes(1)
+        expect(harness.loadSession).toHaveBeenCalledWith("sess-1")
+      })
+    })
+
+    test("legacy persisted session without a fingerprint is invalidated", async () => {
+      await withTempXdgDataHome(async (storageDir) => {
+        const harness = createAffinityToolsetHarness(storageDir)
+        persistSession(harness.cwd, "sess-legacy", "affinity-tools")
+
+        await harness.runTurn([
+          makeTool("task_complete", { type: "object", properties: {} }),
+        ])
+
+        expect(harness.loadSession).not.toHaveBeenCalled()
+        expect(harness.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
+      })
     })
   })
 
@@ -3864,6 +4017,65 @@ describe("KiroACPLanguageModel", () => {
 
       // Assert: startedToolless ends false (reset by stop() during restart).
       expect(getStartedToolless()).toBe(false)
+    })
+
+    test("two model instances sharing one client serialize readiness waits", async () => {
+      const toolsDir = createTempToolsDir()
+      const readinessResolvers: Array<(tools: Array<{ name: string; source: string }>) => void> = []
+      let nextSession = 0
+      const createSessionWithToolsPath = mock(async () => {
+        nextSession++
+        return {
+          sessionId: `sess-${nextSession}`,
+          modes: { currentModeId: "test-agent", availableModes: [] },
+          models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+        } satisfies ACPSession
+      })
+      const waitForToolsReady = mock(
+        () => new Promise<Array<{ name: string; source: string }>>((resolve) => {
+          readinessResolvers.push(resolve)
+        }),
+      )
+      const client = createMockClient({
+        getAgentName: mock(() => "test-agent"),
+        createSessionToolsFilePath: mock((id: string) => join(toolsDir, `tools-${id}.json`)),
+        createSessionWithToolsPath,
+        waitForToolsReady,
+      } as unknown as Partial<ACPClient>)
+      const withSessionSetupLock = client.withSessionSetupLock as unknown as ReturnType<typeof mock>
+      const modelA = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const modelB = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const tools = [makeTool("task_complete", { type: "object", properties: {} })]
+      const options = makeCallOptions(
+        [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        { tools },
+      )
+
+      try {
+        const resultAPromise = modelA.doStream(options)
+        await waitForCondition(() => readinessResolvers.length === 1)
+
+        const resultBPromise = modelB.doStream(options)
+        await waitForCondition(() => withSessionSetupLock.mock.calls.length === 2)
+
+        expect(withSessionSetupLock).toHaveBeenCalledTimes(2)
+        expect(createSessionWithToolsPath).toHaveBeenCalledTimes(1)
+        expect(waitForToolsReady).toHaveBeenCalledTimes(1)
+        expect(readinessResolvers).toHaveLength(1)
+
+        readinessResolvers[0]([{ name: "task_complete", source: "mcp:test" }])
+        const resultA = await resultAPromise
+        await waitForCondition(() => readinessResolvers.length === 2)
+
+        expect(createSessionWithToolsPath).toHaveBeenCalledTimes(2)
+        expect(waitForToolsReady).toHaveBeenCalledTimes(2)
+
+        readinessResolvers[1]([{ name: "task_complete", source: "mcp:test" }])
+        const resultB = await resultBPromise
+        await Promise.all([collectStream(resultA.stream), collectStream(resultB.stream)])
+      } finally {
+        rmSync(toolsDir, { recursive: true, force: true })
+      }
     })
   })
 

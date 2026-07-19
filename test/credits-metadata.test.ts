@@ -43,6 +43,7 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
         releaseLock()
       }
     }),
+    withSessionSetupLock: mock(async <T,>(fn: () => Promise<T>): Promise<T> => fn()),
     isRunning: mock(() => false),
     start: mock(() =>
       Promise.resolve({

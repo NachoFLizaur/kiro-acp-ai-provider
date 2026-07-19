@@ -226,6 +226,13 @@ export class ACPClient {
   private sessionCreationLock: Promise<void> = Promise.resolve()
 
   /**
+   * Mutex for serializing the complete session setup transaction. Kiro's
+   * commands/available notification has no session ID, so only one session
+   * may load/create, switch mode, and wait for tools at a time per client.
+   */
+  private sessionSetupLock: Promise<void> = Promise.resolve()
+
+  /**
    * Mutex for serializing the start/stop/restart decision in the model's
    * ensureClient(). Because the ACPClient is a per-provider singleton shared
    * by multiple model instances (each with its own per-model initPromise),
@@ -704,6 +711,25 @@ export class ACPClient {
     const previousLock = this.ensureClientLock
     let releaseLock: () => void
     this.ensureClientLock = new Promise<void>((resolve) => {
+      releaseLock = resolve
+    })
+    try {
+      await previousLock
+      return await fn()
+    } finally {
+      releaseLock!()
+    }
+  }
+
+  /**
+   * Run a complete load/create + mode/readiness setup transaction exclusively.
+   * This prevents a shared commands/available notification from satisfying
+   * the readiness waiter for a different session on the same client.
+   */
+  async withSessionSetupLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previousLock = this.sessionSetupLock
+    let releaseLock: () => void
+    this.sessionSetupLock = new Promise<void>((resolve) => {
       releaseLock = resolve
     })
     try {
