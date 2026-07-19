@@ -111,8 +111,8 @@ describe("writeAgentConfig", () => {
     })
 
     expect(config.toolAliases).toEqual({
-      "@kacp-760ededf/agent_teams_readiness_echo": "agent_teams_readiness_echo",
-      "@kacp-760ededf/agent_teams_task_complete": "agent_teams_task_complete",
+      "@kacp_760ededf/agent_teams_readiness_echo": "agent_teams_readiness_echo",
+      "@kacp_760ededf/agent_teams_task_complete": "agent_teams_task_complete",
     })
   })
 })
