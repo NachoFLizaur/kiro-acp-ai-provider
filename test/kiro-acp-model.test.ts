@@ -381,6 +381,44 @@ describe("KiroACPLanguageModel", () => {
       expect(client.setModel).toHaveBeenCalledWith("sess-1", "claude-opus-4.6")
     })
 
+    test("reapplies the custom-agent mode after model switching resets the toolset", async () => {
+      const toolsDir = createTempToolsDir()
+      const commandOrder: string[] = []
+      const client = createMockClient({
+        getAgentName: mock(() => "test-agent"),
+        getToolsRevision: mock(() => 7),
+        createSessionToolsFilePath: mock((id: string) => join(toolsDir, `tools-${id}.json`)),
+        createSessionWithToolsPath: mock(() => Promise.resolve({
+          sessionId: "sess-model-switch",
+          modes: { currentModeId: "test-agent", availableModes: [] },
+          models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+        } satisfies ACPSession)),
+        setModel: mock(async () => { commandOrder.push("model") }),
+        setMode: mock(async () => { commandOrder.push("mode") }),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "ready" } })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+      const model = new KiroACPLanguageModel("claude-opus-4.6", { client })
+      const tools = [makeTool("agent-teams_task_complete", {
+        type: "object",
+        properties: {},
+      })]
+
+      await collectStream((await model.doStream(makeCallOptions(
+        [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        { tools },
+      ))).stream)
+
+      expect(commandOrder).toEqual(["model", "mode"])
+      expect(client.waitForToolsReady).toHaveBeenLastCalledWith({
+        timeoutMs: 5000,
+        expectedTools: ["agent_teams_task_complete"],
+        afterRevision: 7,
+      })
+    })
+
     test("does not call setModel when modelId matches session default", async () => {
       const client = createMockClient({
         prompt: mock(async (opts: PromptOptions) => {

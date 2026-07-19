@@ -956,11 +956,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   /** Switch model on a session if the requested modelId differs. */
-  private async ensureModel(session: ACPSession): Promise<void> {
-    if (this.currentModelId === this.modelId) return
+  private async ensureModel(session: ACPSession): Promise<boolean> {
+    if (this.currentModelId === this.modelId) return false
 
     await this.client.setModel(session.sessionId, this.modelId)
     this.currentModelId = this.modelId
+    return true
   }
 
   /**
@@ -1805,8 +1806,31 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     reset = false,
   ): Promise<LanguageModelV3StreamResult> {
     const session = await this.acquireSession(options.tools)
-    await this.ensureModel(session)
+    const modelChanged = await this.ensureModel(session)
     await this.ensureEffort(session, this.resolveRequestedEffort(options))
+
+    // Kiro resets a custom-agent session to the default mode when the model
+    // changes (notably when selecting the `auto` route). Reapply the mode only
+    // after model and effort commands, then verify the exact MCP toolset again.
+    if (modelChanged) {
+      const agentName = this.client.getAgentName()
+      if (agentName) {
+        const definitions = functionToolDefinitions(options.tools)
+        const mapping = buildToolNameMapping(definitions.map((tool) => tool.name))
+        const expectedToolNames = definitions
+          .map((tool) => mapping.originalToKiro.get(tool.name)!)
+          .sort()
+
+        session.modes.currentModeId = ""
+        if (expectedToolNames.length > 0) {
+          const toolsRevision = this.client.getToolsRevision?.() ?? 0
+          await this.ensureSessionMode(session, expectedToolNames, toolsRevision)
+        } else {
+          await this.client.setMode(session.sessionId, agentName)
+          session.modes.currentModeId = agentName
+        }
+      }
+    }
 
     let promptBlocks: ContentBlock[]
 
