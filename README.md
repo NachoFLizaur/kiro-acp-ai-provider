@@ -62,7 +62,7 @@ const kiro = createKiroAcp({
   trustAllTools: true,            // Auto-approve all tool calls
   agentPrompt: "You are a ...",   // Custom system prompt
   contextWindow: 200_000,         // Max context window in tokens (default: 1_000_000)
-  mcpTimeout: 30,                 // MCP tool call timeout in minutes (default: 30)
+  mcpTimeout: 120,                // MCP startup/call timeout in minutes (default: 120)
   sessionId: "previous-id",       // Resume an existing session
   env: { MY_VAR: "value" },       // Extra env vars for kiro-cli
   clientInfo: { name: "my-app", version: "1.0.0" },
@@ -84,7 +84,7 @@ The `x-session-reset: true` header clears the persisted session and creates a fr
 
 ### MCP Timeout
 
-On startup, the provider sets `mcp.noInteractiveTimeout` to 30 minutes via `kiro-cli settings`. The default 5 minutes is too short for long-running tool calls (e.g., subagents that run for 8+ minutes).
+On startup, the provider sets `mcp.noInteractiveTimeout` to 120 minutes via `kiro-cli settings`. The Kiro CLI default of 5 minutes can be too short for cold MCP server startup and long-running tool calls (e.g., subagents that run for 8+ minutes).
 
 ## Provider Methods
 

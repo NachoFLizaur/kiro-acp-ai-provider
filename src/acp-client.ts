@@ -95,7 +95,7 @@ export interface ACPClientOptions {
   onUpdate?: (sessionId: string, update: SessionUpdate) => void
   onExtension?: (method: string, params: Record<string, unknown>) => void
   clientInfo?: { name: string; version: string; title?: string }
-  /** MCP tool call timeout in minutes (default: 30). */
+  /** MCP server startup and tool call timeout in minutes (default: 120). */
   mcpTimeout?: number
 }
 
@@ -179,6 +179,7 @@ interface PendingRequest {
 const DEFAULT_REQUEST_TIMEOUT_MS = 300_000 // 5 minutes (prompts can be long)
 // Cold Kiro starts can spend more than a minute loading an agent and its MCP bridge.
 const INITIALIZE_TIMEOUT_MS = 120_000
+const DEFAULT_MCP_TIMEOUT_MINUTES = 120
 const STOP_TIMEOUT_MS = 10_000
 
 export class ACPClient {
@@ -283,10 +284,11 @@ export class ACPClient {
     // shell:true on Windows resolves the .exe; elsewhere it is a no-op default.
     const isWin = process.platform === "win32"
 
-    // Ensure MCP tool timeout is sufficient for long-running subagent tasks.
-    // Default is 5 minutes which is too short for complex planning operations.
+    // Kiro applies this timeout while waiting for non-interactive MCP servers
+    // and their calls. Cold provider installs can exceed the CLI's 5-minute
+    // default before the bridge is available to the first model request.
     try {
-      execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
+      execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? DEFAULT_MCP_TIMEOUT_MINUTES)], {
         timeout: 5000,
         stdio: "ignore",
         shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
