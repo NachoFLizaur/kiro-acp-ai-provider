@@ -58,7 +58,7 @@ The provider translates AI SDK calls into ACP messages sent to a `kiro-cli` subp
 const kiro = createKiroAcp({
   cwd: "/path/to/project",        // Working directory (default: process.cwd())
   model: "claude-sonnet-4.6",     // Default model ID
-  agent: "my-agent",              // Custom agent name (--agent flag)
+  agent: "my-agent",              // Custom agent name (default: "kiro-acp")
   trustAllTools: true,            // Auto-approve all tool calls
   agentPrompt: "You are a ...",   // Custom system prompt
   contextWindow: 200_000,         // Max context window in tokens (default: 1_000_000)

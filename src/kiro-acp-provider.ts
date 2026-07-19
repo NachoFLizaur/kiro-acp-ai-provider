@@ -9,6 +9,7 @@ import { KiroACPLanguageModel } from "./kiro-acp-model"
 export interface KiroACPProviderSettings {
   cwd?: string
   model?: string
+  /** Custom Kiro agent name used for the MCP bridge. Default: kiro-acp. */
   agent?: string
   trustAllTools?: boolean
   agentPrompt?: string
@@ -28,7 +29,7 @@ export interface KiroACPProviderSettings {
   effort?: string
   /** Per-model default effort levels keyed by model id. Mirrors `contextWindows`. */
   efforts?: Record<string, string>
-  /** MCP tool call timeout in minutes. Default: 30. */
+  /** MCP server startup and tool call timeout in minutes. Default: 120. */
   mcpTimeout?: number
 }
 
@@ -65,7 +66,7 @@ export interface KiroACPProvider {
 export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPProvider {
   const clientOptions: ACPClientOptions = {
     cwd: settings.cwd ?? process.cwd(),
-    agent: settings.agent,
+    agent: settings.agent ?? "kiro-acp",
     trustAllTools: settings.trustAllTools,
     agentPrompt: settings.agentPrompt,
     onPermission: settings.onPermission,
