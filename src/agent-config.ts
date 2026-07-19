@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, renameSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
 import { join, dirname, basename } from "node:path"
 
@@ -24,6 +24,26 @@ function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_")
 }
 
+function readToolAliases(
+  toolsFilePath: string,
+  mcpServerName: string,
+): Record<string, string> {
+  try {
+    const parsed = JSON.parse(readFileSync(toolsFilePath, "utf-8")) as {
+      tools?: Array<{ name?: unknown }>
+    }
+    if (!Array.isArray(parsed.tools)) return {}
+
+    return Object.fromEntries(parsed.tools.flatMap((tool) =>
+      typeof tool.name === "string" && tool.name.length > 0
+        ? [[`@${mcpServerName}/${tool.name}`, tool.name]]
+        : [],
+    ))
+  } catch {
+    return {}
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Config generation
 // ---------------------------------------------------------------------------
@@ -46,6 +66,7 @@ export function generateAgentConfig(options: AgentConfigOptions): Record<string,
     ? `kacp-${streamSuffix}`
     : "kacp"
   const mcpServerRef = `@${mcpServerName}`
+  const toolAliases = readToolAliases(options.toolsFilePath, mcpServerName)
 
   return {
     name: options.name ?? "kiro-acp",
@@ -59,6 +80,7 @@ export function generateAgentConfig(options: AgentConfigOptions): Record<string,
         cwd: options.cwd,
       },
     },
+    ...(Object.keys(toolAliases).length > 0 ? { toolAliases } : {}),
     prompt:
       options.prompt ??
       `You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block included with each request. Always follow the latest <system_instructions> as your primary directive — they define who you are, how you behave, and what tools you should use. If no <system_instructions> are present, act as a helpful coding assistant that follows instructions precisely and uses tools proactively. If a tool call fails, retry it or try alternative approaches — do not assume a tool is permanently unavailable based on a single failure.`,
