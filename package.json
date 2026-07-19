@@ -1,6 +1,6 @@
 {
   "name": "kiro-acp-ai-provider",
-  "version": "2.1.2",
+  "version": "3.0.0",
   "description": "Kiro ACP (AWS) provider for Vercel AI SDK",
   "license": "MIT",
   "type": "module",
@@ -58,7 +58,14 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/NachoFLizaur/kiro-acp-ai-provider"
+    "url": "git+https://github.com/NachoFLizaur/kiro-acp-ai-provider.git"
   },
-  "author": "NachoFLizaur"
+  "bugs": {
+    "url": "https://github.com/NachoFLizaur/kiro-acp-ai-provider/issues"
+  },
+  "homepage": "https://github.com/NachoFLizaur/kiro-acp-ai-provider#readme",
+  "author": {
+    "name": "Nacho F. Lizaur",
+    "url": "https://github.com/NachoFLizaur"
+  }
 }

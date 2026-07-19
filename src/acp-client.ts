@@ -9,6 +9,7 @@ import { getXdgDataHome } from "./session-storage"
 import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
+import type { KiroEffort } from "./kiro-effort"
 import { verifyAuth } from "./kiro-auth"
 import { MCP_BRIDGE_SOURCE } from "./mcp-bridge-source"
 
@@ -69,6 +70,11 @@ export interface CommandResult {
   success: boolean
   message: string
   data?: Record<string, unknown>
+}
+
+export interface EffortOptionsResult {
+  runtimeEfforts: KiroEffort[]
+  baselineEffort?: KiroEffort
 }
 
 export interface AvailableTool {
@@ -138,6 +144,60 @@ interface JsonRpcServerRequest {
 }
 
 type JsonRpcMessage = JsonRpcResponse | JsonRpcNotification | JsonRpcServerRequest
+
+function parseEffortOptions(result: unknown): EffortOptionsResult | undefined {
+  if (typeof result !== "object" || result === null || Array.isArray(result)) {
+    return undefined
+  }
+
+  const response = result as Record<string, unknown>
+  if (
+    !Array.isArray(response.options) ||
+    (response.hasMore !== undefined && typeof response.hasMore !== "boolean") ||
+    response.hasMore === true
+  ) {
+    return undefined
+  }
+
+  const runtimeEfforts: KiroEffort[] = []
+  const activeStates = new Map<string, boolean>()
+  const activeEfforts: string[] = []
+  let hasAmbiguousActiveState = false
+
+  for (const option of response.options) {
+    if (typeof option !== "object" || option === null || Array.isArray(option)) {
+      return undefined
+    }
+
+    const entry = option as Record<string, unknown>
+    if (
+      typeof entry.value !== "string" ||
+      entry.value.length === 0 ||
+      (entry.label !== undefined && typeof entry.label !== "string") ||
+      (entry.active !== undefined && typeof entry.active !== "boolean")
+    ) {
+      return undefined
+    }
+
+    const isActive = entry.active === true
+    const previousActiveState = activeStates.get(entry.value)
+    if (previousActiveState !== undefined) {
+      if (previousActiveState !== isActive) hasAmbiguousActiveState = true
+      continue
+    }
+
+    activeStates.set(entry.value, isActive)
+    runtimeEfforts.push(entry.value)
+    if (isActive) activeEfforts.push(entry.value)
+  }
+
+  return {
+    runtimeEfforts,
+    ...(!hasAmbiguousActiveState && activeEfforts.length === 1
+      ? { baselineEffort: activeEfforts[0]! }
+      : {}),
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -529,8 +589,19 @@ export class ACPClient {
     await this.executeCommand(sessionId, "model", { value: modelId })
   }
 
-  async setEffort(sessionId: string, level: string): Promise<CommandResult> {
+  async setEffort(sessionId: string, level: KiroEffort): Promise<CommandResult> {
     return this.executeCommand(sessionId, "effort", { value: level })
+  }
+
+  async requestEffortOptions(
+    sessionId: string,
+  ): Promise<EffortOptionsResult | undefined> {
+    const result = await this.sendRequest("_kiro.dev/commands/options", {
+      sessionId,
+      command: "effort",
+      partial: "",
+    })
+    return parseEffortOptions(result)
   }
 
   async setMode(sessionId: string, modeId: string): Promise<void> {

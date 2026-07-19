@@ -726,17 +726,103 @@ describe("ACPClient", () => {
     })
   })
 
+  describe("requestEffortOptions()", () => {
+    test("uses the existing request path and dedupes same-state opaque options", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const sendRequest = mock(async () => ({
+        options: [
+          { value: "balanced-plus", label: "Balanced", active: false },
+          { value: "Future/MAX.v2!", active: true },
+          { value: "balanced-plus", active: false },
+        ],
+        hasMore: false,
+      }))
+      ;(client as any).sendRequest = sendRequest
+
+      await expect(client.requestEffortOptions("sess-opaque")).resolves.toEqual({
+        runtimeEfforts: ["balanced-plus", "Future/MAX.v2!"],
+        baselineEffort: "Future/MAX.v2!",
+      })
+      expect(sendRequest).toHaveBeenCalledWith("_kiro.dev/commands/options", {
+        sessionId: "sess-opaque",
+        command: "effort",
+        partial: "",
+      })
+    })
+
+    test("omits the baseline when multiple options are active", async () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      ;(client as any).sendRequest = mock(async () => ({
+        options: [
+          { value: "balanced-plus", active: true },
+          { value: "Future/MAX.v2!", active: true },
+        ],
+        hasMore: false,
+      }))
+
+      const result = await client.requestEffortOptions("sess-multiple-active")
+
+      expect(result).toEqual({
+        runtimeEfforts: ["balanced-plus", "Future/MAX.v2!"],
+      })
+      expect(Object.hasOwn(result!, "baselineEffort")).toBe(false)
+    })
+
+    test.each([
+      [
+        "active to inactive",
+        [
+          { value: "ambiguous", active: true },
+          { value: "stable", active: false },
+          { value: "ambiguous", active: false },
+        ],
+      ],
+      [
+        "inactive to active",
+        [
+          { value: "ambiguous", active: false },
+          { value: "stable", active: true },
+          { value: "ambiguous", active: true },
+        ],
+      ],
+    ])("omits the baseline for %s duplicate conflicts", async (_name, options) => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      ;(client as any).sendRequest = mock(async () => ({
+        options,
+        hasMore: false,
+      }))
+
+      const result = await client.requestEffortOptions("sess-ambiguous")
+
+      expect(result).toEqual({
+        runtimeEfforts: ["ambiguous", "stable"],
+      })
+      expect(Object.hasOwn(result!, "baselineEffort")).toBe(false)
+    })
+
+    test.each([
+      ["unsupported result", null],
+      ["missing options", {}],
+      ["malformed option", { options: [{ value: "" }], hasMore: false }],
+      ["incomplete page", { options: [{ value: "partial" }], hasMore: true }],
+    ])("returns no options for %s", async (_name, result) => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      ;(client as any).sendRequest = mock(async () => result)
+
+      await expect(client.requestEffortOptions("sess-1")).resolves.toBeUndefined()
+    })
+  })
+
   describe("setEffort()", () => {
-    test("issues an effort command with the requested native level", async () => {
-      // setEffort relays the level verbatim through executeCommand.
+    test("issues an effort command with the requested opaque value", async () => {
       const client = new ACPClient({ cwd: "/tmp" })
       const executeCommand = mock(async () => ({ success: true, message: "ok" }))
       ;(client as any).executeCommand = executeCommand
 
-      const result = await client.setEffort("sess-1", "low")
+      const result = await client.setEffort("sess-1", "Runtime/Effort.v2")
 
       expect(executeCommand).toHaveBeenCalledWith("sess-1", "effort", {
-        value: "low",
+        value: "Runtime/Effort.v2",
       })
       expect(result).toEqual({ success: true, message: "ok" })
     })
