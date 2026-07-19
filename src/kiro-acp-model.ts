@@ -32,6 +32,55 @@ import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 
 const TOOL_READY_TIMEOUT_MS = 5000
+const KIRO_TOOL_NAME_MAX_LENGTH = 48
+
+type ToolNameMapping = {
+  originalToKiro: Map<string, string>
+  kiroToOriginal: Map<string, string>
+}
+
+function normalizeKiroToolName(name: string): string {
+  let normalized = name.replace(/[^a-zA-Z0-9_]/g, "_")
+  if (normalized.length === 0) normalized = "tool"
+  else if (!/^[a-zA-Z]/.test(normalized)) normalized = `tool_${normalized}`
+  return normalized
+}
+
+function kiroToolNameBase(name: string): string {
+  return normalizeKiroToolName(name).slice(0, KIRO_TOOL_NAME_MAX_LENGTH)
+}
+
+function kiroToolNameWithHash(base: string, original: string): string {
+  const suffix = createHash("sha256").update(original).digest("hex").slice(0, 10)
+  const prefixLength = KIRO_TOOL_NAME_MAX_LENGTH - suffix.length - 1
+  return `${base.slice(0, prefixLength)}_${suffix}`
+}
+
+/**
+ * Kiro rejects MCP tool names outside `^[a-zA-Z][a-zA-Z0-9_]*$` and names
+ * whose server-qualified form exceeds 64 characters. OpenCode tool IDs may
+ * contain dashes, so expose compact Kiro-safe aliases and map calls back to
+ * the original host IDs at the provider boundary.
+ */
+function buildToolNameMapping(names: string[]): ToolNameMapping {
+  const sortedNames = [...new Set(names)].sort()
+  const bases = new Map(sortedNames.map((name) => [name, kiroToolNameBase(name)]))
+  const baseCounts = new Map<string, number>()
+  for (const base of bases.values()) baseCounts.set(base, (baseCounts.get(base) ?? 0) + 1)
+
+  const originalToKiro = new Map<string, string>()
+  const kiroToOriginal = new Map<string, string>()
+  for (const name of sortedNames) {
+    const base = bases.get(name)!
+    const truncated = normalizeKiroToolName(name).length > KIRO_TOOL_NAME_MAX_LENGTH
+    const mapped = truncated || (baseCounts.get(base) ?? 0) > 1
+      ? kiroToolNameWithHash(base, name)
+      : base
+    originalToKiro.set(name, mapped)
+    kiroToOriginal.set(mapped, name)
+  }
+  return { originalToKiro, kiroToOriginal }
+}
 
 function functionToolDefinitions(
   tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool> | undefined,
@@ -73,7 +122,10 @@ function toolsetHash(
       const serializedRight = JSON.stringify(right)
       return serializedLeft < serializedRight ? -1 : serializedLeft > serializedRight ? 1 : 0
     })
-  return createHash("sha256").update(JSON.stringify(canonicalDefinitions)).digest("hex")
+  return createHash("sha256").update(JSON.stringify({
+    version: 2,
+    definitions: canonicalDefinitions,
+  })).digest("hex")
 }
 
 // ---------------------------------------------------------------------------
@@ -576,7 +628,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private sessionToolsFiles = new Map<
     string,
-    { filePath: string; toolNames: string; toolsetHash: string }
+    {
+      filePath: string
+      toolNames: string
+      toolsetHash: string
+      kiroToOriginalToolName: Map<string, string>
+    }
   >()
 
   /**
@@ -673,7 +730,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     tools?: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
   ): Promise<ACPSession> {
     const expectedToolDefinitions = functionToolDefinitions(tools)
-    const expectedToolNames = expectedToolDefinitions.map((tool) => tool.name).sort()
+    const toolNameMapping = buildToolNameMapping(
+      expectedToolDefinitions.map((tool) => tool.name),
+    )
+    const expectedToolNames = expectedToolDefinitions
+      .map((tool) => toolNameMapping.originalToKiro.get(tool.name)!)
+      .sort()
     const expectedToolsetHash = toolsetHash(expectedToolDefinitions)
 
     // Write tools BEFORE creating the session so the MCP bridge
@@ -725,6 +787,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
                 filePath: toolsFilePath,
                 toolNames,
                 toolsetHash: expectedToolsetHash,
+                kiroToOriginalToolName: toolNameMapping.kiroToOriginal,
               })
             }
             persistSession(
@@ -757,6 +820,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
                   filePath: toolsFilePath,
                   toolNames,
                   toolsetHash: expectedToolsetHash,
+                  kiroToOriginalToolName: toolNameMapping.kiroToOriginal,
                 })
               }
               persistSession(
@@ -791,6 +855,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           filePath: toolsFilePath,
           toolNames,
           toolsetHash: expectedToolsetHash,
+          kiroToOriginalToolName: toolNameMapping.kiroToOriginal,
         })
       }
 
@@ -989,11 +1054,13 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     toolsFilePath: string,
     tools: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
   ): string {
-    const newTools: MCPToolDefinition[] = tools
+    const functionTools = tools
       .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
+    const toolNameMapping = buildToolNameMapping(functionTools.map((tool) => tool.name))
+    const newTools: MCPToolDefinition[] = functionTools
       .map((tool) => ({
-        name: tool.name,
-        description: tool.description ?? "",
+        name: toolNameMapping.originalToKiro.get(tool.name)!,
+        description: tool.description?.trim() || `Invoke ${tool.name}`,
         inputSchema: tool.inputSchema as MCPToolDefinition["inputSchema"],
       }))
 
@@ -1050,9 +1117,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         const raw = readFileSync(toolsFilePath, "utf-8")
         const parsed = JSON.parse(raw) as MCPToolsFile
 
-        const expectedNames = tools
+        const functionTools = tools
           .filter((tool): tool is LanguageModelV3FunctionTool => tool.type === "function")
-          .map((tool) => tool.name)
+        const toolNameMapping = buildToolNameMapping(functionTools.map((tool) => tool.name))
+        const expectedNames = functionTools
+          .map((tool) => toolNameMapping.originalToKiro.get(tool.name)!)
 
         const actualNames = new Set((parsed.tools ?? []).map((tool) => tool.name))
         const missing = expectedNames.filter((name) => !actualNames.has(name))
@@ -1530,7 +1599,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     }
 
     const onToolCall = (pendingCall: PendingToolCall): void => {
-      bufferedToolCalls.push(pendingCall)
+      const originalToolName = this.sessionToolsFiles
+        .get(sessionId)
+        ?.kiroToOriginalToolName.get(pendingCall.toolName)
+      bufferedToolCalls.push(originalToolName
+        ? { ...pendingCall, toolName: originalToolName }
+        : pendingCall)
 
       if (debounceTimer) clearTimeout(debounceTimer)
       debounceTimer = setTimeout(() => {

@@ -36,14 +36,15 @@ function sanitizeName(name: string): string {
  * `<system_instructions>`.
  */
 export function generateAgentConfig(options: AgentConfigOptions): Record<string, unknown> {
-  // Extract unique suffix from tools file path for per-session MCP server naming.
-  // Prevents kiro-cli from merging tools across sessions sharing the same workspace.
+  // Keep the per-session MCP server name compact: Kiro limits the complete
+  // `@server/tool` identifier to 64 characters. The stream suffix still
+  // prevents Kiro from merging tools across concurrent workspace sessions.
   const toolsBaseName = basename(options.toolsFilePath, ".json")
   const segments = toolsBaseName.split("-")
   const streamSuffix = segments.length >= 3 ? segments[segments.length - 1] : ""
   const mcpServerName = streamSuffix
-    ? `${(options.name ?? "kiro-acp")}-tools-${streamSuffix}`
-    : `${(options.name ?? "kiro-acp")}-tools`
+    ? `kacp-${streamSuffix}`
+    : "kacp"
   const mcpServerRef = `@${mcpServerName}`
 
   return {

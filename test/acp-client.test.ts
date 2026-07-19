@@ -755,7 +755,7 @@ describe("generateAgentConfig consumer-agnostic", () => {
 
     expect(config.mcpServers).toBeDefined()
     const mcpServers = config.mcpServers as Record<string, unknown>
-    expect(mcpServers["my-editor-tools"]).toBeDefined()
+    expect(mcpServers.kacp).toBeDefined()
   })
 
   test("generateAgentConfig defaults to kiro-acp", () => {
@@ -764,11 +764,11 @@ describe("generateAgentConfig consumer-agnostic", () => {
     expect(config.name).toBe("kiro-acp")
   })
 
-  test("generateAgentConfig default MCP server is kiro-acp-tools", () => {
+  test("generateAgentConfig uses a compact default MCP server name", () => {
     const config = generateAgentConfig({ ...baseOptions, name: undefined })
 
     const mcpServers = config.mcpServers as Record<string, unknown>
-    expect(mcpServers["kiro-acp-tools"]).toBeDefined()
+    expect(mcpServers.kacp).toBeDefined()
   })
 
   test("generateAgentConfig includes stream suffix from tools file path", () => {
@@ -780,10 +780,10 @@ describe("generateAgentConfig consumer-agnostic", () => {
 
     const mcpServers = config.mcpServers as Record<string, unknown>
     // Server name should include the session/instance suffix
-    expect(mcpServers["my-editor-tools-760ededf"]).toBeDefined()
+    expect(mcpServers["kacp-760ededf"]).toBeDefined()
     // tools and allowedTools should reference the unique server name
-    expect(config.tools).toEqual(["@my-editor-tools-760ededf"])
-    expect(config.allowedTools).toEqual(["@my-editor-tools-760ededf"])
+    expect(config.tools).toEqual(["@kacp-760ededf"])
+    expect(config.allowedTools).toEqual(["@kacp-760ededf"])
   })
 
   test("generateAgentConfig uses default name with stream suffix", () => {
@@ -794,8 +794,8 @@ describe("generateAgentConfig consumer-agnostic", () => {
     })
 
     const mcpServers = config.mcpServers as Record<string, unknown>
-    expect(mcpServers["kiro-acp-tools-deadbeef"]).toBeDefined()
-    expect(config.tools).toEqual(["@kiro-acp-tools-deadbeef"])
+    expect(mcpServers["kacp-deadbeef"]).toBeDefined()
+    expect(config.tools).toEqual(["@kacp-deadbeef"])
   })
 
   test("generateAgentConfig produces unique server names for different sessions", () => {
@@ -811,7 +811,7 @@ describe("generateAgentConfig consumer-agnostic", () => {
     const servers1 = Object.keys(config1.mcpServers as Record<string, unknown>)
     const servers2 = Object.keys(config2.mcpServers as Record<string, unknown>)
     expect(servers1[0]).not.toBe(servers2[0])
-    expect(servers1[0]).toBe("kiro-acp-tools-aaaaaaaa")
-    expect(servers2[0]).toBe("kiro-acp-tools-bbbbbbbb")
+    expect(servers1[0]).toBe("kacp-aaaaaaaa")
+    expect(servers2[0]).toBe("kacp-bbbbbbbb")
   })
 })
