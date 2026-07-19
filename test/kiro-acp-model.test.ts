@@ -678,7 +678,7 @@ describe("KiroACPLanguageModel", () => {
 
       expect(client.waitForToolsReady).toHaveBeenCalledWith({
         timeoutMs: 5000,
-        expectedTools: ["agent-teams_task_complete"],
+        expectedTools: ["agent_teams_task_complete"],
         afterRevision: 4,
       })
     })
@@ -818,6 +818,20 @@ describe("KiroACPLanguageModel", () => {
 
         await harness.runTurn([
           makeTool("task_complete", { type: "object", properties: {} }),
+        ])
+
+        expect(harness.loadSession).not.toHaveBeenCalled()
+        expect(harness.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
+      })
+    })
+
+    test("persisted sessions from an older fingerprint format are invalidated", async () => {
+      await withTempXdgDataHome(async (storageDir) => {
+        const harness = createAffinityToolsetHarness(storageDir)
+        persistSession(harness.cwd, "sess-old-format", "affinity-tools", "old-toolset-hash")
+
+        await harness.runTurn([
+          makeTool("agent-teams_task_complete", { type: "object", properties: {} }),
         ])
 
         expect(harness.loadSession).not.toHaveBeenCalled()
@@ -1053,6 +1067,47 @@ describe("KiroACPLanguageModel", () => {
       expect(types).toContain("tool-call")
       expect(types).not.toContain("text-delta")
       expect(types).toContain("finish")
+    })
+
+    test("maps Kiro-safe MCP aliases back to the original host tool name", async () => {
+      const toolsDir = createTempToolsDir()
+      const toolsFile = join(toolsDir, "tools.json")
+      const laneRouter = new LaneRouter()
+      const client = createMockClient({
+        createSessionToolsFilePath: mock(() => toolsFile),
+        getLaneRouter: mock(() => laneRouter),
+        prompt: mock(async () => {
+          laneRouter.route({
+            callId: "tc-safe-name",
+            toolName: "agent_teams_readiness_echo",
+            args: { token: "expected" },
+          })
+          await new Promise((resolve) => setTimeout(resolve, 200))
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const tools = [makeTool("agent-teams_readiness_echo", {
+        type: "object",
+        properties: { token: { type: "string" } },
+        required: ["token"],
+      })]
+
+      const result = await model.doStream(makeCallOptions(
+        [{ role: "user", content: [{ type: "text", text: "call readiness" }] }],
+        { tools },
+      ))
+      const parts = await collectStream(result.stream)
+      const toolCall = parts.find((part) => part.type === "tool-call")
+
+      expect(JSON.parse(readFileSync(toolsFile, "utf-8")).tools[0].name)
+        .toBe("agent_teams_readiness_echo")
+      expect(toolCall).toMatchObject({
+        type: "tool-call",
+        toolCallId: "tc-safe-name",
+        toolName: "agent-teams_readiness_echo",
+        input: JSON.stringify({ token: "expected" }),
+      })
     })
   })
 
@@ -2029,6 +2084,33 @@ describe("KiroACPLanguageModel", () => {
       })
     })
 
+    test("writes deterministic valid aliases for colliding and long host tool names", async () => {
+      const toolsDir = createTempToolsDir()
+      const toolsFile = join(toolsDir, "tools.json")
+      const client = createMockClient({
+        createSessionToolsFilePath: mock(() => toolsFile),
+        prompt: mock(async () => ({ stopReason: "end_turn" })),
+      } as unknown as Partial<ACPClient>)
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const tools = [
+        makeTool("agent-teams_x", { type: "object", properties: {} }),
+        makeTool("agent_teams_x", { type: "object", properties: {} }),
+        makeTool(`1-${"very-long-".repeat(8)}tool`, { type: "object", properties: {} }),
+      ]
+
+      const result = await model.doStream(makeCallOptions(
+        [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        { tools },
+      ))
+      await collectStream(result.stream)
+
+      const names = JSON.parse(readFileSync(toolsFile, "utf-8")).tools
+        .map((tool: { name: string }) => tool.name)
+      expect(new Set(names).size).toBe(3)
+      expect(names.every((name: string) => /^[a-zA-Z][a-zA-Z0-9_]*$/.test(name))).toBe(true)
+      expect(names.every((name: string) => name.length <= 48)).toBe(true)
+    })
+
     test("skips provider tools and only syncs function tools", async () => {
       const toolsDir = createTempToolsDir()
       const toolsFile = join(toolsDir, "tools.json")
@@ -2156,7 +2238,7 @@ describe("KiroACPLanguageModel", () => {
       expect(written.tools[0].name).toBe("bash")
     })
 
-    test("uses empty string for missing tool description", async () => {
+    test("uses a non-empty Kiro-compatible fallback for missing tool description", async () => {
       const toolsDir = createTempToolsDir()
       const toolsFile = join(toolsDir, "tools.json")
 
@@ -2197,7 +2279,7 @@ describe("KiroACPLanguageModel", () => {
       await collectStream(result.stream)
 
       const written = JSON.parse(readFileSync(toolsFile, "utf-8"))
-      expect(written.tools[0].description).toBe("")
+      expect(written.tools[0].description).toBe("Invoke glob")
     })
 
     test("writes a new tools file for each doStream call (no reuse)", async () => {
