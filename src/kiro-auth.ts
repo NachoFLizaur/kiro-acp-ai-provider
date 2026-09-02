@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs"
-import { execFileSync } from "node:child_process"
+import { execFile, execFileSync } from "node:child_process"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -21,7 +21,11 @@ const WHOAMI_TIMEOUT_MS = 10000
 const AUTH_CACHE_TTL_MS = 5000
 let authCache: { value: AuthStatus; expiresAt: number } | null = null
 
-/** Drop the memoized verifyAuth() result so the next call re-probes. */
+/**
+ * Drop the memoized verifyAuth()/verifyAuthAsync() result so the next call
+ * re-probes. Deliberately does NOT cancel an in-flight async probe — see
+ * verifyAuthAsync: the probe still completes and re-memos its result.
+ */
 export function resetAuthCache(): void {
   authCache = null
 }
@@ -91,57 +95,139 @@ function isTimeoutError(err: unknown): boolean {
   return e?.code === "ETIMEDOUT" || e?.signal === "SIGTERM"
 }
 
+// ---------------------------------------------------------------------------
+// Shared probe core. The sync (verifyAuth) and async (verifyAuthAsync) paths
+// differ ONLY in spawn mechanics (execFileSync vs callback execFile); every
+// probe DECISION — version gate, whoami parse with throw-path recovery, and
+// token-file existence — lives ONCE in the derive* helpers below. The two
+// drivers (probeAuth / probeAuthAsync) are deliberately thin, symmetric
+// sequencers over those helpers (chosen over a generic sync/async core so the
+// sync path stays genuinely synchronous without Promise gymnastics).
+// ---------------------------------------------------------------------------
+
+/** Result of one spawn attempt, normalized across the sync/async adapters. */
+interface ExecOutcome {
+  stdout: string
+  stderr: string
+  error: unknown // undefined on success
+}
+
+/**
+ * Step 1 decision (version gate): success => installed with a trimmed version;
+ * timeout => the command launched but did not answer quickly enough, so it is
+ * NOT a missing install (version unknown); any other failure => not installed.
+ */
+function deriveVersionStep(outcome: ExecOutcome): { installed: boolean; version?: string } {
+  if (outcome.error === undefined) return { installed: true, version: outcome.stdout.trim() }
+  if (isTimeoutError(outcome.error)) return { installed: true }
+  return { installed: false }
+}
+
+/**
+ * Step 2 decision (whoami authority): on success parse stdout alone; on
+ * failure parse the captured stdout AND stderr before concluding logged-out
+ * (kiro-cli may exit non-zero while still printing the auth JSON). We never
+ * decide on exit code alone.
+ */
+function deriveAuthenticated(outcome: ExecOutcome): boolean {
+  if (outcome.error === undefined) return parseWhoamiAuthenticated(outcome.stdout)
+  return parseWhoamiAuthenticated(outcome.stdout, outcome.stderr)
+}
+
+/** Step 3 decision (token file): report the path only when the file exists. */
+function deriveTokenPath(): string | undefined {
+  const tokenPath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json")
+  return existsSync(tokenPath) ? tokenPath : undefined
+}
+
+/**
+ * Sync exec adapter: execFileSync with the exact historical options. On the
+ * throw path execFileSync attaches captured stdout/stderr to the error, so we
+ * mine and coerce them into the outcome.
+ */
+function execSyncOutcome(args: readonly string[], timeoutMs: number): ExecOutcome {
+  try {
+    const stdout = execFileSync("kiro-cli", args as string[], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: timeoutMs,
+      shell: process.platform === "win32", // resolve kiro-cli.exe / PATHEXT on Windows
+    }).toString()
+    return { stdout, stderr: "", error: undefined }
+  } catch (err) {
+    const e = err as { stdout?: Buffer | string | null; stderr?: Buffer | string | null }
+    return {
+      stdout: e?.stdout != null ? e.stdout.toString() : "",
+      stderr: e?.stderr != null ? e.stderr.toString() : "",
+      error: err,
+    }
+  }
+}
+
+/**
+ * Async exec adapter: callback-style execFile wrapped in a hand-rolled Promise
+ * (node builtins only — zero runtime deps preserved). The callback delivers
+ * captured stdout/stderr even on error, and execFile's timeout kill surfaces
+ * as `signal: "SIGTERM"`, which isTimeoutError already classifies. Never
+ * rejects.
+ */
+function execAsyncOutcome(args: readonly string[], timeoutMs: number): Promise<ExecOutcome> {
+  return new Promise((resolve) => {
+    execFile(
+      "kiro-cli",
+      args as string[],
+      {
+        timeout: timeoutMs,
+        shell: process.platform === "win32", // win32 PATHEXT resolution — MUST match the sync probe
+      },
+      (error, stdout, stderr) => {
+        resolve({
+          stdout: stdout?.toString() ?? "",
+          stderr: stderr?.toString() ?? "",
+          error: error ?? undefined,
+        })
+      },
+    )
+  })
+}
+
 /**
  * Spawn `kiro-cli --version` then `whoami --format json` and derive an
  * AuthStatus. Factored out of verifyAuth so the cache covers every return path.
+ * Thin sync driver over the shared derive* decision helpers.
  */
 function probeAuth(): AuthStatus {
-  const isWin = process.platform === "win32"
+  const versionStep = deriveVersionStep(execSyncOutcome(["--version"], VERSION_TIMEOUT_MS))
+  if (!versionStep.installed) return { installed: false, authenticated: false }
 
-  let installed = false
-  let version: string | undefined
-  try {
-    version = execFileSync("kiro-cli", ["--version"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: VERSION_TIMEOUT_MS,
-      shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
-    })
-      .toString()
-      .trim()
-    installed = true
-  } catch (err) {
-    if (!isTimeoutError(err)) return { installed: false, authenticated: false }
-    // A timeout means the command launched but did not answer quickly enough;
-    // do not report this as a missing install.
-    installed = true
-  }
-
-  // Authority = whoami --format json; require a non-empty accountType. We never
-  // decide on exit code alone. On the throw path execFileSync attaches captured
-  // stdout/stderr, so parse both before concluding logged-out.
-  let authenticated = false
-  try {
-    const stdout = execFileSync("kiro-cli", ["whoami", "--format", "json"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: WHOAMI_TIMEOUT_MS,
-      shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
-    }).toString()
-    authenticated = parseWhoamiAuthenticated(stdout)
-  } catch (err) {
-    const e = err as { stdout?: Buffer | string | null; stderr?: Buffer | string | null }
-    const out = e?.stdout != null ? e.stdout.toString() : ""
-    const errOut = e?.stderr != null ? e.stderr.toString() : ""
-    authenticated = parseWhoamiAuthenticated(out, errOut)
-  }
-
-  const tokenPath = join(homedir(), ".aws", "sso", "cache", "kiro-auth-token.json")
-  const hasToken = existsSync(tokenPath)
+  const authenticated = deriveAuthenticated(
+    execSyncOutcome(["whoami", "--format", "json"], WHOAMI_TIMEOUT_MS),
+  )
 
   return {
-    installed,
+    installed: true,
     authenticated,
-    version,
-    tokenPath: hasToken ? tokenPath : undefined,
+    version: versionStep.version,
+    tokenPath: deriveTokenPath(),
+  }
+}
+
+/**
+ * Async twin of probeAuth: identical decisions via the same derive* helpers,
+ * but the spawns go through the non-blocking execFile adapter. Never rejects.
+ */
+async function probeAuthAsync(): Promise<AuthStatus> {
+  const versionStep = deriveVersionStep(await execAsyncOutcome(["--version"], VERSION_TIMEOUT_MS))
+  if (!versionStep.installed) return { installed: false, authenticated: false }
+
+  const authenticated = deriveAuthenticated(
+    await execAsyncOutcome(["whoami", "--format", "json"], WHOAMI_TIMEOUT_MS),
+  )
+
+  return {
+    installed: true,
+    authenticated,
+    version: versionStep.version,
+    tokenPath: deriveTokenPath(),
   }
 }
 
@@ -166,4 +252,35 @@ export function verifyAuth(): AuthStatus {
   const value = probeAuth()
   authCache = { value, expiresAt: Date.now() + AUTH_CACHE_TTL_MS }
   return value
+}
+
+// One in-flight async probe at a time. The plugin's login poll fires every 2s
+// while a probe can take up to ~20s worst-case (2 spawns x 10s), so concurrent
+// verifyAuthAsync() callers coalesce onto the same promise instead of stacking
+// kiro-cli spawns.
+let inflightProbe: Promise<AuthStatus> | null = null
+
+/**
+ * Async variant of verifyAuth(): identical probe, identical AuthStatus,
+ * identical 5s memo (SHARED cache object with the sync path), but the two
+ * kiro-cli spawns never block the event loop. Concurrent callers coalesce
+ * onto one in-flight probe (the plugin login poll fires every 2s while a
+ * probe can take up to ~20s worst-case). Never rejects.
+ *
+ * Note: resetAuthCache() drops the memo but deliberately leaves an in-flight
+ * probe untouched — it still completes and re-memos its result.
+ */
+export async function verifyAuthAsync(): Promise<AuthStatus> {
+  if (authCache && Date.now() < authCache.expiresAt) return authCache.value
+  if (inflightProbe) return inflightProbe
+  inflightProbe = (async () => {
+    try {
+      const value = await probeAuthAsync()
+      authCache = { value, expiresAt: Date.now() + AUTH_CACHE_TTL_MS }
+      return value
+    } finally {
+      inflightProbe = null
+    }
+  })()
+  return inflightProbe
 }

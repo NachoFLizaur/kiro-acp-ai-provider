@@ -42,6 +42,17 @@ describe("root export surface", () => {
     expect(typeof root.listModels).toBe("function")
   })
 
+  test("verifyAuthAsync is an additive root export; auto-discovery still picks createKiroAcp", () => {
+    expect(typeof root.verifyAuthAsync).toBe("function")
+    expect(typeof root.verifyAuth).toBe("function")
+
+    // "v" sorts after "c": the first sorted create* key must remain the factory.
+    const firstCreate = Object.keys(root)
+      .sort()
+      .find((key) => key.startsWith("create"))
+    expect(firstCreate).toBe("createKiroAcp")
+  })
+
   test("exports the required runtime model and one opaque effort contract", () => {
     const runtimeEffort: KiroEffort = "Future/MAX.v2+Beta!"
     const options = { cwd: "/runtime-catalog" } satisfies ListModelsOptions

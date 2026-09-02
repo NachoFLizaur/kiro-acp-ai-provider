@@ -65,8 +65,9 @@ export {
 // Opaque effort values discovered from and relayed to the Kiro runtime.
 export type { KiroEffort } from "./kiro-effort"
 
-// Utilities
-export { verifyAuth, type AuthStatus } from "./kiro-auth"
+// Utilities. `verifyAuthAsync` starts with "v" — safe for the auto-discovery
+// invariant above (no new `create*` root export).
+export { verifyAuth, verifyAuthAsync, type AuthStatus } from "./kiro-auth"
 export {
   listModels,
   type ListModelsOptions,
