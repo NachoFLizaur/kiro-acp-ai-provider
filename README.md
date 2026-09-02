@@ -104,11 +104,14 @@ kiro.getTotalCredits()                       // Total credits consumed
 Standalone functions that don't require a running provider:
 
 ```typescript
-import { verifyAuth, listModels, getQuota } from "kiro-acp-ai-provider"
+import { verifyAuth, verifyAuthAsync, listModels, getQuota } from "kiro-acp-ai-provider"
 
 // Check if kiro-cli is installed and authenticated
 const status = verifyAuth()
 // { installed: true, authenticated: true, version: "1.2.3", tokenPath: "..." }
+
+// Same check without blocking the event loop
+const asyncStatus = await verifyAuthAsync()
 
 // Discover exact runtime model IDs and their effort options
 const models = await listModels({ cwd: process.cwd() })
@@ -118,6 +121,8 @@ const quota = await getQuota({ client: kiro.getClient() })
 ```
 
 `verifyAuth()` determines authentication solely from `kiro-cli whoami`, which abstracts the per-OS credential store. The on-disk SSO token file and its expiry are not consulted for the auth decision, so a stale token file never misreports a logged-in user. The returned `tokenPath` is provided only as an optional refresh hint for consumers.
+
+`verifyAuthAsync()` runs the same probe and returns the same `AuthStatus`, but the two `kiro-cli` invocations (`--version` and `whoami`) run without blocking the event loop. Prefer it anywhere a stalled event loop would be visible, such as an interactive host, a login poll, or a server request handler; `verifyAuth()` remains available for callers that need a synchronous answer. Both functions share one short-TTL result cache and the same per-command timeouts, so mixing them is safe, and concurrent `verifyAuthAsync()` calls coalesce onto a single in-flight probe. `verifyAuthAsync()` never rejects: a missing `kiro-cli` resolves to `{ installed: false, authenticated: false }`, and a failing or timed-out `whoami` resolves to `authenticated: false`.
 
 ## Models
 
