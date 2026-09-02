@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 
 // ---------------------------------------------------------------------------
-// Tests for Task 05: Per-Instance Agent Config
+// Per-instance agent config (writeAgentConfig)
 // ---------------------------------------------------------------------------
 
 describe("writeAgentConfig", () => {

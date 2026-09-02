@@ -9,12 +9,12 @@ import type {
 } from "@ai-sdk/provider"
 
 // ---------------------------------------------------------------------------
-// Credits part-level dual emission (task 05).
+// Credits part-level dual emission.
 //
-// Contract: completed turns with known credits attach the SAME
-// `{ kiro: { credits, creditsUnit } }` provider metadata to the FINAL
-// text-end AND to reasoning-end (when the turn streamed reasoning).
-// NO `kiro` key leaks onto parts when credits are unknown, the turn was
+// Contract: completed turns with known credits attach the same
+// `{ kiro: { credits, creditsUnit } }` provider metadata to the final
+// text-end and to reasoning-end (when the turn streamed reasoning).
+// No `kiro` key leaks onto parts when credits are unknown, the turn was
 // cancelled, a mid-turn tool-call segment is flushed, or the prompt errored.
 // doGenerate mirrors the part metadata onto its content parts and keeps the
 // full finish-event shape at the result level.

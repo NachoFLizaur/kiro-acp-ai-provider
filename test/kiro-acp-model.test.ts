@@ -2389,7 +2389,7 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
-  describe("extractPrompt — base64 conversion (Task 01)", () => {
+  describe("extractPrompt — base64 conversion", () => {
     test("converts Uint8Array image data to base64", async () => {
       let capturedPrompt: unknown[] = []
 
@@ -2558,7 +2558,7 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
-  describe("extractPrompt — image handling (Task 02)", () => {
+  describe("extractPrompt — image handling", () => {
     test("sends text ContentBlocks for text-only prompt", async () => {
       let capturedPrompt: unknown[] = []
 
@@ -2736,7 +2736,7 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
-  describe("startFreshPrompt — ContentBlock[] wiring (Task 04)", () => {
+  describe("startFreshPrompt — ContentBlock[] wiring", () => {
     test("client.prompt receives combined text block for text-only prompts", async () => {
       let capturedPrompt: unknown[] = []
 

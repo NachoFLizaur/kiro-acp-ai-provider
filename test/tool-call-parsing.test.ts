@@ -2,10 +2,10 @@ import { describe, test, expect } from "bun:test"
 import { parseToolCallNotification } from "../src/kiro-acp-model"
 
 // ---------------------------------------------------------------------------
-// Tests for Task 07: Broader Tool Call Parsing
+// Tool call notification parsing (parseToolCallNotification)
 //
-// parseToolCallNotification() is now exported for direct unit testing.
-// It's a pure function with no side effects.
+// parseToolCallNotification() is exported for direct unit testing.
+// It is a pure function with no side effects.
 // ---------------------------------------------------------------------------
 
 describe("parseToolCallNotification", () => {

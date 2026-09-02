@@ -11,14 +11,14 @@ import type {
 } from "../src/index"
 
 // ---------------------------------------------------------------------------
-// Export-surface regression (task 05 / F4).
+// Export-surface regression.
 //
-// opencode's SDK auto-discovery (`resolveSDK`, provider.ts:1786-1817) takes
-// the FIRST key of the SORTED root namespace matching `create*` as the
-// provider factory. A root-level `createIPCServer` sorts before
-// `createKiroAcp` ("I" < "K") and would shadow it, breaking languageModel
-// resolution on stock opencode. The factory therefore lives on the
-// `kiro-acp-ai-provider/ipc` subpath; only types stay at the root.
+// opencode's SDK auto-discovery (`resolveSDK` in its provider.ts) takes the
+// first key of the sorted root namespace matching `create*` as the provider
+// factory. A root-level `createIPCServer` sorts before `createKiroAcp`
+// ("I" < "K") and would shadow it, breaking languageModel resolution on stock
+// opencode. The factory therefore lives on the `kiro-acp-ai-provider/ipc`
+// subpath; only types stay at the root.
 // ---------------------------------------------------------------------------
 
 describe("root export surface", () => {

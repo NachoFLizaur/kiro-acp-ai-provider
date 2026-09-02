@@ -6,30 +6,29 @@ import * as childProcess from "node:child_process"
 import { verifyAuth, verifyAuthAsync, resetAuthCache, type AuthStatus } from "../src/kiro-auth"
 
 // ---------------------------------------------------------------------------
-// verifyAuth() auth authority = `kiro-cli whoami --format json` (SDK 2.0.2).
-//
-// CORRECTS SDK 2.0.1: the on-disk token file `expiresAt` is NOT the live-auth
-// signal (kiro-cli auto-re-authenticates and keeps the live token in the OS
-// credential store), so the old file-expiry gate misclassified a logged-in user
-// as expired. verifyAuth now derives `authenticated` SOLELY from the first
-// "{"-line of `kiro-cli whoami --format json` requiring a non-empty
-// `accountType`, and never consults the file's expiry. These tests mock
-// execFileSync with the EMPIRICAL kiro-cli 2.7.1 fixtures (no real spawn, no
-// backend) per the repo's bun-test conventions.
+// verifyAuth() detection rule: `kiro-cli whoami --format json` is the sole auth
+// authority. `authenticated` is derived from the first balanced JSON object in
+// the whoami output and requires a non-empty `accountType`. The on-disk token
+// file's `expiresAt` is never consulted: kiro-cli auto-re-authenticates and
+// keeps the live token in the OS credential store, so file expiry says nothing
+// about the live session. These tests mock execFileSync with fixtures captured
+// from kiro-cli 2.7.1 (no real spawn, no backend), following the repo's
+// bun-test conventions.
 // ---------------------------------------------------------------------------
 
-// EMPIRICAL FIXTURES (kiro-cli 2.7.1, captured on a real machine; verbatim).
+// Fixtures captured from kiro-cli 2.7.1 (verbatim shape; identifiers are
+// example values).
 
-// LOGGED-IN stdout: a single compact JSON line FOLLOWED by a NON-JSON "Profile:"
-// trailer. EXIT=0. The parser must read ONLY the first "{"-line and ignore the
-// trailer (never JSON.parse the whole stdout).
+// Logged-in stdout: a single compact JSON line followed by a non-JSON "Profile:"
+// trailer, exit 0. The parser must read only the first balanced JSON object and
+// ignore the trailer (never JSON.parse the whole stdout).
 const WHOAMI_LOGGED_IN = `{"accountType":"IamIdentityCenter","email":"user@example.com","region":"eu-west-1","startUrl":"https://d-0000000000.awsapps.com/start"}
 
 Profile:
 KiroProfile-eu-central-1
 arn:aws:codewhisperer:eu-central-1:123456789012:profile/EXAMPLEPROFILE`
 
-// LOGGED-OUT stdout (right after `kiro-cli logout`): no `accountType`.
+// Logged-out stdout (right after `kiro-cli logout`): no `accountType`.
 const WHOAMI_LOGGED_OUT = `{"account":null}`
 
 const VERSION_STDOUT = "kiro-cli 2.7.1"
@@ -60,7 +59,7 @@ function mockKiroCli(opts: { version?: string | Error; whoami?: string | Error }
 // on childProcess.execFile, routes on argv, and delivers (error, stdout,
 // stderr) through the Node callback. A behavior can be a plain string (stdout,
 // success), an Error (failure with empty streams), or `{ error, stdout?,
-// stderr? }` (failure WITH captured output — the throw-path recovery shape).
+// stderr? }` (failure with captured output, the throw-path recovery shape).
 // An optional `gate` promise delays every callback until manually released
 // (used by the coalescing test to hold two callers in flight).
 
@@ -92,7 +91,7 @@ function mockKiroCliAsync(opts: {
     else callback(behavior.error, behavior.stdout ?? "", behavior.stderr ?? "")
   }
 
-  // Defensive over execFile's overloads: the callback is always the LAST
+  // Defensive over execFile's overloads: the callback is always the last
   // argument; options (when present) sit between args and the callback.
   const impl = (file: string, ...rest: unknown[]) => {
     const callback = rest[rest.length - 1] as ExecFileCallback
@@ -142,12 +141,13 @@ describe("verifyAuth: whoami --format json detection rule", () => {
     const cacheDir = join(tempHome, ".aws", "sso", "cache")
     mkdirSync(cacheDir, { recursive: true })
     const tokenPath = join(cacheDir, "kiro-auth-token.json")
-    // Stale: the real expired value that triggered the 2.0.1 -32603 failures.
+    // Stale: an `expiresAt` well in the past, the shape that a file-expiry gate
+    // would wrongly classify as logged out.
     writeFileSync(tokenPath, JSON.stringify({ expiresAt: "2025-04-01T00:00:00.000Z" }))
     return tokenPath
   }
 
-  test("logged-in fixture WITH trailing Profile block => authenticated true (parser ignores the non-JSON trailer)", () => {
+  test("logged-in fixture with trailing Profile block => authenticated true (parser ignores the non-JSON trailer)", () => {
     spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
     mockHome()
     const status = verifyAuth()
@@ -162,18 +162,18 @@ describe("verifyAuth: whoami --format json detection rule", () => {
     expect(verifyAuth().authenticated).toBe(false)
   })
 
-  test("CORE REGRESSION: logged-in whoami WITH a STALE on-disk token file => authenticated true", () => {
-    // SDK 2.0.1 would have flipped this to false via the file-expiry override.
+  test("logged-in whoami with a stale on-disk token file => authenticated true", () => {
+    // A file-expiry gate would flip this to false; whoami is authoritative.
     const tempHome = mockHome()
     const tokenPath = writeStaleToken(tempHome)
     spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
 
     const status = verifyAuth()
-    expect(status.authenticated).toBe(true) // stale expiresAt must NOT downgrade
+    expect(status.authenticated).toBe(true) // stale expiresAt must not downgrade
     expect(status.tokenPath).toBe(tokenPath) // file still reported as a refresh source
   })
 
-  test("logged-in whoami with a MISSING token file => authenticated true (file is not authoritative)", () => {
+  test("logged-in whoami with a missing token file => authenticated true (file is not authoritative)", () => {
     mockHome() // no token file written under the temp home
     spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
 
@@ -182,8 +182,8 @@ describe("verifyAuth: whoami --format json detection rule", () => {
     expect(status.tokenPath).toBeUndefined()
   })
 
-  test("does NOT decide on exit code alone: logged-in (EXIT=0) stays authenticated", () => {
-    // execFileSync returns stdout (success/EXIT=0) for both fixtures; only the
+  test("does not decide on exit code alone: logged-in (exit 0) stays authenticated", () => {
+    // execFileSync returns stdout (success, exit 0) for both fixtures; only the
     // parsed accountType distinguishes them, never the exit code.
     spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
     mockHome()
@@ -264,21 +264,21 @@ describe("verifyAuth: whoami --format json detection rule", () => {
 })
 
 // ---------------------------------------------------------------------------
-// verifyAuthAsync() (SDK 3.1.0): the additive async twin of verifyAuth().
-// Locks probe equivalence across the fixture matrix, the SHARED 5s memo (both
+// verifyAuthAsync(): the additive async twin of verifyAuth(). These tests cover
+// probe equivalence across the fixture matrix, the shared 5s memo (both
 // directions), in-flight coalescing, the never-rejects contract, the verbatim
 // 10s timeouts, and win32 `shell` resolution on the async spawns. Same
 // no-real-spawn conventions as above, with execFile mocked via mockKiroCliAsync.
 //
-// NOT asserted here (deliberate, per Task 01 Step 4): resetAuthCache() does NOT
-// cancel an in-flight async probe — the probe completes and re-memos.
+// Not asserted here (deliberate): resetAuthCache() does not cancel an in-flight
+// async probe; the probe completes and re-memos its result.
 // ---------------------------------------------------------------------------
 
 describe("verifyAuthAsync: async probe, shared memo, coalescing", () => {
   const spies: Array<{ mockRestore: () => void }> = []
   const tempHomes: string[] = []
 
-  // Both paths share ONE memo, so every case starts from a cold cache.
+  // Both paths share one memo, so every case starts from a cold cache.
   beforeEach(resetAuthCache)
 
   afterEach(() => {
@@ -427,7 +427,7 @@ describe("verifyAuthAsync: async probe, shared memo, coalescing", () => {
 
   // --- in-flight coalescing --------------------------------------------------
 
-  test("concurrent verifyAuthAsync calls coalesce onto ONE spawn pair", async () => {
+  test("concurrent verifyAuthAsync calls coalesce onto one spawn pair", async () => {
     mockHome()
     let release!: () => void
     const gate = new Promise<void>((resolve) => { release = resolve })
@@ -466,7 +466,7 @@ describe("verifyAuthAsync: async probe, shared memo, coalescing", () => {
     }
   })
 
-  test("async spawns branch shell on the REAL process.platform", async () => {
+  test("async spawns branch shell on the real process.platform", async () => {
     // Do not assume a non-win32 CI: assert against the actual platform.
     mockHome()
     const { calls } = mockAsync({ whoami: WHOAMI_LOGGED_IN })

@@ -12,10 +12,10 @@ import type { LanguageModelV3FunctionTool, LanguageModelV3CallOptions, LanguageM
 import { mock } from "bun:test"
 
 // ---------------------------------------------------------------------------
-// Tests for Task 08: Tools File Validation (ensureToolsFileReady)
+// Tools file validation (ensureToolsFileReady)
 //
 // ensureToolsFileReady() is a private method on KiroACPLanguageModel.
-// We test it by creating a model with a mock client and calling doStream()
+// It is exercised by creating a model with a mock client and calling doStream()
 // with tools, which triggers acquireSession() -> ensureToolsFileReady().
 //
 // The key insight: createSessionToolsFilePath returns a path we control,

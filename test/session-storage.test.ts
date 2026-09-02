@@ -169,7 +169,7 @@ describe("session-storage", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Task 03: XDG Windows fallback — getXdgDataHome() tests
+// XDG Windows fallback: getXdgDataHome()
 // ---------------------------------------------------------------------------
 
 describe("getXdgDataHome", () => {

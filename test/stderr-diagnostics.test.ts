@@ -2,10 +2,10 @@ import { describe, test, expect } from "bun:test"
 import { ACPClient, KiroACPError, KiroACPConnectionError } from "../src/acp-client"
 
 // ---------------------------------------------------------------------------
-// Tests for Task 06: Stderr Diagnostics
+// Stderr diagnostics
 //
 // formatRecentStderr() and createTimeoutError() are private methods.
-// We test them indirectly by accessing via type casting to `any`.
+// They are exercised directly by casting the client to `any`.
 // ---------------------------------------------------------------------------
 
 describe("stderr diagnostics", () => {
