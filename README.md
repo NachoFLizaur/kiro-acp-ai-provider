@@ -15,7 +15,7 @@ npm install kiro-acp-ai-provider @ai-sdk/provider
 
 ## Prerequisites
 
-- **Node.js 18+** or **Bun**
+- **Node.js 20+** (enforced via `engines.node`) or **Bun**
 - **kiro-cli** installed and authenticated:
   ```bash
   kiro-cli login
@@ -62,6 +62,13 @@ const kiro = createKiroAcp({
   trustAllTools: true,            // Auto-approve all tool calls
   agentPrompt: "You are a ...",   // Custom system prompt
   contextWindow: 200_000,         // Max context window in tokens (default: 1_000_000)
+  contextWindows: {               // Per-model context windows keyed by model ID;
+    "claude-sonnet-4.6": 200_000, // takes precedence over contextWindow for that model
+  },
+  effort: "high",                 // Reasoning effort for every model from this provider
+  efforts: {                      // Per-model reasoning effort keyed by model ID;
+    "claude-sonnet-4.6": "low",   // takes precedence over effort for that model
+  },
   mcpTimeout: 30,                 // MCP tool call timeout in minutes (default: 30)
   sessionId: "previous-id",       // Resume an existing session
   env: { MY_VAR: "value" },       // Extra env vars for kiro-cli

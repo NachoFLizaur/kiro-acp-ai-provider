@@ -139,6 +139,6 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 docs/
 
-# Corvus task planning artifacts
+# local planning/scratch dirs
 .corvus/
 .kiro/

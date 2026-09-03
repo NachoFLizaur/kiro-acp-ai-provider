@@ -266,8 +266,10 @@ let inflightProbe: Promise<AuthStatus> | null = null
  * kiro-cli spawns never block the event loop. Concurrent callers coalesce
  * onto one in-flight probe (see inflightProbe). Never rejects.
  *
- * Note: resetAuthCache() drops the memo but deliberately leaves an in-flight
- * probe untouched; it still completes and re-memos its result.
+ * Note: an in-flight probe always completes and re-memos its result, even if
+ * the memo expires or is cleared while it is running.
+ *
+ * @since 3.1.0
  */
 export async function verifyAuthAsync(): Promise<AuthStatus> {
   if (authCache && Date.now() < authCache.expiresAt) return authCache.value
