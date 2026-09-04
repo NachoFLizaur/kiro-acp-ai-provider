@@ -1247,6 +1247,7 @@ describe("KiroACPLanguageModel", () => {
           kiro: {
             contextUsagePercentage: 0.035,
             turnDurationMs: 2500,
+            turnWallMs: expect.any(Number),
             credits: 0.03,
             creditsUnit: "credit",
           },
@@ -1284,6 +1285,7 @@ describe("KiroACPLanguageModel", () => {
           kiro: {
             contextUsagePercentage: null,
             turnDurationMs: 3200,
+            turnWallMs: expect.any(Number),
             credits: null,
             creditsUnit: null,
           },
@@ -3787,5 +3789,747 @@ describe("KiroACPLanguageModel", () => {
       expect(mainPrompt.mock.calls.length).toBe(1)
       expect(ephemeralPrompt.mock.calls.length).toBe(1) // unchanged
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Stall watchdog
+//
+// Contract: when kiro-cli sends nothing for `stall.afterMs`, the turn counts
+// as stalled. With `live: "reasoning"` (default) a reasoning fragment with its
+// own id narrates the stall and is closed when output resumes or the turn
+// ends. Whenever a turn stalled, the final text-end / reasoning-end carries
+// `providerMetadata.kiro.status = { stalledMs, hint? }` next to the credits.
+// No stall: no `status` key. `afterMs: 0` turns the whole feature off.
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Short silence threshold so the tests stay fast. */
+const STALL_AFTER_MS = 100
+/** Silence long enough for the watchdog to fire at least once, with margin. */
+const STALL_GAP_MS = 260
+
+const FIRST_NOTICE = "Kiro: no output for 0.1s - the model may be overloaded and kiro-cli is retrying."
+const SECOND_NOTICE = "\nKiro: no output for 0.2s - the model may be overloaded and kiro-cli is retrying."
+
+const USER_TURN: LanguageModelV3Prompt = [{ role: "user", content: [{ type: "text", text: "hello" }] }]
+
+type PartWithMetadata = Extract<LanguageModelV3StreamPart, { providerMetadata?: unknown }>
+
+/** The `kiro` record of a part's provider metadata, or undefined. */
+function kiroOf(part: LanguageModelV3StreamPart | undefined): Record<string, unknown> | undefined {
+  const metadata = (part as PartWithMetadata | undefined)?.providerMetadata as
+    | { kiro?: Record<string, unknown> }
+    | undefined
+  return metadata?.kiro
+}
+
+/** Assert a well-formed stall status and return it. */
+function expectStallStatus(kiro: Record<string, unknown> | undefined): { stalledMs: number; hint?: string } {
+  expect(kiro).toBeDefined()
+  const status = kiro!.status as { stalledMs: number; hint?: string } | undefined
+  expect(status).toBeDefined()
+  expect(typeof status!.stalledMs).toBe("number")
+  expect(status!.stalledMs).toBeGreaterThanOrEqual(STALL_AFTER_MS)
+  expect(status!.stalledMs).toBeLessThan(10_000)
+  // Only the documented keys, ever
+  for (const key of Object.keys(status!)) expect(["stalledMs", "hint"]).toContain(key)
+  return status!
+}
+
+function partsOfType<T extends LanguageModelV3StreamPart["type"]>(
+  parts: LanguageModelV3StreamPart[],
+  type: T,
+): Array<Extract<LanguageModelV3StreamPart, { type: T }>> {
+  return parts.filter((p) => p.type === type) as Array<Extract<LanguageModelV3StreamPart, { type: T }>>
+}
+
+async function streamWithStall(
+  client: ACPClient,
+  stall: KiroACPModelConfig["stall"],
+): Promise<LanguageModelV3StreamPart[]> {
+  const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, stall })
+  const result = await model.doStream(makeCallOptions(USER_TURN))
+  return collectStream(result.stream)
+}
+
+/**
+ * Record every timer armed with exactly `delayMs` (the watchdog's own value,
+ * chosen to be distinctive) and whether it later fired or was cleared. Real
+ * timers keep running underneath, so behaviour is unchanged.
+ */
+function trackTimersWithDelay(delayMs: number) {
+  const timers = new Map<unknown, { fired: boolean; cleared: boolean }>()
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    ms?: number,
+    ...args: unknown[]
+  ) => {
+    if (ms !== delayMs) return realSetTimeout(fn, ms, ...args)
+    const entry = { fired: false, cleared: false }
+    const handle = realSetTimeout(() => {
+      entry.fired = true
+      fn(...args)
+    }, ms)
+    timers.set(handle, entry)
+    return handle
+  }) as unknown as typeof setTimeout)
+  const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(((handle: unknown) => {
+    const entry = timers.get(handle)
+    if (entry) entry.cleared = true
+    return realClearTimeout(handle as Parameters<typeof clearTimeout>[0])
+  }) as unknown as typeof clearTimeout)
+  return {
+    timers,
+    restore() {
+      setSpy.mockRestore()
+      clearSpy.mockRestore()
+    },
+  }
+}
+
+describe("doStream() - stall watchdog", () => {
+  test("narrates a stall before the first output and closes the notice when output resumes", async () => {
+    // Arrange
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "late answer" } })
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+    const types = parts.map((p) => p.type)
+
+    // Assert: stream-start exactly once, and first
+    expect(types.filter((t) => t === "stream-start")).toHaveLength(1)
+    expect(types[0]).toBe("stream-start")
+
+    // The notice is its own reasoning fragment, opened before the text
+    const noticeStarts = partsOfType(parts, "reasoning-start")
+    expect(noticeStarts).toHaveLength(1)
+    expect(noticeStarts[0].id).toBe("stall-0-1")
+
+    const noticeDeltas = partsOfType(parts, "reasoning-delta")
+      .filter((p) => p.id === "stall-0-1")
+      .map((p) => p.delta)
+    expect(noticeDeltas[0]).toBe(FIRST_NOTICE)
+    expect(noticeDeltas.at(-1)).toMatch(/^\noutput resumed after \d+(\.\d)?s$/)
+
+    const noticeEndIndex = parts.findIndex((p) => p.type === "reasoning-end" && p.id === "stall-0-1")
+    const textStartIndex = types.indexOf("text-start")
+    expect(noticeEndIndex).toBeGreaterThan(-1)
+    expect(noticeEndIndex).toBeLessThan(textStartIndex)
+
+    // A notice closed by resumed output carries no metadata itself
+    expect(kiroOf(parts[noticeEndIndex])).toBeUndefined()
+
+    // The final text-end reports the stall
+    const textEnd = partsOfType(parts, "text-end")
+    expect(textEnd).toHaveLength(1)
+    expectStallStatus(kiroOf(textEnd[0]))
+    expect(types).toContain("finish")
+  })
+
+  test("repeats the notice while the silence continues", async () => {
+    // Arrange: silence for four thresholds before the first chunk
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        await sleep(STALL_AFTER_MS * 4 + 60)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "finally" } })
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+    // Assert: one fragment, several notices, then the resume line
+    expect(partsOfType(parts, "reasoning-start")).toHaveLength(1)
+    const deltas = partsOfType(parts, "reasoning-delta").map((p) => p.delta)
+    const notices = deltas.filter((d) => d.includes("Kiro: no output for"))
+    expect(notices.length).toBeGreaterThanOrEqual(2)
+    expect(notices[0]).toBe(FIRST_NOTICE)
+    expect(notices[1]).toBe(SECOND_NOTICE)
+    expect(deltas.at(-1)).toMatch(/^\noutput resumed after/)
+  })
+
+  test("closes the text block for the notice and continues the text afterwards", async () => {
+    // Arrange: text, silence, more text
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "Hello" } })
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: " world" } })
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+    const types = parts.map((p) => p.type)
+
+    // Assert: the notice never lands inside the text block
+    const noticeStart = types.indexOf("reasoning-start")
+    const noticeEnd = types.indexOf("reasoning-end")
+    const firstTextEnd = types.indexOf("text-end")
+    const secondTextStart = types.lastIndexOf("text-start")
+    expect(firstTextEnd).toBeLessThan(noticeStart)
+    expect(noticeEnd).toBeLessThan(secondTextStart)
+
+    // Text is delivered in full across the two segments
+    const text = partsOfType(parts, "text-delta").map((p) => p.delta).join("")
+    expect(text).toBe("Hello world")
+
+    // Only the final text-end carries the status
+    const textEnds = partsOfType(parts, "text-end")
+    expect(textEnds).toHaveLength(2)
+    expect(kiroOf(textEnds[0])).toBeUndefined()
+    expectStallStatus(kiroOf(textEnds[1]))
+    expect(types.filter((t) => t === "stream-start")).toHaveLength(1)
+  })
+
+  test("with live off, streams no notice but still reports the status", async () => {
+    // Arrange
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS, live: "off" })
+    const types = parts.map((p) => p.type)
+
+    // Assert
+    expect(types).not.toContain("reasoning-start")
+    expect(types).not.toContain("reasoning-delta")
+    expect(types).not.toContain("reasoning-end")
+    const textEnd = partsOfType(parts, "text-end")[0]
+    expectStallStatus(kiroOf(textEnd))
+  })
+
+  test("afterMs 0 disables the watchdog entirely", async () => {
+    // Arrange
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: 0 })
+    const types = parts.map((p) => p.type)
+
+    // Assert: no notice, no status, finish carries only the wall clock
+    expect(types).not.toContain("reasoning-start")
+    const textEnd = partsOfType(parts, "text-end")[0]
+    expect(kiroOf(textEnd)).toBeUndefined()
+    const finish = partsOfType(parts, "finish")[0]
+    expect(finish.providerMetadata).toEqual({ kiro: { turnWallMs: expect.any(Number) } })
+  })
+
+  test("adds no status while output keeps arriving under the threshold", async () => {
+    // Arrange: three chunks, each well within the threshold
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        for (const text of ["one ", "two ", "three"]) {
+          await sleep(40)
+          opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text } })
+        }
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: 200 })
+    const types = parts.map((p) => p.type)
+
+    // Assert
+    expect(types).not.toContain("reasoning-start")
+    const textEnd = partsOfType(parts, "text-end")[0]
+    expect(kiroOf(textEnd)).toBeUndefined()
+    expect(types).toContain("finish")
+  })
+
+  test("attaches the status next to the credits on the final text-end", async () => {
+    // Arrange
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+      getMetadata: mock(() => ({
+        sessionId: "sess-1",
+        turnDurationMs: 900,
+        meteringUsage: [{ unit: "credit", unitPlural: "credits", value: 0.05 }],
+      })),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+    // Assert: one object carrying both
+    const textEnd = partsOfType(parts, "text-end")[0]
+    const kiro = kiroOf(textEnd)!
+    expect(kiro.credits).toBe(0.05)
+    expect(kiro.creditsUnit).toBe("credit")
+    expectStallStatus(kiro)
+    expect(Object.keys(kiro).sort()).toEqual(["credits", "creditsUnit", "status"])
+
+    // Finish still mirrors credits and kiro's own duration untouched
+    const finish = partsOfType(parts, "finish")[0]
+    expect(finish.providerMetadata).toEqual({
+      kiro: {
+        contextUsagePercentage: null,
+        turnDurationMs: 900,
+        turnWallMs: expect.any(Number),
+        credits: 0.05,
+        creditsUnit: "credit",
+      },
+    })
+  })
+
+  test("reports the status even when the turn carries no credits", async () => {
+    // Arrange: metadata present but no credit entry
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+      getMetadata: mock(() => ({
+        sessionId: "sess-1",
+        meteringUsage: [{ unit: "token", unitPlural: "tokens", value: 1000 }],
+      })),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+    // Assert: status alone, no credit keys invented
+    const kiro = kiroOf(partsOfType(parts, "text-end")[0])!
+    expectStallStatus(kiro)
+    expect(Object.keys(kiro)).toEqual(["status"])
+  })
+
+  test("puts the same status on reasoning-end and text-end when both blocks close at the end", async () => {
+    // Arrange: stall first, then reasoning and text without further gaps
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_thought_chunk", content: { text: "thinking" } })
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+      getMetadata: mock(() => ({
+        sessionId: "sess-1",
+        meteringUsage: [{ unit: "credit", unitPlural: "credits", value: 0.07 }],
+      })),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+    // Assert: the model's own reasoning-end and the text-end carry one shape
+    const modelReasoningEnd = partsOfType(parts, "reasoning-end").find((p) => p.id === "reasoning-0")
+    const textEnd = partsOfType(parts, "text-end")[0]
+    expect(modelReasoningEnd).toBeDefined()
+    const onReasoning = kiroOf(modelReasoningEnd)
+    const onText = kiroOf(textEnd)
+    expectStallStatus(onReasoning)
+    expect(onReasoning).toEqual(onText)
+    expect(onText!.credits).toBe(0.07)
+
+    // Exactly two parts carry the status: the dedupe rule stays two-per-turn
+    const carriers = parts.filter((p) => kiroOf(p)?.status !== undefined)
+    expect(carriers).toHaveLength(2)
+  })
+
+  test("closes the model's reasoning block before the notice when the stall hits mid-reasoning", async () => {
+    // Arrange
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        opts.onUpdate({ sessionUpdate: "agent_thought_chunk", content: { text: "thinking" } })
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+    // Assert: model reasoning closed (no metadata), then the notice, then text
+    const modelReasoningEnd = parts.findIndex((p) => p.type === "reasoning-end" && p.id === "reasoning-0")
+    const noticeStart = parts.findIndex((p) => p.type === "reasoning-start" && p.id === "stall-0-1")
+    const noticeEnd = parts.findIndex((p) => p.type === "reasoning-end" && p.id === "stall-0-1")
+    const textStart = parts.findIndex((p) => p.type === "text-start")
+    expect(modelReasoningEnd).toBeGreaterThan(-1)
+    expect(modelReasoningEnd).toBeLessThan(noticeStart)
+    expect(noticeEnd).toBeLessThan(textStart)
+    expect(kiroOf(parts[modelReasoningEnd])).toBeUndefined()
+
+    // The text-end is the only part carrying the status
+    const carriers = parts.filter((p) => kiroOf(p)?.status !== undefined)
+    expect(carriers).toHaveLength(1)
+    expect(carriers[0].type).toBe("text-end")
+    expectStallStatus(kiroOf(carriers[0]))
+  })
+
+  test("reports the stall on the notice itself when the turn fails without further output", async () => {
+    // Arrange
+    const client = createMockClient({
+      prompt: mock(async () => {
+        await sleep(STALL_GAP_MS)
+        throw new Error("boom")
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+    const types = parts.map((p) => p.type)
+
+    // Assert: no text ever opened, so the notice fragment carries the status
+    expect(types).not.toContain("text-start")
+    expect(types).not.toContain("finish")
+    const noticeDeltas = partsOfType(parts, "reasoning-delta").map((p) => p.delta)
+    expect(noticeDeltas[0]).toBe(FIRST_NOTICE)
+    expect(noticeDeltas.at(-1)).toMatch(/^\nturn ended after \d+(\.\d)?s without further output$/)
+
+    const noticeEnd = partsOfType(parts, "reasoning-end").find((p) => p.id === "stall-0-1")
+    const kiro = kiroOf(noticeEnd)!
+    expectStallStatus(kiro)
+    expect(Object.keys(kiro)).toEqual(["status"])
+
+    const errorPart = partsOfType(parts, "error")[0]
+    expect((errorPart.error as Error).message).toBe("boom")
+    expect(types.indexOf("reasoning-end")).toBeLessThan(types.indexOf("error"))
+  })
+
+  test("reports the stall on a cancelled turn without reading credits", async () => {
+    // Arrange
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "partial" } })
+        return { stopReason: "cancelled" }
+      }),
+      getMetadata: mock(() => ({
+        sessionId: "sess-1",
+        meteringUsage: [{ unit: "credit", unitPlural: "credits", value: 0.05 }],
+      })),
+    } as unknown as Partial<ACPClient>)
+
+    // Act
+    const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+    const types = parts.map((p) => p.type)
+
+    // Assert
+    expect(types).not.toContain("finish")
+    expect((partsOfType(parts, "error")[0].error as Error).message).toBe("Request was cancelled by user")
+    const kiro = kiroOf(partsOfType(parts, "text-end")[0])!
+    expectStallStatus(kiro)
+    expect(Object.keys(kiro)).toEqual(["status"])
+  })
+
+  test("attaches the newest kiro-cli error line written during the turn as the hint", async () => {
+    // Arrange: append a fresh ERROR line to the real kiro-cli log while the
+    // turn is stalled, then trim the log back to its original size afterwards
+    // so the developer's own log is left as it was.
+    const { kiroChatLogPath } = await import("../src/kiro-log-hint")
+    const { appendFileSync, statSync, truncateSync, unlinkSync, rmdirSync } = await import("node:fs")
+    const { dirname } = await import("node:path")
+    const logPath = kiroChatLogPath()
+    const logDir = dirname(logPath)
+    const dirExisted = existsSync(logDir)
+    const fileExisted = existsSync(logPath)
+    const originalSize = fileExisted ? statSync(logPath).size : 0
+    if (!dirExisted) mkdirSync(logDir, { recursive: true })
+    const marker = `test-marker-${Date.now().toString(36)}`
+
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        // Stamped after the prompt started, so the reader accepts it
+        const stamp = new Date().toISOString().replace("Z", "000Z")
+        appendFileSync(
+          logPath,
+          `${stamp} \x1b[31mERROR\x1b[0m chat_cli_v2::agent::rts: failed to send rts request err=ModelOverloadedError ${marker}\n`,
+        )
+        await sleep(STALL_GAP_MS)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    try {
+      // Act
+      const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+      // Assert
+      const status = expectStallStatus(kiroOf(partsOfType(parts, "text-end")[0]))
+      expect(status.hint).toBeDefined()
+      expect(status.hint).toContain("ERROR chat_cli_v2::agent::rts: failed to send rts request")
+      expect(status.hint).toContain(marker)
+      expect(status.hint).not.toContain("\x1b")
+      expect(status.hint!.length).toBeLessThanOrEqual(160)
+    } finally {
+      if (fileExisted) {
+        truncateSync(logPath, originalSize)
+      } else {
+        try {
+          unlinkSync(logPath)
+        } catch {
+          // Already gone
+        }
+        if (!dirExisted) {
+          try {
+            rmdirSync(logDir)
+          } catch {
+            // Not empty or already gone
+          }
+        }
+      }
+    }
+  })
+
+  test("carries the stall total across a tool-call segment to the final text-end", async () => {
+    // Arrange: segment 1 stalls, then a tool call arrives; segment 2 resumes
+    // with the tool result and finishes with text.
+    const laneRouter = new LaneRouter()
+    const mockIPC = createMockIPCServer({
+      getLaneRouter: mock(() => laneRouter),
+      resolveToolResult: mock(() => {}),
+    })
+    let promptResolve: ((value: { stopReason: string }) => void) | null = null
+    let resumedOnUpdate: ((update: SessionUpdate) => void) | null = null
+
+    const client = createMockClient({
+      getIPCServer: mock(() => mockIPC),
+      getLaneRouter: mock(() => laneRouter),
+      setPromptCallback: mock((_sessionId: string, cb: (update: SessionUpdate) => void) => {
+        resumedOnUpdate = cb
+      }),
+      prompt: mock(async () => {
+        await sleep(STALL_GAP_MS)
+        laneRouter.route({ callId: "tc-stall", toolName: "bash", args: { command: "ls" } })
+        return new Promise<{ stopReason: string }>((resolve) => {
+          promptResolve = resolve
+        })
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, stall: { afterMs: STALL_AFTER_MS } })
+
+    // Act 1: first segment ends in a tool call
+    const result1 = await model.doStream(makeCallOptions(USER_TURN))
+    const parts1 = await collectStream(result1.stream)
+    const types1 = parts1.map((p) => p.type)
+
+    // Assert 1: the notice was closed by the tool call; no status on this segment
+    expect(types1).toContain("tool-call")
+    expect(partsOfType(parts1, "reasoning-start")[0].id).toBe("stall-0-1")
+    expect(partsOfType(parts1, "reasoning-delta").map((p) => p.delta).at(-1)).toMatch(/^\noutput resumed after/)
+    expect(parts1.some((p) => kiroOf(p)?.status !== undefined)).toBe(false)
+    expect(partsOfType(parts1, "finish")[0].finishReason.unified).toBe("tool-calls")
+
+    // Act 2: resume with the tool result; kiro answers promptly
+    setTimeout(() => {
+      resumedOnUpdate?.({ sessionUpdate: "agent_message_chunk", content: { text: "done" } })
+      promptResolve?.({ stopReason: "end_turn" })
+    }, 30)
+    const result2 = await model.doStream(
+      makeCallOptions([
+        ...USER_TURN,
+        {
+          role: "assistant",
+          content: [{ type: "tool-call", toolCallId: "tc-stall", toolName: "bash", input: JSON.stringify({ command: "ls" }) }],
+        },
+        {
+          role: "tool",
+          content: [
+            { type: "tool-result", toolCallId: "tc-stall", toolName: "bash", output: { type: "text" as const, value: "ok" } },
+          ],
+        },
+      ]),
+    )
+    const parts2 = await collectStream(result2.stream)
+
+    // Assert 2: no new stall in segment 2, yet the earlier total is reported
+    expect(partsOfType(parts2, "reasoning-start")).toHaveLength(0)
+    const textEnd = partsOfType(parts2, "text-end")[0]
+    expectStallStatus(kiroOf(textEnd))
+    expect(partsOfType(parts2, "finish")[0].finishReason.unified).toBe("stop")
+  })
+
+  describe("timer lifecycle", () => {
+    const WATCHDOG_MS = 137
+
+    test("leaves no armed watchdog timer after the turn finishes", async () => {
+      const tracker = trackTimersWithDelay(WATCHDOG_MS)
+      try {
+        // Arrange
+        const client = createMockClient({
+          prompt: mock(async (opts: PromptOptions) => {
+            opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "fast" } })
+            return { stopReason: "end_turn" }
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        // Act
+        const parts = await streamWithStall(client, { afterMs: WATCHDOG_MS })
+
+        // Assert: the watchdog was armed, and every arming was cleared or fired
+        expect(parts.map((p) => p.type)).toContain("finish")
+        expect(tracker.timers.size).toBeGreaterThan(0)
+        for (const entry of tracker.timers.values()) {
+          expect(entry.cleared || entry.fired).toBe(true)
+        }
+        // Nothing fires late: no notice was ever produced for a fast turn
+        await sleep(WATCHDOG_MS + 60)
+        for (const entry of tracker.timers.values()) expect(entry.fired).toBe(false)
+      } finally {
+        tracker.restore()
+      }
+    })
+
+    test("leaves no armed watchdog timer after the turn fails", async () => {
+      const tracker = trackTimersWithDelay(WATCHDOG_MS)
+      try {
+        const client = createMockClient({
+          prompt: mock(async () => {
+            throw new Error("boom")
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        const parts = await streamWithStall(client, { afterMs: WATCHDOG_MS })
+
+        expect(parts.map((p) => p.type)).toContain("error")
+        expect(tracker.timers.size).toBeGreaterThan(0)
+        for (const entry of tracker.timers.values()) {
+          expect(entry.cleared || entry.fired).toBe(true)
+        }
+        await sleep(WATCHDOG_MS + 60)
+        for (const entry of tracker.timers.values()) expect(entry.fired).toBe(false)
+      } finally {
+        tracker.restore()
+      }
+    })
+
+    test("leaves no armed watchdog timer after tool calls are flushed", async () => {
+      const tracker = trackTimersWithDelay(WATCHDOG_MS)
+      const laneRouter = new LaneRouter()
+      let promptResolve: ((value: { stopReason: string }) => void) | null = null
+      try {
+        const client = createMockClient({
+          getLaneRouter: mock(() => laneRouter),
+          prompt: mock(async (opts: PromptOptions) => {
+            opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "Let me check" } })
+            laneRouter.route({ callId: "tc-timer", toolName: "bash", args: { command: "ls" } })
+            return new Promise<{ stopReason: string }>((resolve) => {
+              promptResolve = resolve
+            })
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        const parts = await streamWithStall(client, { afterMs: WATCHDOG_MS })
+
+        // The segment closed on the tool call; the prompt itself is still pending
+        expect(parts.map((p) => p.type)).toContain("tool-call")
+        expect(tracker.timers.size).toBeGreaterThan(0)
+        for (const entry of tracker.timers.values()) {
+          expect(entry.cleared || entry.fired).toBe(true)
+        }
+        await sleep(WATCHDOG_MS + 60)
+        for (const entry of tracker.timers.values()) expect(entry.fired).toBe(false)
+      } finally {
+        tracker.restore()
+        promptResolve?.({ stopReason: "end_turn" })
+        await sleep(10)
+      }
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// turnWallMs on the finish part
+// ---------------------------------------------------------------------------
+
+describe("doStream() - turnWallMs", () => {
+  test("reports the provider-measured wall clock next to kiro's own duration", async () => {
+    // Arrange: kiro reports its own figure; the provider measures independently
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        await sleep(120)
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+      getMetadata: mock(() => ({ sessionId: "sess-1", turnDurationMs: 2500 })),
+    } as unknown as Partial<ACPClient>)
+    const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+    // Act
+    const result = await model.doStream(makeCallOptions(USER_TURN))
+    const parts = await collectStream(result.stream)
+
+    // Assert
+    const kiro = kiroOf(partsOfType(parts, "finish")[0])!
+    expect(kiro.turnDurationMs).toBe(2500)
+    expect(typeof kiro.turnWallMs).toBe("number")
+    expect(kiro.turnWallMs as number).toBeGreaterThanOrEqual(100)
+    expect(kiro.turnWallMs as number).toBeLessThan(10_000)
+  })
+
+  test("is the only key when kiro-cli reports no session metadata", async () => {
+    // Arrange
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+    const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+    // Act
+    const result = await model.doStream(makeCallOptions(USER_TURN))
+    const parts = await collectStream(result.stream)
+
+    // Assert: no fabricated turnDurationMs, context usage or credit keys
+    const finish = partsOfType(parts, "finish")[0]
+    expect(finish.providerMetadata).toEqual({ kiro: { turnWallMs: expect.any(Number) } })
+    const kiro = kiroOf(finish)!
+    expect(Object.keys(kiro)).toEqual(["turnWallMs"])
+    expect(kiro.turnWallMs as number).toBeGreaterThanOrEqual(0)
+  })
+
+  test("keeps the null fallback for turnDurationMs when kiro reports metadata without it", async () => {
+    // Arrange
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+        return { stopReason: "end_turn" }
+      }),
+      getMetadata: mock(() => ({ sessionId: "sess-1", contextUsagePercentage: 0.1 })),
+    } as unknown as Partial<ACPClient>)
+    const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+
+    // Act
+    const result = await model.doStream(makeCallOptions(USER_TURN))
+    const parts = await collectStream(result.stream)
+
+    // Assert
+    const kiro = kiroOf(partsOfType(parts, "finish")[0])!
+    expect(kiro.turnDurationMs).toBeNull()
+    expect(typeof kiro.turnWallMs).toBe("number")
   })
 })

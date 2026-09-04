@@ -1,6 +1,6 @@
 import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { ACPClient, type ACPClientOptions, type PermissionRequest, type PermissionDecision } from "./acp-client"
-import { KiroACPLanguageModel } from "./kiro-acp-model"
+import { KiroACPLanguageModel, type KiroACPStallSettings } from "./kiro-acp-model"
 import type { KiroEffort } from "./kiro-effort"
 
 // ---------------------------------------------------------------------------
@@ -31,6 +31,25 @@ export interface KiroACPProviderSettings {
   efforts?: Record<string, KiroEffort>
   /** MCP tool call timeout in minutes. Default: 30. */
   mcpTimeout?: number
+  /**
+   * Stall watchdog: how long kiro-cli may stay silent during a turn before
+   * the turn counts as stalled, and whether to narrate the stall live.
+   *
+   * - `afterMs` (default `10_000`): silence threshold in ms; `0` disables
+   *   the watchdog entirely.
+   * - `live` (default `"reasoning"`): `"reasoning"` streams a reasoning
+   *   fragment while the turn is stalled (`Kiro: no output for 10s - ...`,
+   *   refreshed every `afterMs`, closed with `output resumed after Ns`);
+   *   `"off"` streams nothing.
+   *
+   * Whenever a turn stalled, its final `text-end`/`reasoning-end` carries
+   * `providerMetadata.kiro.status = { stalledMs, hint? }` next to the
+   * credits; `hint` is the newest ERROR line kiro-cli wrote to its own
+   * chat log during the turn, when readable.
+   *
+   * @since 3.2.0
+   */
+  stall?: KiroACPStallSettings
 }
 
 export interface KiroACPModelOverrides {
@@ -114,6 +133,7 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
         overrides?.effort ??
         settings.efforts?.[modelId] ??
         settings.effort,
+      stall: settings.stall,
       getEphemeralClient,
       affinityPrompts,
     })

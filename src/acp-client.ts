@@ -1,4 +1,7 @@
-import { spawn, execFileSync, type ChildProcess } from "node:child_process"
+// Namespace import (not destructured) so tests can replace `execFile` and
+// `spawn` on the module object; a named import would capture the originals.
+import * as childProcess from "node:child_process"
+import type { ChildProcess } from "node:child_process"
 import { createInterface, type Interface as ReadlineInterface } from "node:readline"
 import { createHash, randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
@@ -6,7 +9,7 @@ import { dirname, join, isAbsolute } from "node:path"
 import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { getXdgDataHome } from "./session-storage"
-import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig } from "./agent-config"
+import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig, removeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 import type { KiroEffort } from "./kiro-effort"
@@ -239,6 +242,82 @@ interface PendingRequest {
 const DEFAULT_REQUEST_TIMEOUT_MS = 300_000 // 5 minutes (prompts can be long)
 const INITIALIZE_TIMEOUT_MS = 30_000
 const STOP_TIMEOUT_MS = 10_000
+const SETTINGS_EXEC_TIMEOUT_MS = 5_000
+
+/**
+ * Memo for `kiro-cli settings mcp.noInteractiveTimeout <value>`, keyed by the
+ * stringified timeout value. The setting is a user-level kiro-cli preference,
+ * so it only needs to be applied once per process for each distinct value,
+ * not on every client start.
+ *
+ * Invariants:
+ * - Key: `String(mcpTimeout ?? 30)` - the exact value passed to kiro-cli.
+ * - Once per process per value: concurrent or repeated `start()` calls with
+ *   the same value share a single child process; a different value runs its
+ *   own one-time exec.
+ * - Ordering: `start()` awaits the memoized promise before spawning
+ *   `kiro-cli acp`, so the setting is in place when the agent process reads it.
+ * - Failure direction: best-effort, matching the previous synchronous call.
+ *   Errors (missing binary, non-zero exit, timeout) are swallowed and the
+ *   promise resolves. The failed entry is evicted from the memo so a later
+ *   `start()` retries instead of trusting a failed attempt for the rest of
+ *   the process lifetime.
+ */
+const settingsApplied = new Map<string, Promise<void>>()
+
+/**
+ * Drop every memoized settings attempt so the next `start()` re-applies the
+ * MCP timeout setting. Does not cancel an in-flight exec; its result is simply
+ * no longer remembered. Intended for tests; not part of the package entry point.
+ */
+export function resetMcpTimeoutSettingMemo(): void {
+  settingsApplied.clear()
+}
+
+/**
+ * Apply the MCP tool timeout setting once per process per value. Never rejects.
+ * See `settingsApplied` for the memo contract.
+ */
+function ensureMcpTimeoutSetting(value: string): Promise<void> {
+  const memoized = settingsApplied.get(value)
+  if (memoized) return memoized
+
+  let settle!: (failed: boolean) => void
+  const attempt = new Promise<void>((resolve) => {
+    let settled = false
+    settle = (failed) => {
+      if (settled) return
+      settled = true
+      // Evict only this attempt's own entry, never a newer one for the same key.
+      if (failed && settingsApplied.get(value) === attempt) settingsApplied.delete(value)
+      resolve()
+    }
+  })
+  // Register before running so a callback that fires synchronously (possible
+  // with a mocked execFile) still finds and evicts the right entry.
+  settingsApplied.set(value, attempt)
+
+  try {
+    // On win32 a bare exec of "kiro-cli" does not resolve kiro-cli.exe via
+    // PATHEXT and uses no shell, so it can fail with ENOENT. shell:true on
+    // Windows resolves the .exe; elsewhere it is a no-op default.
+    childProcess.execFile(
+      "kiro-cli",
+      ["settings", "mcp.noInteractiveTimeout", value],
+      {
+        timeout: SETTINGS_EXEC_TIMEOUT_MS,
+        shell: process.platform === "win32", // resolve kiro-cli.exe / PATHEXT on Windows
+      },
+      (error) => settle(error != null),
+    )
+  } catch {
+    // execFile can throw synchronously on invalid arguments; treat it like
+    // any other failed attempt.
+    settle(true)
+  }
+
+  return attempt
+}
 
 export class ACPClient {
   private readonly options: ACPClientOptions
@@ -276,6 +355,13 @@ export class ACPClient {
   private resolvedBridgePath?: string
 
   private readonly sessionToolsFiles = new Set<string>()
+
+  /**
+   * Path of the agent config file this client last wrote, or null when none
+   * exists on disk. Set by every writeAgentConfig call and cleared by stop()
+   * after deletion, so a second stop() has nothing left to remove.
+   */
+  private agentConfigPath: string | null = null
 
   /**
    * Mutex for serializing agent config rewrites + session creation.
@@ -329,22 +415,16 @@ export class ACPClient {
       this.setupAgentConfig(toolsFilePath)
     }
 
-    // On win32 a bare spawn/execFileSync of "kiro-cli" does not resolve
-    // kiro-cli.exe via PATHEXT and uses no shell, so it can fail with ENOENT.
-    // shell:true on Windows resolves the .exe; elsewhere it is a no-op default.
+    // On win32 a bare spawn of "kiro-cli" does not resolve kiro-cli.exe via
+    // PATHEXT and uses no shell, so it can fail with ENOENT. shell:true on
+    // Windows resolves the .exe; elsewhere it is a no-op default.
     const isWin = process.platform === "win32"
 
     // Ensure MCP tool timeout is sufficient for long-running subagent tasks.
     // Default is 5 minutes which is too short for complex planning operations.
-    try {
-      execFileSync("kiro-cli", ["settings", "mcp.noInteractiveTimeout", String(this.options.mcpTimeout ?? 30)], {
-        timeout: 5000,
-        stdio: "ignore",
-        shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
-      })
-    } catch {
-      // Best-effort — setting may already be configured
-    }
+    // Applied once per process per value (see settingsApplied); awaited so the
+    // setting is in place before kiro-cli acp starts. Best-effort: never throws.
+    await ensureMcpTimeoutSetting(String(this.options.mcpTimeout ?? 30))
 
     const args = ["acp"]
     if (this.options.agent) {
@@ -352,7 +432,7 @@ export class ACPClient {
     }
     if (this.options.trustAllTools) args.push("--trust-all-tools")
 
-    this.process = spawn("kiro-cli", args, {
+    this.process = childProcess.spawn("kiro-cli", args, {
       cwd: this.options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...this.options.env },
@@ -430,32 +510,66 @@ export class ACPClient {
     return initResult
   }
 
+  /**
+   * Stop the client and release everything it owns.
+   *
+   * Two independent phases:
+   * 1. Terminate the child process - only when one is still running. Waits for
+   *    a clean exit, falling back to SIGTERM after STOP_TIMEOUT_MS.
+   * 2. Release resources - ALWAYS runs, even when the client never started or
+   *    the child already crashed. Closes the IPC server, deletes the tools
+   *    files and this client's own agent config file, rejects pending requests,
+   *    and clears in-memory session state.
+   *
+   * Idempotent: a second call finds nothing left to release and resolves
+   * without side effects. Each release step is guarded on its own, so one
+   * failure cannot skip the rest. Never throws.
+   */
   async stop(): Promise<void> {
-    if (!this.running || !this.process) return
-
-    this.running = false
-    this.process.stdin?.end()
-
     const proc = this.process
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        proc.kill("SIGTERM")
-        resolve()
-      }, STOP_TIMEOUT_MS)
+    if (this.running && proc) {
+      this.running = false
+      proc.stdin?.end()
 
-      proc.once("exit", () => {
-        clearTimeout(timer)
-        resolve()
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          proc.kill("SIGTERM")
+          resolve()
+        }, STOP_TIMEOUT_MS)
+
+        proc.once("exit", () => {
+          clearTimeout(timer)
+          resolve()
+        })
       })
-    })
+    }
+    this.running = false
 
-    this.readline?.close()
+    await this.releaseResources()
+  }
+
+  /**
+   * Release every resource this client may hold, regardless of whether the
+   * child process is (or ever was) running. Safe to call repeatedly: every
+   * step checks for and clears its own state, and every step is guarded so a
+   * failure in one cannot prevent the others from running.
+   */
+  private async releaseResources(): Promise<void> {
+    try {
+      this.readline?.close()
+    } catch {
+      // Already closed
+    }
     this.readline = null
     this.process = null
 
-    for (const [id, pending] of this.pending) {
-      pending.reject(new KiroACPConnectionError("Client stopped"))
-      clearTimeout(pending.timer ?? undefined)
+    for (const [, pending] of this.pending) {
+      try {
+        clearTimeout(pending.timer ?? undefined)
+        pending.reject(new KiroACPConnectionError("Client stopped"))
+      } catch {
+        // A rejection handler that throws must not block the rest of teardown
+      }
     }
     this.pending.clear()
     this.metadata.clear()
@@ -464,29 +578,43 @@ export class ACPClient {
     this.availableTools = []
     this.startedToolless = false
 
-    if (this.ipcServer) {
-      await this.ipcServer.stop()
-      this.ipcServer = null
-      this.ipcPort = null
+    const ipcServer = this.ipcServer
+    this.ipcServer = null
+    this.ipcPort = null
+    if (ipcServer) {
+      try {
+        await ipcServer.stop()
+      } catch {
+        // Server already closed or failed to close; nothing else depends on it
+      }
     }
 
-    if (this.toolsFilePath) {
+    const toolsFilePath = this.toolsFilePath
+    this.toolsFilePath = null
+    if (toolsFilePath) {
       try {
-        unlinkSync(this.toolsFilePath)
+        unlinkSync(toolsFilePath)
       } catch {
         // Already gone
       }
-      this.toolsFilePath = null
     }
 
-    for (const filePath of this.sessionToolsFiles) {
+    const sessionToolsFiles = [...this.sessionToolsFiles]
+    this.sessionToolsFiles.clear()
+    for (const filePath of sessionToolsFiles) {
       try {
         unlinkSync(filePath)
       } catch {
         // Already gone
       }
     }
-    this.sessionToolsFiles.clear()
+
+    if (this.agentConfigPath && this.options.agent) {
+      this.agentConfigPath = null
+      // removeAgentConfig is best-effort and derives the same path that
+      // writeAgentConfig produced for this name and instance.
+      removeAgentConfig(this.options.cwd, this.options.agent, this.instanceId)
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -748,7 +876,7 @@ export class ACPClient {
           cwd: this.options.cwd,
           prompt: this.options.agentPrompt,
         })
-        writeAgentConfig(this.options.cwd, this.options.agent, config, this.instanceId)
+        this.agentConfigPath = writeAgentConfig(this.options.cwd, this.options.agent, config, this.instanceId)
       }
 
       return await this.sendNewSession()
@@ -888,7 +1016,7 @@ export class ACPClient {
         name: this.uniqueAgentName,
         prompt: this.options.agentPrompt,
       })
-      writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
+      this.agentConfigPath = writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
       return // Early return — no MCP bridge needed for toolless startup
     }
 
@@ -900,7 +1028,7 @@ export class ACPClient {
       prompt: this.options.agentPrompt,
     })
 
-    writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
+    this.agentConfigPath = writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
   }
 
   /**

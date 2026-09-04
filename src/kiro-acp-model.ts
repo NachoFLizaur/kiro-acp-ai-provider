@@ -22,6 +22,7 @@ import { interceptSessionAffinity } from "./session-affinity"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
+import { readStallHint } from "./kiro-log-hint"
 
 // ---------------------------------------------------------------------------
 // Data conversion helpers
@@ -93,6 +94,30 @@ interface PendingTurnState {
   outputCharCount: number
   streamSegment: number
   promptAbort: AbortController
+  /** Stall accounting carried across tool-call segments of the same turn. */
+  stalledMs: number
+  stallHint: string | undefined
+}
+
+/**
+ * Stall watchdog settings. A turn is "stalled" when kiro-cli has sent no
+ * session/update for `afterMs`; this typically means the model backend is
+ * overloaded and kiro-cli is retrying without telling the client.
+ *
+ * @since 3.2.0
+ */
+export interface KiroACPStallSettings {
+  /**
+    * Silence (ms) after which a turn counts as stalled. Default: 10_000.
+   * `0` disables the watchdog: no live fragments, no `kiro.status` metadata.
+   */
+  afterMs?: number
+  /**
+   * Live channel for stall notices. `"reasoning"` (default) streams a
+   * reasoning fragment while the turn is stalled; `"off"` only records the
+   * stall in the final `kiro.status` metadata.
+   */
+  live?: "off" | "reasoning"
 }
 
 export interface KiroACPModelConfig {
@@ -102,6 +127,11 @@ export interface KiroACPModelConfig {
   contextWindow?: number
   /** Explicit configured effort. Per-call `providerOptions.kiro.reasoningEffort` overrides it. */
   effort?: KiroEffort
+  /**
+   * Stall watchdog settings for every turn of this model.
+   * @since 3.2.0
+   */
+  stall?: KiroACPStallSettings
   /**
    * Lazy accessor for an isolated ACPClient used to serve ephemeral
    * (toolless) calls — e.g. title generation. When provided,
@@ -274,6 +304,46 @@ function creditsProviderMetadata(
 ): SharedV3ProviderMetadata | undefined {
   if (!creditEntry || !Number.isFinite(creditEntry.value)) return undefined
   return { kiro: { credits: creditEntry.value, creditsUnit: creditEntry.unit } }
+}
+
+// ---------------------------------------------------------------------------
+// Stall status
+// ---------------------------------------------------------------------------
+
+/** Default silence before a turn counts as stalled (ms). */
+const STALL_AFTER_MS_DEFAULT = 10_000
+
+/** Stall summary attached as `kiro.status` on the turn's final part ends. */
+interface StallStatus {
+  /** Total wall-clock ms the turn spent stalled (sum of all stall windows). */
+  stalledMs: number
+  /** Newest kiro-cli ERROR log line seen during the turn, when available. */
+  hint?: string
+}
+
+/**
+ * Merge the credits metadata with the stall status into one part-level
+ * `{ kiro: {...} }` object. Either input may be absent; the result is
+ * undefined only when both are, so parts never carry an empty `kiro` key.
+ * `status` is present only when the turn actually stalled (`stalledMs > 0`).
+ */
+function partProviderMetadata(
+  credits: SharedV3ProviderMetadata | undefined,
+  status: StallStatus | undefined,
+): SharedV3ProviderMetadata | undefined {
+  if (!status) return credits
+  const statusRecord = status.hint === undefined
+    ? { stalledMs: status.stalledMs }
+    : { stalledMs: status.stalledMs, hint: status.hint }
+  return { kiro: { ...(credits?.kiro ?? {}), status: statusRecord } }
+}
+
+/** Human-readable seconds: `10s`, `66s`, `2.5s`, `0.1s`. */
+function formatSeconds(ms: number): string {
+  const seconds = ms / 1000
+  return seconds >= 10 || Number.isInteger(seconds)
+    ? `${Math.round(seconds)}s`
+    : `${Math.round(seconds * 10) / 10}s`
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,6 +1228,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         contextWindow: this.config.contextWindow,
         // Propagate the provider default so ephemeral turns inherit it.
         effort: this.config.effort,
+        stall: this.config.stall,
       })
     }
     return this.ephemeralModel.doStream(options)
@@ -1189,6 +1260,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         contextWindow: this.config.contextWindow,
         // Propagate the provider default so subagent turns inherit it.
         effort: this.config.effort,
+        stall: this.config.stall,
       })
       entry = { client, model, timer: null }
       this.subClients.set(affinityId, entry)
@@ -1269,11 +1341,15 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     initialOutputCharCount: number
     streamSegment: number
     options: LanguageModelV3CallOptions
+    /** Stall accounting inherited from earlier segments of the same turn. */
+    initialStall?: { stalledMs: number; hint: string | undefined }
     /** Called when tool calls are flushed to save/update pending turn state. */
     savePendingTurn: (state: {
       pendingToolCalls: Map<string, PendingToolCall>
       outputCharCount: number
       nextSegment: number
+      stalledMs: number
+      stallHint: string | undefined
     }) => void
   }): {
     readable: ReadableStream<LanguageModelV3StreamPart>
@@ -1287,9 +1363,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       initialOutputCharCount,
       streamSegment,
       options,
+      initialStall,
       savePendingTurn,
     } = params
 
+    let streamStarted = false
     let textStarted = false
     let reasoningStarted = false
     let outputCharCount = initialOutputCharCount
@@ -1305,6 +1383,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const writePart = (part: LanguageModelV3StreamPart) => {
       if (streamClosed) return
       writeChain = writeChain.then(() => writer.write(part)).catch(() => { streamClosed = true })
+    }
+
+    // `stream-start` is emitted exactly once per stream, by whichever block
+    // (text, reasoning, or stall notice) opens first.
+    const ensureStreamStarted = (): void => {
+      if (streamStarted) return
+      streamStarted = true
+      writePart({ type: "stream-start", warnings: [] })
     }
 
     let bufferedToolCalls: PendingToolCall[] = []
@@ -1324,8 +1410,181 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     const laneRouter = this.client.getLaneRouter()
 
+    // -----------------------------------------------------------------------
+    // Stall watchdog
+    // -----------------------------------------------------------------------
+    //
+    // Reads: the arrival of session/update notifications (any kind) and IPC
+    // tool calls, each of which counts as activity. The watchdog is armed
+    // when this stream is created (immediately before the prompt or tool
+    // results are sent), re-armed on every activity, and stopped on every
+    // exit path: finish, cancel, error and tool-call flush. A single timer
+    // handle is owned by this stream; no exit path leaves it armed.
+    //
+    // A stall window opens retroactively at the last activity time when the
+    // timer fires and closes at the next activity (or at turn end). The sum
+    // of all windows is `stalledMs`, carried across tool-call segments via
+    // the pending-turn state and reported as `kiro.status` on the turn's
+    // final part ends. With `live: "reasoning"`, each window is also
+    // narrated as a reasoning fragment with its own id (never mixed into the
+    // model's own reasoning block): one notice when the timer fires, one
+    // every further `afterMs` of silence, and a closing line when output
+    // resumes or the turn ends.
+    //
+    // Fail directions: the timer callback and the hint lookup never reject
+    // and never touch the stream after it closed; a missing or unreadable
+    // kiro-cli log just yields no `hint`. `afterMs: 0` disables everything
+    // (no timer, no fragments, no `kiro.status`).
+    const stallAfterMs = this.config.stall?.afterMs ?? STALL_AFTER_MS_DEFAULT
+    const stallEnabled = Number.isFinite(stallAfterMs) && stallAfterMs > 0
+    const stallLive = this.config.stall?.live ?? "reasoning"
+    const promptStartedAt = Date.now()
+
+    let stalledMs = initialStall?.stalledMs ?? 0
+    let stallHint: string | undefined = initialStall?.hint
+    let stallTimer: ReturnType<typeof setTimeout> | null = null
+    let lastActivityAt = promptStartedAt
+    /** Start of the open stall window, or null when output is flowing. */
+    let stallWindowStart: number | null = null
+    /** Notices emitted for the open window (drives the interval wording). */
+    let stallNotices = 0
+    /** Distinct id per narrated window so a resumed turn never re-opens a closed part. */
+    let stallWindows = 0
+    let stallFragmentId: string | null = null
+
+    const clearStallTimer = (): void => {
+      if (stallTimer) {
+        clearTimeout(stallTimer)
+        stallTimer = null
+      }
+    }
+
+    const armStallTimer = (): void => {
+      clearStallTimer()
+      if (!stallEnabled || streamClosed) return
+      stallTimer = setTimeout(onStallTick, stallAfterMs)
+    }
+
+    /** Capture the newest kiro-cli ERROR line for this turn, best-effort. */
+    const captureStallHint = (): void => {
+      readStallHint(promptStartedAt)
+        .then((hint) => {
+          if (streamClosed || hint === undefined) return
+          stallHint = hint
+        })
+        .catch(() => {
+          // The reader never rejects; this guard keeps the promise settled anyway.
+        })
+    }
+
+    const onStallTick = (): void => {
+      stallTimer = null
+      if (streamClosed) return
+
+      if (stallWindowStart === null) {
+        stallWindowStart = lastActivityAt
+        stallNotices = 0
+      }
+      stallNotices += 1
+
+      if (stallLive === "reasoning") {
+        const silence = formatSeconds(stallNotices * stallAfterMs)
+        const notice = `Kiro: no output for ${silence} - the model may be overloaded and kiro-cli is retrying.`
+        if (stallFragmentId === null) {
+          // Close whatever real block is open so the notice never lands inside
+          // the model's own text or reasoning; the next real chunk re-opens it.
+          if (reasoningStarted) {
+            reasoningStarted = false
+            writePart({ type: "reasoning-end", id: reasoningId })
+          }
+          if (textStarted) {
+            textStarted = false
+            writePart({ type: "text-end", id: textId })
+          }
+          stallWindows += 1
+          stallFragmentId = `stall-${streamSegment}-${stallWindows}`
+          ensureStreamStarted()
+          writePart({ type: "reasoning-start", id: stallFragmentId })
+          writePart({ type: "reasoning-delta", id: stallFragmentId, delta: notice })
+        } else {
+          writePart({ type: "reasoning-delta", id: stallFragmentId, delta: `\n${notice}` })
+        }
+      }
+
+      captureStallHint()
+      armStallTimer()
+    }
+
+    /** Close the open stall window; returns its length (0 when none was open). */
+    const endStallWindow = (now: number): number => {
+      if (stallWindowStart === null) return 0
+      const windowMs = Math.max(0, now - stallWindowStart)
+      stalledMs += windowMs
+      stallWindowStart = null
+      stallNotices = 0
+      return windowMs
+    }
+
+    /** Close the narrated fragment (if any) with a final line. */
+    const closeStallFragment = (line: string, metadata?: SharedV3ProviderMetadata): void => {
+      if (stallFragmentId === null) return
+      const id = stallFragmentId
+      stallFragmentId = null
+      writePart({ type: "reasoning-delta", id, delta: `\n${line}` })
+      writePart({
+        type: "reasoning-end",
+        id,
+        ...(metadata ? { providerMetadata: metadata } : {}),
+      })
+    }
+
+    /** Record activity from kiro-cli: settle any stall window and re-arm. */
+    const noteActivity = (): void => {
+      const now = Date.now()
+      lastActivityAt = now
+      const windowMs = endStallWindow(now)
+      if (windowMs > 0) {
+        closeStallFragment(`output resumed after ${formatSeconds(windowMs)}`)
+      }
+      armStallTimer()
+    }
+
+    /**
+     * Stop the watchdog at turn end. Any open window is closed and counted;
+     * an open fragment is closed, carrying `metadata` when no real block is
+     * left to carry it. Returns the status to attach, or undefined when the
+     * turn never stalled.
+     */
+    const finishStallTracking = (
+      buildMetadata: (status: StallStatus | undefined) => SharedV3ProviderMetadata | undefined,
+    ): SharedV3ProviderMetadata | undefined => {
+      clearStallTimer()
+      const windowMs = endStallWindow(Date.now())
+      const status: StallStatus | undefined = stalledMs > 0
+        ? { stalledMs, ...(stallHint !== undefined ? { hint: stallHint } : {}) }
+        : undefined
+      const metadata = buildMetadata(status)
+      const realBlockOpen = reasoningStarted || textStarted
+      closeStallFragment(
+        `turn ended after ${formatSeconds(windowMs)} without further output`,
+        realBlockOpen ? undefined : metadata,
+      )
+      return metadata
+    }
+
+    armStallTimer()
+
     const flushToolCalls = async (): Promise<void> => {
       if (streamClosed || bufferedToolCalls.length === 0) return
+
+      // A tool call is output: settle any stall window before closing the
+      // segment. Status is not attached here (this is not the turn's final
+      // segment); the totals travel with the pending-turn state instead.
+      clearStallTimer()
+      const windowMs = endStallWindow(Date.now())
+      if (windowMs > 0) {
+        closeStallFragment(`output resumed after ${formatSeconds(windowMs)}`)
+      }
 
       if (reasoningStarted) {
         reasoningStarted = false
@@ -1353,6 +1612,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         pendingToolCalls: new Map(bufferedToolCalls.map(c => [c.callId, c])),
         outputCharCount,
         nextSegment: streamSegment + 1,
+        stalledMs,
+        stallHint,
       })
 
       const metadata = this.client.getMetadata(sessionId)
@@ -1371,6 +1632,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     }
 
     const onToolCall = (pendingCall: PendingToolCall): void => {
+      // kiro-cli invoking a tool is output; the flush that follows stops the watchdog.
+      noteActivity()
       bufferedToolCalls.push(pendingCall)
 
       if (debounceTimer) clearTimeout(debounceTimer)
@@ -1383,6 +1646,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const onUpdate = (update: SessionUpdate): void => {
       if (streamClosed) return
 
+      // Every session/update is activity, whatever its kind. Settling the
+      // stall window first keeps the notice fragment closed before the real
+      // block below opens or continues.
+      noteActivity()
+
       const updateType = update.sessionUpdate
 
       if (updateType === "agent_message_chunk") {
@@ -1391,7 +1659,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           outputCharCount += text.length
           if (!textStarted) {
             textStarted = true
-            writePart({ type: "stream-start", warnings: [] })
+            ensureStreamStarted()
             writePart({ type: "text-start", id: textId })
           }
           writePart({ type: "text-delta", id: textId, delta: text })
@@ -1405,7 +1673,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           }
           if (!reasoningStarted) {
             reasoningStarted = true
-            writePart({ type: "stream-start", warnings: [] })
+            ensureStreamStarted()
             writePart({ type: "reasoning-start", id: reasoningId })
           }
           writePart({ type: "reasoning-delta", id: reasoningId, delta: text })
@@ -1423,7 +1691,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const attachPromise = (promptPromise: Promise<{ stopReason: string }>): void => {
       promptPromise
         .then(async (result) => {
-          if (streamClosed) return
+          if (streamClosed) {
+            clearStallTimer()
+            return
+          }
 
           if (debounceTimer) {
             clearTimeout(debounceTimer)
@@ -1447,8 +1718,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           const creditEntry = findCreditEntry(metadata)
 
           // DUAL EMISSION (deliberate): attach the SAME
-          // `{ kiro: { credits, creditsUnit } }` object to BOTH the final
-          // text-end AND the reasoning-end (when reasoning occurred):
+          // `{ kiro: { credits, creditsUnit, status } }` object to BOTH the
+          // final text-end AND the reasoning-end (when reasoning occurred):
           // - TEXT: some hosts (e.g. opencode) persist part-level
           //   providerMetadata on the final text part — this is what such
           //   consumers read TODAY via `part.metadata.kiro`.
@@ -1459,8 +1730,13 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           //   text path alone is not future-proof.
           // Both parts carry the same turn total — consumers MUST dedupe per
           // assistant message or they will double count. When credits are
-          // unknown (or the turn was cancelled) no `kiro` key is attached.
-          const partMetadata = creditsProviderMetadata(creditEntry)
+          // unknown (or the turn was cancelled) no credit keys are attached;
+          // `status` is attached independently, whenever the turn stalled, so
+          // a stalled turn without metering (or a cancelled one) still reports
+          // it. No stall and no credits: no `kiro` key at all.
+          const partMetadata = finishStallTracking((status) =>
+            partProviderMetadata(creditsProviderMetadata(creditEntry), status),
+          )
 
           if (reasoningStarted) {
             writePart({
@@ -1502,20 +1778,31 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           // (never persisted), so it is harmless there — while plain AI-SDK
           // consumers (and any host that reads finish metadata) get the full
           // turn picture in one event.
+          //
+          // Two durations sit side by side and must not be confused:
+          // - `turnDurationMs` is kiro-cli's own figure, passed through
+          //   untouched (`null` when kiro-cli did not report one).
+          // - `turnWallMs` (@since 3.2.0) is measured here: wall clock from
+          //   the moment this segment's prompt (or tool results) were sent
+          //   until the finish event. It is always present, even when kiro-cli
+          //   reported no session metadata at all, in which case it is the
+          //   only key under `kiro`.
+          const turnWallMs = Date.now() - promptStartedAt
           writePart({
             type: "finish",
             finishReason: mapStopReason(result.stopReason),
             usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
-            providerMetadata: metadata
-              ? {
-                  kiro: {
+            providerMetadata: {
+              kiro: metadata
+                ? {
                     contextUsagePercentage: metadata.contextUsagePercentage ?? null,
                     turnDurationMs: metadata.turnDurationMs ?? null,
+                    turnWallMs,
                     credits: creditEntry?.value ?? null,
                     creditsUnit: creditEntry?.unit ?? null,
-                  },
-                }
-              : undefined,
+                  }
+                : { turnWallMs },
+            },
           })
 
           removeAbortListener()
@@ -1532,18 +1819,35 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           laneRouter?.unregister(sessionId)
           this.cleanupAfterStream(sessionId)
 
-          if (streamClosed) return
+          if (streamClosed) {
+            clearStallTimer()
+            return
+          }
 
           if (debounceTimer) {
             clearTimeout(debounceTimer)
             debounceTimer = null
           }
 
+          // A failed turn carries no credits, but a stall that preceded the
+          // failure is still reported: it is usually the explanation.
+          const partMetadata = finishStallTracking((status) =>
+            partProviderMetadata(undefined, status),
+          )
+
           if (reasoningStarted) {
-            writePart({ type: "reasoning-end", id: reasoningId })
+            writePart({
+              type: "reasoning-end",
+              id: reasoningId,
+              ...(partMetadata ? { providerMetadata: partMetadata } : {}),
+            })
           }
           if (textStarted) {
-            writePart({ type: "text-end", id: textId })
+            writePart({
+              type: "text-end",
+              id: textId,
+              ...(partMetadata ? { providerMetadata: partMetadata } : {}),
+            })
           }
 
           writePart({ type: "error", error: new Error(extractErrorMessage(err)) })
@@ -1623,6 +1927,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           outputCharCount: state.outputCharCount,
           streamSegment: state.nextSegment,
           promptAbort,
+          stalledMs: state.stalledMs,
+          stallHint: state.stallHint,
         })
       },
     })
@@ -1682,10 +1988,13 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         initialOutputCharCount: turn.outputCharCount,
         streamSegment: turn.streamSegment,
         options,
+        initialStall: { stalledMs: turn.stalledMs, hint: turn.stallHint },
         savePendingTurn: (state) => {
           turn.pendingToolCalls = state.pendingToolCalls
           turn.outputCharCount = state.outputCharCount
           turn.streamSegment = state.nextSegment
+          turn.stalledMs = state.stalledMs
+          turn.stallHint = state.stallHint
         },
       })
 
@@ -1763,6 +2072,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           outputCharCount: state.outputCharCount,
           streamSegment: state.nextSegment,
           promptAbort,
+          stalledMs: state.stalledMs,
+          stallHint: state.stallHint,
         })
       },
     })

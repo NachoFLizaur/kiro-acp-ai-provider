@@ -218,6 +218,7 @@ describe("doStream — credits on part-end metadata", () => {
         kiro: {
           contextUsagePercentage: null,
           turnDurationMs: 3200,
+          turnWallMs: expect.any(Number),
           credits: null,
           creditsUnit: null,
         },
@@ -225,7 +226,7 @@ describe("doStream — credits on part-end metadata", () => {
     }
   })
 
-  test("no session metadata at all → no kiro key on parts, no finish metadata", async () => {
+  test("no session metadata at all → no kiro key on parts, finish carries only the wall clock", async () => {
     const parts = await streamParts(
       clientWithTurn({ updates: [{ kind: "text", text: "answer" }] }),
     )
@@ -234,9 +235,13 @@ describe("doStream — credits on part-end metadata", () => {
     if (textEnd?.type === "text-end") {
       expect(textEnd.providerMetadata).toBeUndefined()
     }
+    // Without kiro-reported metadata nothing is invented: no turnDurationMs,
+    // no context usage, no credit keys. Only the provider's own wall clock.
     const finish = parts.find((p) => p.type === "finish")
     if (finish?.type === "finish") {
-      expect(finish.providerMetadata).toBeUndefined()
+      expect(finish.providerMetadata).toEqual({
+        kiro: { turnWallMs: expect.any(Number) },
+      })
     }
   })
 
@@ -347,6 +352,7 @@ describe("doStream — credits on part-end metadata", () => {
         kiro: {
           contextUsagePercentage: 0.42,
           turnDurationMs: 1234,
+          turnWallMs: expect.any(Number),
           credits: 0.05,
           creditsUnit: "credit",
         },
@@ -381,6 +387,7 @@ describe("doGenerate — credits mirroring", () => {
       kiro: {
         contextUsagePercentage: 0.42,
         turnDurationMs: 1234,
+        turnWallMs: expect.any(Number),
         credits: 0.05,
         creditsUnit: "credit",
       },
@@ -388,13 +395,15 @@ describe("doGenerate — credits mirroring", () => {
     expect(result.finishReason.unified).toBe("stop")
   })
 
-  test("no metadata → content parts and result carry no provider metadata", async () => {
+  test("no metadata → content parts carry no provider metadata, result carries only the wall clock", async () => {
     const client = clientWithTurn({ updates: [{ kind: "text", text: "plain" }] })
     const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
 
     const result = await model.doGenerate(makeCallOptions(USER_PROMPT))
 
     expect(result.content).toEqual([{ type: "text", text: "plain" }])
-    expect(result.providerMetadata).toBeUndefined()
+    expect(result.providerMetadata).toEqual({
+      kiro: { turnWallMs: expect.any(Number) },
+    })
   })
 })

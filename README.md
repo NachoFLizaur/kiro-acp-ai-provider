@@ -70,6 +70,10 @@ const kiro = createKiroAcp({
     "claude-sonnet-4.6": "low",   // takes precedence over effort for that model
   },
   mcpTimeout: 30,                 // MCP tool call timeout in minutes (default: 30)
+  stall: {                        // Stall watchdog (see Stall detection below)
+    afterMs: 10_000,              // Silence threshold in ms (default: 10_000; 0 disables)
+    live: "reasoning",            // "reasoning" (default) shows a live notice while stalled; "off" shows nothing
+  },
   sessionId: "previous-id",       // Resume an existing session
   env: { MY_VAR: "value" },       // Extra env vars for kiro-cli
   clientInfo: { name: "my-app", version: "1.0.0" },
@@ -91,7 +95,43 @@ The `x-session-reset: true` header clears the persisted session and creates a fr
 
 ### MCP Timeout
 
-On startup, the provider sets `mcp.noInteractiveTimeout` to 30 minutes via `kiro-cli settings`. The default 5 minutes is too short for long-running tool calls (e.g., subagents that run for 8+ minutes).
+On startup, the provider sets `mcp.noInteractiveTimeout` to 30 minutes via `kiro-cli settings`. The default 5 minutes is too short for long-running tool calls (e.g., subagents that run for 8+ minutes). The setting is applied once per process for each distinct `mcpTimeout` value and does not block the event loop.
+
+### Stall detection
+
+When the model backend is overloaded, `kiro-cli` retries silently and the stream can go quiet for a long time with no indication of what is happening. The `stall` setting turns that silence into a visible signal:
+
+```typescript
+const kiro = createKiroAcp({
+  stall: {
+    afterMs: 10_000,    // default; a turn counts as stalled after 10s without output
+    live: "reasoning",  // default; set to "off" to keep the transcript clean
+  },
+})
+```
+
+- **`afterMs`** (default `10_000`): how long `kiro-cli` may stay silent during a turn before it counts as stalled. The timer starts when the prompt (or a batch of tool results) is sent, resets on every update from `kiro-cli`, and is cleared when the turn finishes, errors, or hands tool calls back to your application. `0` turns stall detection off entirely: no live notice and no `status` field in the provider metadata described below.
+- **`live`** (default `"reasoning"`): with `"reasoning"`, the provider streams a small reasoning fragment (separate from the model's own reasoning) while the turn is stalled. It opens with a notice that no output has arrived for the configured time and that kiro-cli is likely retrying, adds a line at each further `afterMs` of silence, and closes with a line reporting how long the stall lasted: `output resumed after Ns` once real output arrives, or `turn ended after Ns without further output` if the turn ends first. With `"off"`, nothing is streamed; the stall is only recorded in the metadata described next.
+
+Whenever a turn stalled (regardless of `live`), the turn's final `text-end` or `reasoning-end` part carries `providerMetadata.kiro.status` next to the credits:
+
+```typescript
+providerMetadata.kiro.status = {
+  stalledMs: number, // total time the turn spent stalled, in ms
+  hint?: string,     // most recent ERROR line from kiro-cli's own chat log during this turn
+}
+```
+
+`hint` is best-effort: it is read from kiro-cli's log file (`kiro-log/kiro-chat.log` in the OS temp directory), ANSI-stripped and truncated to about 160 characters, and is omitted when the log is missing or unreadable. It never blocks or fails the stream.
+
+Separately from stalls, every `finish` part reports the provider's own wall-clock measurement of the turn:
+
+```typescript
+providerMetadata.kiro.turnWallMs // ms from sending the prompt until finish, always present
+providerMetadata.kiro.turnDurationMs // kiro-cli's own figure, passed through unchanged (null when not reported)
+```
+
+When `kiro-cli` reports no session metadata for a turn, the `kiro` object on `finish` contains `turnWallMs` only.
 
 ## Provider Methods
 
