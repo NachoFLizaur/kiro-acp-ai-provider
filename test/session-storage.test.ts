@@ -247,4 +247,53 @@ describe("getXdgDataHome", () => {
     expect(typeof getXdgDataHome).toBe("function")
     expect(getXdgDataHome()).toBeTruthy()
   })
+
+  test("persistSession with state stores delivered + systemHash; loads back", () => {
+    persistSession("/project", "sess-1", "aff", { delivered: ["h1", "h2"], systemHash: "sys" })
+
+    const loaded = loadPersistedSession("/project", "aff")
+    expect(loaded?.kiroSessionId).toBe("sess-1")
+    expect(loaded?.delivered).toEqual(["h1", "h2"])
+    expect(loaded?.systemHash).toBe("sys")
+  })
+
+  test("persistSession without state keeps delivered when the session id is unchanged", () => {
+    persistSession("/project", "sess-1", "aff", { delivered: ["h1"], systemHash: "sys" })
+    persistSession("/project", "sess-1", "aff")
+
+    const loaded = loadPersistedSession("/project", "aff")
+    expect(loaded?.delivered).toEqual(["h1"])
+    expect(loaded?.systemHash).toBe("sys")
+  })
+
+  test("persistSession without state drops delivered when the session id changes", () => {
+    persistSession("/project", "sess-1", "aff", { delivered: ["h1"], systemHash: "sys" })
+    persistSession("/project", "sess-2", "aff")
+
+    const loaded = loadPersistedSession("/project", "aff")
+    expect(loaded?.kiroSessionId).toBe("sess-2")
+    expect(loaded?.delivered).toBeUndefined()
+    expect(loaded?.systemHash).toBeUndefined()
+  })
+
+  test("legacy file without delivered loads with delivered undefined", () => {
+    const path = getSessionFilePath("/project", "legacy")
+    mkdirSync(join(path, ".."), { recursive: true })
+    writeFileSync(path, JSON.stringify({ kiroSessionId: "old", lastUsed: Date.now() }))
+
+    const loaded = loadPersistedSession("/project", "legacy")
+    expect(loaded?.kiroSessionId).toBe("old")
+    expect(loaded?.delivered).toBeUndefined()
+  })
+
+  test("malformed delivered field is dropped, not returned", () => {
+    const path = getSessionFilePath("/project", "bad")
+    mkdirSync(join(path, ".."), { recursive: true })
+    writeFileSync(path, JSON.stringify({ kiroSessionId: "x", lastUsed: Date.now(), delivered: "nope", systemHash: 42 }))
+
+    const loaded = loadPersistedSession("/project", "bad")
+    expect(loaded?.kiroSessionId).toBe("x")
+    expect(loaded?.delivered).toBeUndefined()
+    expect(loaded?.systemHash).toBeUndefined()
+  })
 })

@@ -1,5 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test"
-import { writeAgentConfig, removeAgentConfig, agentConfigPath } from "../src/agent-config"
+import { writeAgentConfig, removeAgentConfig, agentConfigPath, isPidAlive } from "../src/agent-config"
+import { spawnSync } from "node:child_process"
 import {
   mkdtempSync,
   mkdirSync,
@@ -114,7 +115,7 @@ describe("writeAgentConfig", () => {
   })
 
   describe("stale config sweep", () => {
-    test("removes only opencode-*.json files older than seven days", () => {
+    test("removes only opencode-*.json files older than 24 hours", () => {
       // Arrange
       const dir = makeTempDir()
       const agentsDir = join(dir, ".kiro", "agents")
@@ -127,9 +128,9 @@ describe("writeAgentConfig", () => {
       const stalePrefixed = join(agentsDir, "old-opencode-deadbeef.json")
       const staleWrongExtension = join(agentsDir, "opencode-deadbeef.json.bak")
       const staleDirectory = join(agentsDir, "opencode-directory.json")
-      writeAged(staleMatching, 8 * DAY_MS)
-      writeAged(freshMatching, 1 * DAY_MS)
-      writeAged(justUnderCutoff, 7 * DAY_MS - 60_000)
+      writeAged(staleMatching, 2 * DAY_MS)
+      writeAged(freshMatching, 60_000)
+      writeAged(justUnderCutoff, DAY_MS - 60_000)
       writeAged(staleCustomName, 30 * DAY_MS)
       writeAged(staleNoSuffix, 30 * DAY_MS)
       writeAged(stalePrefixed, 30 * DAY_MS)
@@ -150,6 +151,62 @@ describe("writeAgentConfig", () => {
       expect(existsSync(stalePrefixed)).toBe(true)
       expect(existsSync(staleWrongExtension)).toBe(true)
       expect(existsSync(staleDirectory)).toBe(true)
+      expect(existsSync(written)).toBe(true)
+    })
+
+    test("written config carries the current pid", () => {
+      const dir = makeTempDir()
+      const written = writeAgentConfig(dir, "opencode", { name: "opencode" }, "a1b2c3d4")
+      expect(JSON.parse(readFileSync(written, "utf-8")).pid).toBe(process.pid)
+    })
+
+    test("removes a fresh config whose pid is dead", () => {
+      const dir = makeTempDir()
+      const agentsDir = join(dir, ".kiro", "agents")
+      mkdirSync(agentsDir, { recursive: true })
+      const deadPid = spawnSync(process.execPath, ["-e", ""]).pid
+      expect(isPidAlive(deadPid)).toBe(false)
+      const deadFile = join(agentsDir, "opencode-dead0000.json")
+      writeAged(deadFile, 60_000, JSON.stringify({ name: "x", pid: deadPid }))
+
+      writeAgentConfig(dir, "opencode", { name: "opencode" }, "a1b2c3d4")
+
+      expect(existsSync(deadFile)).toBe(false)
+    })
+
+    test("keeps a fresh config whose pid is alive", () => {
+      const dir = makeTempDir()
+      const agentsDir = join(dir, ".kiro", "agents")
+      mkdirSync(agentsDir, { recursive: true })
+      const liveFile = join(agentsDir, "opencode-live0000.json")
+      writeAged(liveFile, 60_000, JSON.stringify({ name: "x", pid: process.pid }))
+
+      writeAgentConfig(dir, "opencode", { name: "opencode" }, "a1b2c3d4")
+
+      expect(existsSync(liveFile)).toBe(true)
+    })
+
+    test("removes a day-old config even when its pid is alive (age rule wins)", () => {
+      const dir = makeTempDir()
+      const agentsDir = join(dir, ".kiro", "agents")
+      mkdirSync(agentsDir, { recursive: true })
+      const oldLive = join(agentsDir, "opencode-oldlive0.json")
+      writeAged(oldLive, DAY_MS + 60_000, JSON.stringify({ name: "x", pid: process.pid }))
+
+      writeAgentConfig(dir, "opencode", { name: "opencode" }, "a1b2c3d4")
+
+      expect(existsSync(oldLive)).toBe(false)
+    })
+
+    test("keeps the file just written even if it looks stale", () => {
+      const dir = makeTempDir()
+      const written = writeAgentConfig(dir, "opencode", { name: "opencode" }, "a1b2c3d4")
+      const old = new Date(Date.now() - 30 * DAY_MS)
+      utimesSync(written, old, old)
+
+      // A second write of the same instance sweeps the directory with keepPath = written
+      writeAgentConfig(dir, "opencode", { name: "opencode" }, "a1b2c3d4")
+
       expect(existsSync(written)).toBe(true)
     })
 

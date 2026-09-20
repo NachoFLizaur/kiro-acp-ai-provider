@@ -6,6 +6,7 @@ import {
   diverged,
 } from "../src/session-affinity"
 import { KiroACPLanguageModel } from "../src/kiro-acp-model"
+import { createHistorySyncState, REPLAY_PREAMBLE } from "../src/history-sync"
 import { createKiroAcp } from "../src/kiro-acp-provider"
 import { LaneRouter } from "../src/lane-router"
 import type { ACPClient, ACPSession, PromptOptions } from "../src/acp-client"
@@ -181,7 +182,7 @@ describe("interceptSessionAffinity — first call semantics", () => {
     expect(prompts.get("aff-1")).toHaveLength(1)
   })
 
-  test("first call WITH history → reset (core provider.ts:980-981)", () => {
+  test("first call WITH history → no reset; history sync in the model decides", () => {
     const prompts = new Map<string, string[]>()
     const options = makeOptions(
       [system("sys"), user("q1"), assistant("a1"), user("q2")],
@@ -190,16 +191,13 @@ describe("interceptSessionAffinity — first call semantics", () => {
 
     const result = interceptSessionAffinity(options, prompts)
 
-    expect(result).not.toBe(options)
-    expect(result.headers?.["x-session-affinity"]).toBe("aff-1")
-    expect(result.headers?.["x-session-reset"]).toBe("true")
-    // Original options object must NOT be mutated
-    expect(options.headers?.["x-session-reset"]).toBeUndefined()
+    expect(result).toBe(options)
+    expect(result.headers?.["x-session-reset"]).toBeUndefined()
     // Messages tracked so the NEXT call can be a continuation
     expect(prompts.get("aff-1")).toHaveLength(3)
   })
 
-  test("tool messages count as history on first call → reset", () => {
+  test("tool messages on first call → tracked, no reset", () => {
     const prompts = new Map<string, string[]>()
     const options = makeOptions(
       [
@@ -221,7 +219,8 @@ describe("interceptSessionAffinity — first call semantics", () => {
 
     const result = interceptSessionAffinity(options, prompts)
 
-    expect(result.headers?.["x-session-reset"]).toBe("true")
+    expect(result.headers?.["x-session-reset"]).toBeUndefined()
+    expect(prompts.get("aff-1")).toHaveLength(2)
   })
 })
 
@@ -695,10 +694,12 @@ describe("affinity state shared across models of one provider", () => {
       }),
     } as unknown as Partial<ACPClient>)
 
-    // Two models wired exactly like createKiroAcp wires them: ONE shared map
+    // Two models wired exactly like createKiroAcp wires them: ONE shared
+    // intercept map and ONE shared history-sync state
     const shared = new Map<string, string[]>()
-    const modelA = new KiroACPLanguageModel("claude-sonnet-4.6", { client, affinityPrompts: shared })
-    const modelB = new KiroACPLanguageModel("claude-opus-4.6", { client, affinityPrompts: shared })
+    const syncState = createHistorySyncState()
+    const modelA = new KiroACPLanguageModel("claude-sonnet-4.6", { client, affinityPrompts: shared, syncState })
+    const modelB = new KiroACPLanguageModel("claude-opus-4.6", { client, affinityPrompts: shared, syncState })
 
     const affinity = uniqueAffinity()
     const headers = { "x-session-affinity": affinity }
@@ -715,7 +716,7 @@ describe("affinity state shared across models of one provider", () => {
     await drainStream(r2.stream)
 
     expect(promptBodies[1]).toBe("u2")
-    expect(promptBodies[1]).not.toContain("Resume and act on the following message.")
+    expect(promptBodies[1]).not.toContain(REPLAY_PREAMBLE)
 
     // Turn 3 on model B — DIVERGED history (first message rewritten) → reset →
     // full conversation replay sent to a fresh session
@@ -724,8 +725,10 @@ describe("affinity state shared across models of one provider", () => {
     )
     await drainStream(r3.stream)
 
-    expect(promptBodies[2]).toContain("Resume and act on the following message.")
-    expect(promptBodies[2]).toContain("<context>")
+    expect(promptBodies[2]).toContain(REPLAY_PREAMBLE)
+    expect(promptBodies[2]).toContain("[User]\nREWRITTEN")
+    expect(promptBodies[2]).toContain("[Assistant]\na1")
+    expect(promptBodies[2]).toContain("[User]\nu3")
   })
 
   test("createKiroAcp injects the SAME map instance into every model it creates", () => {

@@ -1151,6 +1151,8 @@ describe("KiroACPLanguageModel", () => {
       ["end_turn", "stop"],
       ["max_tokens", "length"],
       ["content_filter", "content-filter"],
+      ["refusal", "content-filter"],
+      ["max_turn_requests", "stop"],
       ["unknown_reason", "other"],
     ] as const)("maps ACP stop reason '%s' to unified '%s'", async (acpReason, expectedUnified) => {
       const client = createMockClient({
@@ -1527,8 +1529,8 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
-  describe("prompt extraction", () => {
-    test("sends only the last user message, skipping history and assistant messages", async () => {
+  describe("prompt rendering (no affinity: one-shot session, full replay)", () => {
+    test("replays history with role labels when there is no affinity to continue", async () => {
       let capturedPrompt: unknown[] = []
 
       const client = createMockClient({
@@ -1556,9 +1558,9 @@ describe("KiroACPLanguageModel", () => {
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
-      expect(textContent).toBe("follow up")
-      expect(textContent).not.toContain("first question")
-      expect(textContent).not.toContain("first answer")
+      expect(textContent).toContain("[User]\nfirst question")
+      expect(textContent).toContain("[Assistant]\nfirst answer")
+      expect(textContent).toContain("[User]\nfollow up")
     })
 
     test("concatenates multiple system messages", async () => {
@@ -1591,7 +1593,7 @@ describe("KiroACPLanguageModel", () => {
       expect(textContent).toContain("<system_instructions>")
     })
 
-    test("skips tool messages — kiro-cli manages tool results in its session", async () => {
+    test("replays tool calls and results so a fresh session has the full picture", async () => {
       let capturedPrompt: unknown[] = []
 
       const client = createMockClient({
@@ -1637,9 +1639,9 @@ describe("KiroACPLanguageModel", () => {
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
-      expect(textContent).toBe("what was the output?")
-      expect(textContent).not.toContain("hello\n")
-      expect(textContent).not.toContain("bash")
+      expect(textContent).toContain('[Assistant tool call] bash({"command":"echo hello"})')
+      expect(textContent).toContain("[Tool result: bash]\nhello\n")
+      expect(textContent).toContain("[User]\nwhat was the output?")
     })
   })
 
@@ -2172,7 +2174,7 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
-  describe("formatConversationReplay — image placeholders", () => {
+  describe("replay — image placeholders", () => {
     test("includes [Image: image/png] placeholder for file parts with image MIME", async () => {
       let capturedPrompt: unknown[] = []
 
@@ -2338,9 +2340,9 @@ describe("KiroACPLanguageModel", () => {
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
-      expect(textContent).toContain("User: hello")
-      expect(textContent).toContain("Assistant: hi there")
-      expect(textContent).toContain("follow up")
+      expect(textContent).toContain("[User]\nhello")
+      expect(textContent).toContain("[Assistant]\nhi there")
+      expect(textContent).toContain("[User]\nfollow up")
       expect(textContent).not.toContain("[Image:")
     })
 
@@ -2560,7 +2562,7 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
-  describe("extractPrompt — image handling", () => {
+  describe("image handling", () => {
     test("sends text ContentBlocks for text-only prompt", async () => {
       let capturedPrompt: unknown[] = []
 
@@ -2689,9 +2691,9 @@ describe("KiroACPLanguageModel", () => {
         ]),
       )
 
-      // Only the text block should be sent; PDF is silently skipped
+      // Non-image files cannot cross ACP; a placeholder keeps the reference visible
       expect(capturedPrompt).toHaveLength(1)
-      expect(capturedPrompt[0]).toEqual({ type: "text", text: "check this" })
+      expect(capturedPrompt[0]).toEqual({ type: "text", text: "check this\n[File: application/pdf]" })
     })
 
     test("preserves system prompt with images", async () => {
@@ -2723,14 +2725,14 @@ describe("KiroACPLanguageModel", () => {
         ]),
       )
 
-      // System prompt is first, then user text, then image
-      expect(capturedPrompt).toHaveLength(3)
+      // System prompt and user text share the first text block, then the image
+      expect(capturedPrompt).toHaveLength(2)
       const systemBlock = capturedPrompt[0] as { type: string; text: string }
       expect(systemBlock.type).toBe("text")
       expect(systemBlock.text).toContain("<system_instructions>")
       expect(systemBlock.text).toContain("You are a vision assistant.")
-      expect(capturedPrompt[1]).toEqual({ type: "text", text: "Describe this:" })
-      expect(capturedPrompt[2]).toEqual({
+      expect(systemBlock.text.endsWith("</system_instructions>\n\nDescribe this:")).toBe(true)
+      expect(capturedPrompt[1]).toEqual({
         type: "image",
         data: "imgdata",
         mimeType: "image/jpeg",
