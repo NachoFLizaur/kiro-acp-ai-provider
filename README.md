@@ -52,6 +52,8 @@ Your App → AI SDK → kiro-acp-ai-provider → kiro-cli (ACP) → AWS Models
 
 The provider translates AI SDK calls into ACP messages sent to a `kiro-cli` subprocess over JSON-RPC stdio. Tool calls are relayed through an MCP bridge back to your application via IPC. The bridge does **not** execute tools, your application does.
 
+Kiro sessions are stateful; AI SDK calls are not. The provider keeps track of which messages each kiro session has already seen (keyed by `x-session-affinity`) and sends only the new tail of the conversation on each call. When the history no longer extends what was delivered (compaction, revert, fork, a cleared kiro session), it starts a new kiro session and replays the full history. See [History sync](#history-sync).
+
 ## Configuration
 
 ```typescript
@@ -89,9 +91,21 @@ const kiro = createKiroAcp({
 
 When the provider receives an `x-parent-session-id` header (indicating a subagent/child session), it spawns a **separate kiro-cli process** for that session. This prevents tool definitions from leaking between parent and child sessions. Isolated processes are auto-cleaned after 3 minutes idle.
 
+### History sync
+
+Your application is the source of truth for the conversation; the kiro session is a mirror. On every call the provider hashes the non-system messages in the prompt and compares them with what the kiro session bound to the `x-session-affinity` key has already received.
+
+- **Continue**: the prompt extends the delivered prefix. Only the new user messages are sent. Assistant and tool messages directly after the prefix are skipped, since kiro produced them itself. The system prompt is sent once per kiro session as `<system_instructions>`, then again only when it changes, as `<system-update>`.
+- **Replay**: the prompt diverges from the delivered prefix (compaction summary replaced the history, a message was edited, the session was forked or reverted, or no history is known). The persisted mapping is dropped, a new kiro session is created, and the full history is replayed with `[User]`, `[Assistant]`, `[Assistant tool call]` and `[Tool result]` labels. Tool results are truncated in replays.
+- A call without an `x-session-affinity` header always replays into a one-shot session.
+
+The delivered prefix is persisted next to the session mapping (see Session Reset), so an application restart continues the same kiro session without a replay. If kiro-cli no longer has the session, or kiro cleared it (`_kiro.dev/clear/status`), the next call replays.
+
+Set `KIRO_ACP_DEBUG_FILE=/path/to/file.jsonl` to log one record per dispatched prompt with `mode` (`continue`, `replay`, `resume`), `newSession`, and block sizes.
+
 ### Session Reset (Revert / Fork)
 
-The `x-session-reset: true` header clears the persisted session and creates a fresh kiro session. The full conversation history is replayed as `<context>` text in a single message, since ACP doesn't support native fork/truncate. This enables revert-to-message and fork operations in consumers like [opencode](https://opencode.ai).
+The `x-session-reset: true` header forces a replay: the persisted session is cleared, a fresh kiro session is created, and the full conversation history is replayed. Consumers such as [opencode](https://opencode.ai) send it on revert-to-message and fork. Since the provider detects divergence on its own, the header is a belt-and-braces signal rather than a requirement.
 
 ### MCP Timeout
 
@@ -238,10 +252,10 @@ This is necessary because kiro-cli's MCP tool result path doesn't reliably handl
 
 - **System prompt**: Kiro's base context is always present; yours is injected via `<system_instructions>` tags
 - **Limited per-turn options**: Temperature and similar sampling parameters are controlled by kiro-cli. Reasoning effort is the exception (see Reasoning effort)
-- **Estimated token counts**: Input tokens estimated from context usage %, output from character count
+- **Estimated token counts**: Input tokens estimated from context usage %, output from character count. Kiro sends no token counts over ACP.
 - **Process model**: One kiro-cli per provider instance (subagent sessions get their own isolated process); concurrent sessions use lane routing
-- **Revert-to-message**: Requires the consumer to signal session reset via `x-session-reset` header as Kiro ACP doesn't support Checkpointing.
-- **No ACP session/fork**: Kiro ACP doesn't support native fork/truncate, so reverts replay the conversation history as context text
+- **No ACP session/fork**: Kiro ACP doesn't support native fork/truncate, so divergence (revert, fork, compaction) replays the conversation history as labeled text into a new kiro session (see History sync)
+- **Two compactions**: Kiro compacts its own session history independently of your application. The provider reports `providerMetadata.kiro.compaction` on the finish that follows one, but does not act on it. Set your application's context limit below kiro's so your compaction runs first.
 - **Reasoning**: Kiro always streams reasoning and it cannot be disabled. Effort is configurable per model (see Reasoning effort)
 - **Tool-returned images**: Uses a follow-up prompt approach which adds ~1-2s latency and an extra synthetic message in kiro-cli's session history
 

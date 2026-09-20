@@ -18,69 +18,21 @@ import { KiroACPError, type ACPClient, type ACPSession, type SessionUpdate, type
 import type { KiroEffort } from "./kiro-effort"
 import { verifyAuth } from "./kiro-auth"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
-import { interceptSessionAffinity } from "./session-affinity"
+import { interceptSessionAffinity, hashPromptMessages } from "./session-affinity"
+import { nonSystemMessages, isImageMediaType, normalizeMediaType } from "./prompt-serializer"
+import {
+  planSync,
+  invalidateSession,
+  buildPromptBlocks,
+  createHistorySyncState,
+  type HistorySyncState,
+  type SyncPlan,
+  type SystemState,
+} from "./history-sync"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 import { readStallHint } from "./kiro-log-hint"
-
-// ---------------------------------------------------------------------------
-// Data conversion helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Convert AI SDK V3 data content to a base64 string.
- *
- * LanguageModelV3DataContent can be:
- * - Uint8Array → convert to base64
- * - string → assume already base64-encoded
- * - URL → convert URL string to base64 (data URLs decoded, http URLs passed as-is)
- */
-function toBase64Data(data: Uint8Array | string | URL): string {
-  if (data instanceof Uint8Array) {
-    return Buffer.from(data).toString("base64")
-  }
-
-  if (data instanceof URL) {
-    // Data URLs: extract the base64 payload
-    if (data.protocol === "data:") {
-      const href = data.href
-      const base64Marker = ";base64,"
-      const markerIndex = href.indexOf(base64Marker)
-      if (markerIndex !== -1) {
-        return href.slice(markerIndex + base64Marker.length)
-      }
-      // Non-base64 data URL — extract after comma as fallback
-      const commaIndex = href.indexOf(",")
-      if (commaIndex !== -1) {
-        return href.slice(commaIndex + 1)
-      }
-    }
-    // For http/https URLs, return the URL string — the ACP server
-    // will need to fetch it. This is a best-effort fallback.
-    return data.href
-  }
-
-  // Already a string — assume base64
-  return data
-}
-
-/**
- * Normalize an AI SDK mediaType to a concrete MIME type.
- *
- * AI SDK may send `image/*` as a wildcard; default to `image/jpeg`.
- */
-function normalizeMediaType(mediaType: string): string {
-  if (mediaType === "image/*") return "image/jpeg"
-  return mediaType
-}
-
-/**
- * Check if a media type represents an image.
- */
-function isImageMediaType(mediaType: string): boolean {
-  return mediaType.startsWith("image/") || mediaType === "image/*"
-}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -149,6 +101,14 @@ export interface KiroACPModelConfig {
    * never on inner models.
    */
   affinityPrompts?: Map<string, string[]>
+
+  /**
+   * Provider-level shared history-sync state (delivered message hashes and
+   * system prompt per affinity key). Shared by all models of one provider
+   * and passed down to ephemeral/subagent children. A model constructed
+   * without it owns a private instance.
+   */
+  syncState?: HistorySyncState
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +229,10 @@ function mapStopReason(stopReason: string): LanguageModelV3FinishReason {
     case "cancelled":
       return { unified: "error", raw: "cancelled" }
     case "content_filter":
+    case "refusal":
       return { unified: "content-filter", raw: stopReason }
+    case "max_turn_requests":
+      return { unified: "stop", raw: stopReason }
     default:
       return { unified: "other", raw: stopReason }
   }
@@ -405,6 +368,40 @@ function debugLogIntercept(
 }
 
 /**
+ * Log one dispatched `session/prompt` (or tool-result resume) to
+ * `$KIRO_ACP_DEBUG_FILE`: sync mode, whether a new kiro session was created,
+ * and a shape-only view of the blocks (sizes and a 200-char head, no full
+ * payloads). Best-effort, inert unless the env var is set; never throws.
+ */
+function debugLogDispatch(
+  modelId: string,
+  sessionId: string,
+  mode: "continue" | "replay" | "resume",
+  newSession: boolean,
+  blocks: ContentBlock[],
+): void {
+  const file = process.env.KIRO_ACP_DEBUG_FILE
+  if (!file) return
+  try {
+    const record = {
+      ts: new Date().toISOString(),
+      model: modelId,
+      sessionId,
+      mode,
+      newSession,
+      blocks: blocks.map((b) =>
+        b.type === "text"
+          ? { type: "text", chars: (b.text ?? "").length, head: (b.text ?? "").slice(0, 200) }
+          : { type: "image", mimeType: b.mimeType },
+      ),
+    }
+    appendFileSync(file, JSON.stringify(record) + "\n")
+  } catch {
+    // Observability must never affect the call path
+  }
+}
+
+/**
  * Log a swallowed `setEffort` failure to `$KIRO_ACP_DEBUG_FILE` so it stays
  * diagnosable. Best-effort, inert unless the env var is set; never throws.
  */
@@ -428,129 +425,6 @@ function debugLogEffortFailure(
   } catch {
     // Observability must never affect the call path
   }
-}
-
-/**
- * Extract system prompt and latest user message from a LanguageModelV3Prompt.
- *
- * Assistant and tool messages are skipped — kiro-cli's ACP session maintains
- * its own conversation history. Including them would duplicate every turn.
- */
-function extractPrompt(prompt: LanguageModelV3Prompt): {
-  systemPrompt: string | undefined
-  userParts: ContentBlock[]
-} {
-  const systemParts: string[] = []
-  let lastUserParts: ContentBlock[] = []
-
-  for (const message of prompt) {
-    if (message.role === "system") {
-      systemParts.push(message.content)
-      continue
-    }
-
-    if (message.role === "user") {
-      const parts: ContentBlock[] = []
-      for (const part of message.content) {
-        if (part.type === "text") {
-          parts.push({ type: "text", text: part.text })
-          continue
-        }
-        if (part.type === "file" && isImageMediaType(part.mediaType)) {
-          parts.push({
-            type: "image",
-            data: toBase64Data(part.data),
-            mimeType: normalizeMediaType(part.mediaType),
-          })
-        }
-      }
-      lastUserParts = parts
-    }
-  }
-
-  const systemPrompt = systemParts.length > 0 ? systemParts.join("\n\n") : undefined
-
-  return {
-    systemPrompt,
-    userParts: lastUserParts,
-  }
-}
-
-/**
- * Format a full conversation prompt as a single message for session replay.
- *
- * Used when resetting a session (revert/fork): the AI SDK prompt contains
- * the full conversation history, but kiro-cli has no session state. We format
- * everything as a single user message with the history as context and the
- * last user message as the actual query.
- */
-function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
-  const systemParts: string[] = []
-  const historyParts: string[] = []
-  let lastUserMessage = ""
-
-  for (const message of prompt) {
-    if (message.role === "system") {
-      systemParts.push(message.content)
-      continue
-    }
-
-    if (message.role === "user") {
-      // Flush previous user message to history (if any)
-      if (lastUserMessage) {
-        historyParts.push(`User: ${lastUserMessage}`)
-      }
-      const parts: string[] = []
-      for (const part of message.content) {
-        if (part.type === "text") {
-          parts.push(part.text)
-          continue
-        }
-        if (part.type === "file" && isImageMediaType(part.mediaType)) {
-          parts.push(`[Image: ${normalizeMediaType(part.mediaType)}]`)
-        } else if (part.type === "file") {
-          parts.push(`[File: ${part.mediaType}]`)
-        }
-      }
-      lastUserMessage = parts.join("\n")
-      continue
-    }
-
-    if (message.role === "assistant") {
-      const parts: string[] = []
-      for (const part of message.content) {
-        if (part.type === "text") {
-          parts.push(part.text)
-        }
-        // Skip tool-call parts — including tool names primes the model
-        // to reference tools that may not be available in the new session.
-      }
-      if (parts.length > 0) {
-        historyParts.push(`Assistant: ${parts.join("\n")}`)
-      }
-      continue
-    }
-
-    // Skip tool-result messages entirely — they reference tool names
-    // and outputs that could mislead the model about available tools.
-    if (message.role === "tool") {
-      continue
-    }
-  }
-
-  const sections: string[] = []
-
-  if (systemParts.length > 0) {
-    sections.push(`<system_instructions>\n${systemParts.join("\n\n")}\n</system_instructions>`)
-  }
-
-  if (historyParts.length > 0) {
-    sections.push(`<context>\n${historyParts.join("\n\n")}\n</context>`)
-  }
-
-  sections.push(`Resume and act on the following message.\n\n${lastUserMessage}`)
-
-  return sections.join("\n\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -619,10 +493,31 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private ephemeralModel: KiroACPLanguageModel | null = null
 
+  /**
+   * History sync state per affinity key: hashes of the non-system messages
+   * the live kiro session has already received, and the system prompt it
+   * was given. See `src/history-sync.ts`.
+   */
+  private readonly sync: HistorySyncState
+
   constructor(modelId: string, config: KiroACPModelConfig) {
     this.modelId = modelId
     this.client = config.client
     this.config = config
+    this.sync = config.syncState ?? createHistorySyncState()
+    // Mock clients in tests may not implement this; production clients do.
+    this.client.onSessionInvalidated?.((sessionId) => this.handleSessionInvalidated(sessionId))
+  }
+
+  /**
+   * kiro cleared a session's history (`/clear` from another client, or a
+   * kiro-side reset). The mirror is stale: forget the delivered prefix and
+   * the persisted mapping so the next turn replays into a fresh session.
+   */
+  private handleSessionInvalidated(sessionId: string): void {
+    for (const affinity of invalidateSession(this.sync, sessionId)) {
+      clearPersistedSession(this.client.getCwd(), affinity)
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -685,7 +580,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private async acquireSession(
     tools?: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
-  ): Promise<ACPSession> {
+  ): Promise<{ session: ACPSession; created: boolean }> {
     // Write tools BEFORE creating the session so the MCP bridge
     // has them from the very first `tools/list` query.
     let toolsFilePath: string | undefined
@@ -723,7 +618,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
           }
           persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
-          return loaded
+          return { session: loaded, created: false }
         } catch (err) {
           // Fall through to persisted session or create new
         }
@@ -744,10 +639,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
               this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
             }
             persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
-            return session
+            return { session, created: false }
           }
         } catch (err: unknown) {
-          // Fall through to create new session
+          // kiro-cli evicted the session (TTL, version change). Create new.
+          clearPersistedSession(this.client.getCwd(), this.currentAffinityId)
         }
       }
     }
@@ -771,7 +667,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       persistSession(this.client.getCwd(), session.sessionId, this.currentAffinityId)
     }
 
-    return session
+    return { session, created: true }
   }
 
   /**
@@ -871,7 +767,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * Used when session/load fails and we need to rehydrate from the consumer's history.
    */
   async injectContext(summary: string): Promise<void> {
-    const session = await this.acquireSession()
+    const { session } = await this.acquireSession()
 
     try {
       await this.client.prompt({
@@ -915,6 +811,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const toolsData: MCPToolsFile = {
       tools: newTools,
       cwd: this.client.getCwd(),
+      pid: process.pid,
       ...(ipcPort != null ? { ipcPort } : {}),
       ...(ipcSecret ? { ipcSecret } : {}),
     }
@@ -1187,12 +1084,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       return this.doStreamIsolated(options, affinityId)
     }
 
-    // Session reset: clear persisted mapping so acquireSession() creates a fresh session
-    const reset = options.headers?.["x-session-reset"] === "true"
-    if (reset && affinityId) {
-      clearPersistedSession(this.client.getCwd(), affinityId)
-    }
-
     const toolResults = this.extractToolResults(options.prompt)
 
     if (toolResults.length > 0) {
@@ -1202,7 +1093,57 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       }
     }
 
-    return this.startFreshPrompt(options, reset)
+    // Host-requested reset (`x-session-reset`) always replays. Otherwise the
+    // delivered prefix for this affinity decides between delta and replay.
+    const forceReset = options.headers?.["x-session-reset"] === "true"
+    if (affinityId) this.seedSyncFromDisk(affinityId)
+    const nonSystem = nonSystemMessages(options.prompt)
+    const plan = planSync(
+      affinityId ? this.sync.delivered.get(affinityId) : undefined,
+      hashPromptMessages(options.prompt),
+      nonSystem.map((m) => m.role),
+      forceReset || !affinityId,
+    )
+
+    return this.startFreshPrompt(options, plan)
+  }
+
+  /**
+   * First call for an affinity in this process: pick up what the persisted
+   * kiro session already saw so a restart continues instead of replaying.
+   */
+  private seedSyncFromDisk(affinityId: string): void {
+    if (this.sync.delivered.has(affinityId)) return
+    const persisted = loadPersistedSession(this.client.getCwd(), affinityId)
+    if (!persisted?.delivered) return
+    this.sync.delivered.set(affinityId, persisted.delivered)
+    this.sync.system.set(affinityId, { hash: persisted.systemHash, delivered: true })
+  }
+
+  /**
+   * Remember what the live kiro session has now seen. Called right after a
+   * prompt is dispatched (not when it resolves): kiro has the message either
+   * way. Also called on tool-result resumes, because the assistant tool-call
+   * and tool-result messages OpenCode appends came out of kiro itself.
+   * `systemHash === null` keeps the previously recorded system state.
+   */
+  private recordDelivery(
+    sessionId: string,
+    prompt: LanguageModelV3Prompt,
+    systemHash: string | undefined | null,
+  ): void {
+    const affinityId = this.currentAffinityId
+    if (!affinityId) return
+    const delivered = hashPromptMessages(prompt)
+    this.sync.delivered.set(affinityId, delivered)
+    this.sync.sessions.set(affinityId, sessionId)
+    if (systemHash !== null) {
+      this.sync.system.set(affinityId, { hash: systemHash, delivered: true })
+    }
+    persistSession(this.client.getCwd(), sessionId, affinityId, {
+      delivered,
+      systemHash: this.sync.system.get(affinityId)?.hash,
+    })
   }
 
   // -------------------------------------------------------------------------
@@ -1229,6 +1170,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         // Propagate the provider default so ephemeral turns inherit it.
         effort: this.config.effort,
         stall: this.config.stall,
+        syncState: this.sync,
       })
     }
     return this.ephemeralModel.doStream(options)
@@ -1261,6 +1203,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         // Propagate the provider default so subagent turns inherit it.
         effort: this.config.effort,
         stall: this.config.stall,
+        syncState: this.sync,
       })
       entry = { client, model, timer: null }
       this.subClients.set(affinityId, entry)
@@ -1788,20 +1731,26 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           //   reported no session metadata at all, in which case it is the
           //   only key under `kiro`.
           const turnWallMs = Date.now() - promptStartedAt
+          const compaction = this.client.takeCompaction?.(sessionId)
           writePart({
             type: "finish",
             finishReason: mapStopReason(result.stopReason),
             usage: estimateUsage(outputCharCount, metadata?.contextUsagePercentage, this.config.contextWindow ?? 1_000_000),
             providerMetadata: {
-              kiro: metadata
-                ? {
-                    contextUsagePercentage: metadata.contextUsagePercentage ?? null,
-                    turnDurationMs: metadata.turnDurationMs ?? null,
-                    turnWallMs,
-                    credits: creditEntry?.value ?? null,
-                    creditsUnit: creditEntry?.unit ?? null,
-                  }
-                : { turnWallMs },
+              kiro: {
+                ...(metadata
+                  ? {
+                      contextUsagePercentage: metadata.contextUsagePercentage ?? null,
+                      turnDurationMs: metadata.turnDurationMs ?? null,
+                      turnWallMs,
+                      credits: creditEntry?.value ?? null,
+                      creditsUnit: creditEntry?.unit ?? null,
+                    }
+                  : { turnWallMs }),
+                ...(compaction
+                  ? { compaction: { at: compaction.at, status: compaction.status, error: compaction.error ?? null } }
+                  : {}),
+              },
             },
           })
 
@@ -1873,39 +1822,29 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
   private async startFreshPrompt(
     options: LanguageModelV3CallOptions,
-    reset = false,
+    requested: SyncPlan,
   ): Promise<LanguageModelV3StreamResult> {
-    const session = await this.acquireSession(options.tools)
+    const affinityId = this.currentAffinityId
+    if (requested.mode === "replay" && affinityId) {
+      clearPersistedSession(this.client.getCwd(), affinityId)
+    }
+
+    const { session, created } = await this.acquireSession(options.tools)
+    // A CONTINUE plan assumes the kiro session that saw the prefix is still
+    // there. If kiro-cli evicted it we got a fresh one, which has seen nothing.
+    // `start === 0` is a first turn: nothing was delivered, so nothing to replay.
+    const plan: SyncPlan = created && requested.mode === "continue" && requested.start > 0
+      ? { mode: "replay", start: 0 }
+      : requested
     await this.ensureModel(session)
     await this.ensureEffort(session, this.resolveRequestedEffort(options))
 
-    let promptBlocks: ContentBlock[]
-
-    const hasHistory = reset && options.prompt.some(
-      (m) => m.role === "assistant" || m.role === "tool",
-    )
-
-    if (hasHistory) {
-      const compositeText = formatConversationReplay(options.prompt)
-      promptBlocks = [{ type: "text", text: compositeText }]
-    } else {
-      const { systemPrompt, userParts } = extractPrompt(options.prompt)
-      const hasImages = userParts.some((p) => p.type === "image")
-
-      if (hasImages) {
-        // Mixed content: send system prompt + user parts as separate blocks
-        promptBlocks = systemPrompt
-          ? [{ type: "text" as const, text: `<system_instructions>\n${systemPrompt}\n</system_instructions>` }, ...userParts]
-          : [...userParts]
-      } else {
-        // Text-only: combine into single ContentBlock (original behavior kiro-cli expects)
-        const userText = userParts.map((p) => p.text ?? "").join("\n")
-        const compositeText = systemPrompt
-          ? `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${userText}`
-          : userText
-        promptBlocks = [{ type: "text", text: compositeText }]
-      }
-    }
+    // A fresh kiro session has seen no system prompt, whatever the map says.
+    const systemState: SystemState = affinityId && plan.mode === "continue" && !created
+      ? (this.sync.system.get(affinityId) ?? { hash: undefined, delivered: false })
+      : { hash: undefined, delivered: false }
+    const built = buildPromptBlocks(options.prompt, plan, systemState)
+    const promptBlocks = built.blocks
 
     const sessionId = session.sessionId
 
@@ -1946,6 +1885,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     })
 
     attachPromise(promptPromise)
+    this.recordDelivery(sessionId, options.prompt, built.systemHash)
+    debugLogDispatch(this.modelId, sessionId, plan.mode, created, promptBlocks)
 
     const bodyText = promptBlocks
       .map((b) => b.type === "text" ? b.text : `[Image: ${b.mimeType}]`)
@@ -2008,6 +1949,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       }
 
       attachPromise(turn.promptPromise)
+      this.recordDelivery(sessionId, options.prompt, null)
+      debugLogDispatch(this.modelId, sessionId, "resume", false, [])
 
       return {
         stream: readable,
@@ -2119,6 +2062,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     })
 
     attachPromise(followUpPromise)
+    this.recordDelivery(sessionId, options.prompt, null)
+    debugLogDispatch(this.modelId, sessionId, "resume", false, followUpBlocks)
 
     return {
       stream: readable,

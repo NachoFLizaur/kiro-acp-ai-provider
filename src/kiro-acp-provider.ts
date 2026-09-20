@@ -2,6 +2,7 @@ import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { ACPClient, type ACPClientOptions, type PermissionRequest, type PermissionDecision } from "./acp-client"
 import { KiroACPLanguageModel, type KiroACPStallSettings } from "./kiro-acp-model"
 import type { KiroEffort } from "./kiro-effort"
+import { createHistorySyncState } from "./history-sync"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -115,6 +116,7 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
   // cross-model continuation within one session is detected correctly —
   // one shared map per provider, never per model.
   const affinityPrompts = new Map<string, string[]>()
+  const syncState = createHistorySyncState()
 
   const createModel = (modelId: string, overrides?: KiroACPModelOverrides): LanguageModelV3 => {
     const model = new KiroACPLanguageModel(modelId, {
@@ -136,6 +138,7 @@ export function createKiroAcp(settings: KiroACPProviderSettings = {}): KiroACPPr
       stall: settings.stall,
       getEphemeralClient,
       affinityPrompts,
+      syncState,
     })
     lastModel = model
     return model

@@ -13,7 +13,8 @@ import type { ChildProcess } from "node:child_process"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
 import { createInterface } from "node:readline"
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, utimesSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 
@@ -274,6 +275,81 @@ describe("ACPClient", () => {
       )
 
       expect(onExtension).toHaveBeenCalledWith("custom/notification", { foo: "bar" })
+    })
+
+    test("_kiro.dev/compaction/status marks the session; takeCompaction returns it once", () => {
+      const onExtension = mock(() => {})
+      const client = new ACPClient({ cwd: "/tmp", onExtension })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      handleLine(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "_kiro.dev/compaction/status",
+        params: { sessionId: "sess-1", status: { type: "completed" }, summary: "..." },
+      }))
+
+      expect(onExtension).toHaveBeenCalledTimes(1)
+      const marker = client.takeCompaction("sess-1")
+      expect(marker?.status).toBe("completed")
+      expect(typeof marker?.at).toBe("number")
+      expect(client.takeCompaction("sess-1")).toBeUndefined()
+      expect(client.takeCompaction("sess-2")).toBeUndefined()
+    })
+
+    test("compaction marker survives a later _kiro.dev/metadata overwrite", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+
+      handleLine(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "_kiro.dev/compaction/status",
+        params: { sessionId: "sess-1", status: { type: "failed", error: "boom" } },
+      }))
+      handleLine(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "_kiro.dev/metadata",
+        params: { sessionId: "sess-1", contextUsagePercentage: 3 },
+      }))
+
+      expect(client.getMetadata("sess-1")?.contextUsagePercentage).toBe(3)
+      expect(client.takeCompaction("sess-1")).toMatchObject({ status: "failed", error: "boom" })
+    })
+
+    test("compaction/status without sessionId resolves to the only live prompt session", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const handleLine = (client as any).handleLine.bind(client)
+      client.setPromptCallback("only-sess", () => {})
+
+      handleLine(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "_kiro.dev/compaction/status",
+        params: { status: { type: "completed" } },
+      }))
+
+      expect(client.takeCompaction("only-sess")?.status).toBe("completed")
+    })
+
+    test("_kiro.dev/clear/status notifies onSessionInvalidated listeners and still forwards", () => {
+      const onExtension = mock(() => {})
+      const client = new ACPClient({ cwd: "/tmp", onExtension })
+      const handleLine = (client as any).handleLine.bind(client)
+      const seen: string[] = []
+      const unsubscribe = client.onSessionInvalidated((id) => seen.push(id))
+
+      handleLine(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "_kiro.dev/clear/status",
+        params: { sessionId: "sess-9" },
+      }))
+      unsubscribe()
+      handleLine(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "_kiro.dev/clear/status",
+        params: { sessionId: "sess-10" },
+      }))
+
+      expect(seen).toEqual(["sess-9"])
+      expect(onExtension).toHaveBeenCalledTimes(2)
     })
   })
 
@@ -1263,5 +1339,75 @@ describe("generateAgentConfig consumer-agnostic", () => {
     expect(servers1[0]).not.toBe(servers2[0])
     expect(servers1[0]).toBe("kiro-acp-tools-aaaaaaaa")
     expect(servers2[0]).toBe("kiro-acp-tools-bbbbbbbb")
+  })
+})
+
+describe("ACPClient start() - stale tools file sweep", () => {
+  let spies: ReturnType<typeof installChildProcessSpies>
+  let tmpRoot: string
+  let originalTmpdir: string | undefined
+  let cwd: string
+
+  beforeEach(() => {
+    resetMcpTimeoutSettingMemo()
+    tmpRoot = mkdtempSync(join(tmpdir(), "acp-tools-sweep-"))
+    originalTmpdir = process.env.TMPDIR
+    process.env.TMPDIR = tmpRoot
+    cwd = mkdtempSync(join(tmpRoot, "cwd-"))
+    mkdirSync(join(tmpRoot, "kiro-acp"), { recursive: true })
+  })
+
+  afterEach(() => {
+    spies?.restore()
+    resetMcpTimeoutSettingMemo()
+    if (originalTmpdir !== undefined) process.env.TMPDIR = originalTmpdir
+    else delete process.env.TMPDIR
+    rmSync(tmpRoot, { recursive: true, force: true })
+  })
+
+  function aged(name: string, ageMs: number, content: object): string {
+    const path = join(tmpRoot, "kiro-acp", name)
+    writeFileSync(path, JSON.stringify(content))
+    const t = new Date(Date.now() - ageMs)
+    utimesSync(path, t, t)
+    return path
+  }
+
+  test("removes dead-pid and day-old files, keeps live, own and unrelated files", async () => {
+    spies = installChildProcessSpies()
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid
+    const dead = aged("tools-abcd1234-dead.json", 60_000, { tools: [], pid: deadPid })
+    const old = aged("tools-abcd1234-old.json", 25 * 60 * 60 * 1000, { tools: [], pid: process.pid })
+    const live = aged("tools-abcd1234-live.json", 60_000, { tools: [], pid: process.pid })
+    const legacyFresh = aged("tools-abcd1234-legacy.json", 60_000, { tools: [] })
+    const unrelated = aged("notes-abcd1234-dead.json", 60_000, { pid: deadPid })
+    const wrongExt = aged("tools-abcd1234-dead.json.bak", 60_000, { pid: deadPid })
+
+    const client = new ACPClient({ cwd })
+    const own = client.createSessionToolsFilePath("mine")
+    writeFileSync(own, JSON.stringify({ tools: [], pid: deadPid }))
+
+    await client.start(own)
+    const ownSurvivedSweep = existsSync(own)
+    await client.stop()
+
+    expect(existsSync(dead)).toBe(false)
+    expect(existsSync(old)).toBe(false)
+    expect(existsSync(live)).toBe(true)
+    expect(existsSync(legacyFresh)).toBe(true)
+    expect(existsSync(unrelated)).toBe(true)
+    expect(existsSync(wrongExt)).toBe(true)
+    expect(ownSurvivedSweep).toBe(true)
+  })
+
+  test("start still succeeds when the tools dir is missing", async () => {
+    spies = installChildProcessSpies()
+    rmSync(join(tmpRoot, "kiro-acp"), { recursive: true, force: true })
+
+    const client = new ACPClient({ cwd })
+    await client.start()
+    await client.stop()
+
+    expect(spies.spawnCalls).toHaveLength(1)
   })
 })

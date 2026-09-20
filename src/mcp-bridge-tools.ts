@@ -20,5 +20,7 @@ export interface MCPToolsFile {
   cwd?: string
   ipcPort?: number
   ipcSecret?: string
+  /** Writing process; lets the start-up sweep reclaim files of dead processes. */
+  pid?: number
 }
 

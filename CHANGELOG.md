@@ -8,6 +8,47 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file was introduced after 3.1.0 was published; the 3.1.0 entry below is
 retroactive and earlier releases are recorded by their git tags only.
 
+## [Unreleased]
+
+### Added
+
+- History sync (`src/history-sync.ts`): the provider tracks which messages
+  each kiro session has received, keyed by `x-session-affinity`, and sends
+  only the new tail of the conversation on each call. Divergence (compaction,
+  edited or reverted history, fork, cleared kiro session, unknown state)
+  creates a new kiro session and replays the full history with tool calls
+  and results. The system prompt is sent once per kiro session as
+  `<system_instructions>` and again only on change as `<system-update>`.
+- The delivered prefix is persisted next to the session mapping
+  (`delivered`, `systemHash` in the session file), so a host restart
+  continues the same kiro session without a replay.
+- `KIRO_ACP_DEBUG_FILE` now also logs one record per dispatched prompt
+  (`mode`, `newSession`, block sizes and a 200-char head).
+- `providerMetadata.kiro.compaction = { at, status, error }` on the finish
+  following a kiro-side `_kiro.dev/compaction/status`. `ACPClient.takeCompaction`
+  and `ACPClient.onSessionInvalidated` expose the two signals.
+- `mapStopReason`: `refusal` → `content-filter`, `max_turn_requests` → `stop`.
+- Agent configs and tools files carry `pid`; on start the provider removes
+  files whose process is dead or that are older than 24h (was 7 days, age
+  only).
+- `test/integration/compaction-roundtrip.ts`: real kiro-cli proof that the
+  turn after an OpenCode-style compaction still has the compacted context.
+
+### Changed
+
+- A first call carrying assistant history no longer triggers a header-level
+  reset; the delivered-prefix tracking decides. `x-session-reset` is still
+  honoured as a forced replay.
+- A call without `x-session-affinity` replays the full history into a
+  one-shot session instead of sending only the last user message.
+- Replay text uses `[User]`, `[Assistant]`, `[Assistant tool call]` and
+  `[Tool result]` labels; the `<context>` wrapper is gone.
+
+### Removed
+
+- `extractPrompt` and `formatConversationReplay` in `src/kiro-acp-model.ts`,
+  replaced by `src/prompt-serializer.ts`.
+
 ## [3.2.0] - 2026-09-04
 
 ### Added

@@ -10,6 +10,15 @@ import { homedir } from "node:os"
 export interface PersistedSession {
   kiroSessionId: string
   lastUsed: number
+  /** `hashPromptMessages` output at the last dispatch to this kiro session. */
+  delivered?: string[]
+  /** sha1 of the system prompt text last delivered to this kiro session. */
+  systemHash?: string
+}
+
+export interface DeliveredState {
+  delivered: string[]
+  systemHash?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -44,8 +53,19 @@ export function getSessionFilePath(cwd: string, affinityId?: string): string {
 // Persist / Load
 // ---------------------------------------------------------------------------
 
-/** Persist a session ID to disk (best-effort, failures silently ignored). */
-export function persistSession(cwd: string, sessionId: string, affinityId?: string): void {
+/**
+ * Persist a session ID to disk (best-effort, failures silently ignored).
+ *
+ * Without `state`, the delivered prefix already on disk is kept when the
+ * kiro session id is unchanged (touching `lastUsed` must not forget what the
+ * session has seen). A different session id starts with no prefix.
+ */
+export function persistSession(
+  cwd: string,
+  sessionId: string,
+  affinityId?: string,
+  state?: DeliveredState,
+): void {
   try {
     const filePath = getSessionFilePath(cwd, affinityId)
     const dir = join(filePath, "..")
@@ -54,11 +74,26 @@ export function persistSession(cwd: string, sessionId: string, affinityId?: stri
       kiroSessionId: sessionId,
       lastUsed: Date.now(),
     }
+    const carried = state ?? carriedState(filePath, sessionId)
+    if (carried) {
+      data.delivered = carried.delivered
+      if (carried.systemHash !== undefined) data.systemHash = carried.systemHash
+    }
     const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
     writeFileSync(tmpPath, JSON.stringify(data), { mode: 0o600 })
     renameSync(tmpPath, filePath)
   } catch {
     // Best-effort
+  }
+}
+
+function carriedState(filePath: string, sessionId: string): DeliveredState | undefined {
+  try {
+    const existing = JSON.parse(readFileSync(filePath, "utf-8")) as PersistedSession
+    if (existing.kiroSessionId !== sessionId || !Array.isArray(existing.delivered)) return undefined
+    return { delivered: existing.delivered, systemHash: existing.systemHash }
+  } catch {
+    return undefined
   }
 }
 
@@ -86,6 +121,8 @@ export function loadPersistedSession(cwd: string, affinityId?: string): Persiste
 
     if (Date.now() - data.lastUsed > SESSION_TTL_MS) return null
     if (!data.kiroSessionId || typeof data.kiroSessionId !== "string") return null
+    if (data.delivered !== undefined && !Array.isArray(data.delivered)) delete data.delivered
+    if (data.systemHash !== undefined && typeof data.systemHash !== "string") delete data.systemHash
 
     return data
   } catch {

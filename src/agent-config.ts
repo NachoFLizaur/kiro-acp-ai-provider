@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, renameSync, unlinkSync, readdirSync, statSync } from "node:fs"
+import { mkdirSync, writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync, statSync } from "node:fs"
 import { randomBytes } from "node:crypto"
 import { join, dirname, basename } from "node:path"
 
@@ -38,7 +38,7 @@ export function agentConfigPath(dir: string, name: string, instanceId?: string):
 }
 
 /** Agent config files older than this are considered abandoned by the sweep. */
-const STALE_AGENT_CONFIG_MS = 7 * 24 * 60 * 60 * 1000
+const STALE_AGENT_CONFIG_MS = 24 * 60 * 60 * 1000
 
 /**
  * Filename pattern for the stale sweep. Matches the DEFAULT agent name
@@ -125,7 +125,9 @@ export function writeAgentConfig(
 
   mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 })
   const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`
-  writeFileSync(tmpPath, JSON.stringify(config, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 })
+  // `pid` lets the sweep reclaim configs of dead processes; kiro-cli ignores unknown keys.
+  const withPid = { ...config, pid: process.pid }
+  writeFileSync(tmpPath, JSON.stringify(withPid, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 })
   renameSync(tmpPath, filePath)
 
   sweepStaleAgentConfigs(dirname(filePath), filePath)
@@ -151,35 +153,64 @@ export function removeAgentConfig(dir: string, name: string, instanceId?: string
 /**
  * Remove abandoned agent configs from `agentsDir`.
  *
- * Safety invariant: a file is deleted only when BOTH hold -
- * 1. its name matches `opencode-*.json` (the default agent name plus an
- *    instance suffix; custom agent names are never swept), and
- * 2. its modification time is more than 7 days old.
- *
- * The age gate is what protects other live clients: every running client
- * wrote its config during the current process lifetime, far under 7 days, so
- * only files left behind by crashed or killed processes qualify. The file at
- * `keepPath` (the one just written) is always skipped as an extra guard.
+ * A file is deleted only when its name matches `opencode-*.json` (the default
+ * agent name plus an instance suffix; custom agent names are never swept) AND
+ * `isStaleFile` says so: the writing process is dead, or the file is older
+ * than 24h. The file at `keepPath` (the one just written) is always skipped.
  *
  * Does not recurse, does not follow other patterns, never throws.
  */
 function sweepStaleAgentConfigs(agentsDir: string, keepPath: string): void {
+  sweepStaleFiles(agentsDir, STALE_AGENT_CONFIG_PATTERN, new Set([keepPath]), STALE_AGENT_CONFIG_MS)
+}
+
+/** `process.kill(pid, 0)` probes without signalling. ESRCH means gone; EPERM means alive but not ours. */
+export function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+/**
+ * A JSON file written by this package is stale when its `pid` field names a
+ * dead process, or when it is older than `maxAgeMs`. Files without a `pid`
+ * (older versions) fall back to the age rule alone. Files owned by this
+ * process are stale only by age.
+ */
+export function isStaleFile(filePath: string, maxAgeMs: number, now = Date.now()): boolean {
+  const info = statSync(filePath)
+  if (!info.isFile()) return false
+  if (info.mtimeMs < now - maxAgeMs) return true
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, "utf-8")) as { pid?: unknown }
+    if (typeof parsed.pid !== "number") return false
+    return !isPidAlive(parsed.pid)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Delete files in `dir` whose name matches `pattern` and that `isStaleFile`
+ * flags, except those in `keep`. Never throws.
+ */
+export function sweepStaleFiles(dir: string, pattern: RegExp, keep: Set<string>, maxAgeMs: number): void {
   let entries: string[]
   try {
-    entries = readdirSync(agentsDir)
+    entries = readdirSync(dir)
   } catch {
     return
   }
 
-  const cutoff = Date.now() - STALE_AGENT_CONFIG_MS
   for (const entry of entries) {
-    if (!STALE_AGENT_CONFIG_PATTERN.test(entry)) continue
-    const candidate = join(agentsDir, entry)
-    if (candidate === keepPath) continue
+    if (!pattern.test(entry)) continue
+    const candidate = join(dir, entry)
+    if (keep.has(candidate)) continue
     try {
-      const info = statSync(candidate)
-      if (!info.isFile() || info.mtimeMs >= cutoff) continue
-      unlinkSync(candidate)
+      if (isStaleFile(candidate, maxAgeMs)) unlinkSync(candidate)
     } catch {
       // Vanished between readdir and stat, or not removable; skip it.
     }

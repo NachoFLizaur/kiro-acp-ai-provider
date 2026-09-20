@@ -9,7 +9,7 @@ import { dirname, join, isAbsolute } from "node:path"
 import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { getXdgDataHome } from "./session-storage"
-import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig, removeAgentConfig } from "./agent-config"
+import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig, removeAgentConfig, sweepStaleFiles } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 import type { KiroEffort } from "./kiro-effort"
@@ -91,6 +91,15 @@ export interface SessionMetadata {
   contextUsagePercentage?: number
   meteringUsage?: Array<{ unit: string; unitPlural: string; value: number }>
   turnDurationMs?: number
+  /** Set when kiro compacted its own history (`_kiro.dev/compaction/status`); consumed by the next finish. */
+  compaction?: KiroCompaction
+}
+
+export interface KiroCompaction {
+  at: number
+  /** `status.type` as sent by kiro-cli, e.g. "completed". */
+  status: string
+  error?: string
 }
 
 export interface ACPClientOptions {
@@ -243,6 +252,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 300_000 // 5 minutes (prompts can be long)
 const INITIALIZE_TIMEOUT_MS = 30_000
 const STOP_TIMEOUT_MS = 10_000
 const SETTINGS_EXEC_TIMEOUT_MS = 5_000
+const STALE_TOOLS_FILE_MS = 24 * 60 * 60 * 1000
+const STALE_TOOLS_FILE_PATTERN = /^tools-[a-f0-9]+-[a-zA-Z0-9_-]+\.json$/
 
 /**
  * Memo for `kiro-cli settings mcp.noInteractiveTimeout <value>`, keyed by the
@@ -326,6 +337,7 @@ export class ACPClient {
   private nextId = 0
   private readonly pending = new Map<number, PendingRequest>()
   private readonly metadata = new Map<string, SessionMetadata>()
+  private readonly invalidationListeners = new Set<(sessionId: string) => void>()
   private readonly promptCallbacks = new Map<string, (update: SessionUpdate) => void>()
   private running = false
   startedToolless = false
@@ -406,6 +418,8 @@ export class ACPClient {
     if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
       throw new KiroACPError(`cwd is not a directory: ${cwd}`, -1)
     }
+
+    this.sweepStaleToolsFiles(toolsFilePath)
 
     // IPC server must start BEFORE setupAgentConfig so we have the port
     this.ipcServer = createIPCServer()
@@ -756,6 +770,26 @@ export class ACPClient {
     return [...this.metadata.values()]
   }
 
+  /** Return and clear the pending kiro compaction marker for a session. */
+  takeCompaction(sessionId: string): KiroCompaction | undefined {
+    const entry = this.metadata.get(sessionId)
+    const compaction = entry?.compaction
+    if (entry && compaction) delete entry.compaction
+    return compaction
+  }
+
+  /**
+   * Subscribe to kiro-side history invalidation (`_kiro.dev/clear/status`).
+   * The session still exists but has forgotten everything delivered to it.
+   * Returns an unsubscribe function.
+   */
+  onSessionInvalidated(listener: (sessionId: string) => void): () => void {
+    this.invalidationListeners.add(listener)
+    return () => {
+      this.invalidationListeners.delete(listener)
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Health
   // -------------------------------------------------------------------------
@@ -841,6 +875,18 @@ export class ACPClient {
     const filePath = join(toolsDir, `tools-${cwdHash}-${sessionUniqueId}.json`)
     this.sessionToolsFiles.add(filePath)
     return filePath
+  }
+
+  /**
+   * Reclaim tools files left behind by dead or day-old processes. Files this
+   * client knows about (and the one being started with) are never touched;
+   * other live processes are protected by the `pid` field in each file.
+   */
+  private sweepStaleToolsFiles(currentToolsFilePath?: string): void {
+    const keep = new Set<string>(this.sessionToolsFiles)
+    if (this.toolsFilePath) keep.add(this.toolsFilePath)
+    if (currentToolsFilePath) keep.add(currentToolsFilePath)
+    sweepStaleFiles(join(tmpdir(), "kiro-acp"), STALE_TOOLS_FILE_PATTERN, keep, STALE_TOOLS_FILE_MS)
   }
 
   removeSessionToolsFile(filePath: string): void {
@@ -1335,10 +1381,49 @@ export class ACPClient {
         break
       }
 
+      case "_kiro.dev/compaction/status":
+        this.handleCompactionStatus(params)
+        this.options.onExtension?.(msg.method, params)
+        break
+
+      case "_kiro.dev/clear/status": {
+        const sessionId = this.resolveNotificationSession(params)
+        if (sessionId) {
+          for (const listener of this.invalidationListeners) listener(sessionId)
+        }
+        this.options.onExtension?.(msg.method, params)
+        break
+      }
+
       default:
         this.options.onExtension?.(msg.method, params)
         break
     }
+  }
+
+  /**
+   * kiro-cli's TUI reads no `sessionId` from these notifications, so it may
+   * be absent. Fall back to the only session with a live prompt callback.
+   */
+  private resolveNotificationSession(params: Record<string, unknown>): string | undefined {
+    if (typeof params.sessionId === "string") return params.sessionId
+    if (this.promptCallbacks.size === 1) return this.promptCallbacks.keys().next().value
+    return undefined
+  }
+
+  /** Params shape (kiro-cli 2.22.1 TUI): `{ status: { type, error? }, summary? }`. */
+  private handleCompactionStatus(params: Record<string, unknown>): void {
+    const sessionId = this.resolveNotificationSession(params)
+    if (!sessionId) return
+    const status = params.status as { type?: unknown; error?: unknown } | undefined
+    if (!status || typeof status.type !== "string") return
+    const entry = this.metadata.get(sessionId) ?? { sessionId }
+    entry.compaction = {
+      at: Date.now(),
+      status: status.type,
+      ...(typeof status.error === "string" ? { error: status.error } : {}),
+    }
+    this.metadata.set(sessionId, entry)
   }
 
   private handleSessionUpdate(params: Record<string, unknown>): void {
@@ -1366,6 +1451,7 @@ export class ACPClient {
       contextUsagePercentage: params.contextUsagePercentage as number | undefined,
       meteringUsage: params.meteringUsage as SessionMetadata["meteringUsage"],
       turnDurationMs: params.turnDurationMs as number | undefined,
+      compaction: this.metadata.get(sessionId)?.compaction,
     })
   }
 }

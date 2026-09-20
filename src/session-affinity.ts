@@ -89,10 +89,10 @@ export function diverged(prev: string[], msgs: string[]): boolean {
  * - Toolless calls are "ephemeral": tracked under `<affinity>:ephemeral` and
  *   the `x-session-affinity` header is rewritten to that key so downstream
  *   bookkeeping isolates them from the tooled conversation.
- * - A reset (`x-session-reset: "true"`) is signaled when (a) the tracked
- *   key's new messages diverge from the previous prefix, or (b) the FIRST
- *   tracked call already contains assistant/tool history (e.g. the host
- *   restarted mid-conversation, or a fork/revert landed on a fresh key).
+ * - A reset (`x-session-reset: "true"`) is signaled when the tracked key's
+ *   new messages diverge from the previous prefix. A first call is never a
+ *   reset, even with assistant/tool history: history sync in the model owns
+ *   that decision (see `src/history-sync.ts`).
  * - Pure continuation on a non-ephemeral key returns the ORIGINAL options
  *   object untouched — preserves reference equality.
  *
@@ -113,8 +113,10 @@ export function interceptSessionAffinity(
 
   const msgs = hashPromptMessages(options.prompt)
   const prev = prompts.get(key)
-  const hasHistory = options.prompt.some((m) => m.role === "assistant" || m.role === "tool")
-  const reset = prev ? diverged(prev, msgs) : hasHistory
+  // A first call that already carries history (host restart, fork onto a new
+  // key) is NOT a reset here: the model's delivered-prefix tracking decides
+  // whether the persisted kiro session can continue or must be replayed.
+  const reset = prev ? diverged(prev, msgs) : false
   prompts.set(key, msgs)
 
   if (!reset && !ephemeral) return options
