@@ -4,10 +4,12 @@ import { join } from "node:path"
 import * as root from "../src/index"
 import * as ipc from "../src/ipc"
 import type {
+  AuthStatus,
   EffortOptionsResult,
   KiroEffort,
   ListModelsOptions,
   ModelWithEfforts,
+  VerifyAuthOptions,
 } from "../src/index"
 
 // ---------------------------------------------------------------------------
@@ -51,6 +53,27 @@ describe("root export surface", () => {
       .sort()
       .find((key) => key.startsWith("create"))
     expect(firstCreate).toBe("createKiroAcp")
+  })
+
+  test("logout detection surfaces are root exports that leave auto-discovery untouched", () => {
+    // Runtime values consumers match on and call
+    expect(root.KIRO_NOT_LOGGED_IN_REASON).toBe("not-logged-in")
+    expect(typeof root.isKiroNotLoggedInError).toBe("function")
+    expect(typeof root.stallReason).toBe("function")
+
+    // Type-only surfaces compile against the root
+    const options: VerifyAuthOptions = { fresh: true }
+    const status: AuthStatus = { installed: true, authenticated: false, inconclusive: true }
+    expect(options.fresh).toBe(true)
+    expect(status.inconclusive).toBe(true)
+
+    // None of the new keys start with "create"
+    const createKeys = Object.keys(root).filter((key) => key.startsWith("create"))
+    expect(createKeys).toEqual(["createKiroAcp"])
+  })
+
+  test("the auth cache reset helper stays off the root", () => {
+    expect("resetAuthCache" in root).toBe(false)
   })
 
   test("exports the required runtime model and one opaque effort contract", () => {

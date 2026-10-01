@@ -3,9 +3,12 @@ import {
   ACPClient,
   KiroACPError,
   KiroACPConnectionError,
+  KIRO_NOT_LOGGED_IN_REASON,
+  isKiroNotLoggedInError,
   resetMcpTimeoutSettingMemo,
   type ACPClientOptions,
 } from "../src/acp-client"
+import { resetAuthCache } from "../src/kiro-auth"
 import { generateAgentConfig, writeAgentConfig, agentConfigPath, type AgentConfigOptions } from "../src/agent-config"
 import { createIPCServer } from "../src/ipc-server"
 import * as childProcess from "node:child_process"
@@ -1263,5 +1266,184 @@ describe("generateAgentConfig consumer-agnostic", () => {
     expect(servers1[0]).not.toBe(servers2[0])
     expect(servers1[0]).toBe("kiro-acp-tools-aaaaaaaa")
     expect(servers2[0]).toBe("kiro-acp-tools-bbbbbbbb")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Not-logged-in marker. kiro-cli hangs silently on `initialize` / `session/new`
+// when it is not authenticated, so the request timeout for those two methods
+// consults whoami and, when it reports logged out, rejects with a KiroACPError
+// whose `data.reason` is the stable marker. Every other timeout is generic.
+// `isKiroNotLoggedInError` matches the marker first and falls back to the
+// package's own message phrases for consumers that only see a re-wrapped
+// message.
+// ---------------------------------------------------------------------------
+
+const WHOAMI_LOGGED_IN_JSON =
+  '{"accountType":"IamIdentityCenter","email":"user@example.com","region":"eu-west-1","startUrl":"https://d-0000000000.awsapps.com/start"}'
+
+/** Mock the sync kiro-cli spawn so the timeout handler's whoami probe is deterministic. */
+function mockSyncWhoami(whoami: string | Error, version: string | Error = "kiro-cli 2.7.1") {
+  const impl = (_file: string, args?: readonly string[]) => {
+    const argv = args ?? []
+    const result = argv.includes("--version") ? version : argv.includes("whoami") ? whoami : ""
+    if (result instanceof Error) throw result
+    return result
+  }
+  return spyOn(childProcess, "execFileSync").mockImplementation(
+    impl as unknown as typeof childProcess.execFileSync,
+  )
+}
+
+/**
+ * A client that looks running to `sendRequest` but whose stdin swallows every
+ * line, so any request runs into its timeout. Returns the private sender.
+ */
+function makeHangingClient(stderr = ""): (method: string, params: unknown, timeoutMs: number) => Promise<unknown> {
+  const client = new ACPClient({ cwd: "/tmp" })
+  ;(client as any).running = true
+  ;(client as any).process = { stdin: { writable: true, write: () => true } }
+  ;(client as any).stderrBuffer = stderr
+  return (method, params, timeoutMs) => (client as any).sendRequest(method, params, timeoutMs)
+}
+
+describe("not-logged-in marker on request timeouts", () => {
+  let whoamiSpy: { mockRestore: () => void } | undefined
+
+  beforeEach(resetAuthCache)
+
+  afterEach(() => {
+    whoamiSpy?.mockRestore()
+    whoamiSpy = undefined
+    resetAuthCache()
+  })
+
+  for (const method of ["initialize", "session/new"]) {
+    test(`${method} timeout with whoami logged out rejects with the marked KiroACPError`, async () => {
+      whoamiSpy = mockSyncWhoami('{"account":null}')
+      const sendRequest = makeHangingClient()
+
+      const rejection = await sendRequest(method, { cwd: "/tmp" }, 20).then(
+        () => undefined,
+        (err: unknown) => err,
+      )
+
+      expect(rejection).toBeInstanceOf(KiroACPError)
+      const error = rejection as KiroACPError
+      expect(error.message).toBe("Not logged in. Run 'kiro-cli login' to authenticate.")
+      expect(error.code).toBe(-1)
+      expect(error.data).toEqual({ reason: KIRO_NOT_LOGGED_IN_REASON })
+      expect(isKiroNotLoggedInError(error)).toBe(true)
+    })
+
+    for (const [status, whoami, version] of [
+      ["authenticated", WHOAMI_LOGGED_IN_JSON, undefined],
+      ["inconclusive (whoami timeout)", Object.assign(new Error("timed out"), { code: "ETIMEDOUT", signal: "SIGTERM" }), undefined],
+      ["inconclusive (whoami spawn failure)", Object.assign(new Error("spawn failed"), { code: "EACCES" }), undefined],
+      ["not installed", WHOAMI_LOGGED_IN_JSON, Object.assign(new Error("kiro-cli missing"), { code: "ENOENT" })],
+    ] as const) {
+      test(`${method} timeout stays generic without the marker when ${status}`, async () => {
+        whoamiSpy = mockSyncWhoami(whoami, version)
+        const sendRequest = makeHangingClient("service unavailable\n")
+
+        const rejection = await sendRequest(method, { cwd: "/tmp" }, 20).then(
+          () => undefined,
+          (err: unknown) => err,
+        )
+
+        expect(rejection).toBeInstanceOf(KiroACPError)
+        const error = rejection as KiroACPError
+        expect(error.message).toBe(`Request timed out after 20ms: ${method}\n\nkiro-cli stderr:\nservice unavailable`)
+        expect(error.code).toBe(-1)
+        expect(error.data).toBeUndefined()
+        expect(isKiroNotLoggedInError(error)).toBe(false)
+      })
+    }
+  }
+
+  test("a prompt timeout never consults whoami and carries no marker", async () => {
+    // Arrange: a logged-out whoami would mark the error if it were consulted
+    whoamiSpy = mockSyncWhoami('{"account":null}')
+    const sendRequest = makeHangingClient()
+
+    // Act
+    const rejection = await sendRequest("session/prompt", { sessionId: "sess-1" }, 20).then(
+      () => undefined,
+      (err: unknown) => err,
+    )
+
+    // Assert
+    expect(rejection).toBeInstanceOf(KiroACPError)
+    expect((rejection as KiroACPError).message).toContain("timed out")
+    expect(isKiroNotLoggedInError(rejection)).toBe(false)
+    expect(whoamiSpy).toBeDefined()
+    expect((whoamiSpy as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBe(0)
+  })
+
+  test("a -32603 response is mapped generically: no marker at the client boundary", async () => {
+    // Arrange: a pending request answered with the generic internal error
+    const client = new ACPClient({ cwd: "/tmp" })
+    const handleLine = (client as any).handleLine.bind(client)
+    let rejection: unknown
+    const pending = new Promise<void>((_resolve, reject) => {
+      ;(client as any).pending.set(41, { resolve: () => {}, reject, method: "session/prompt", timer: null })
+    }).catch((err: unknown) => {
+      rejection = err
+    })
+
+    // Act
+    handleLine(JSON.stringify({ jsonrpc: "2.0", id: 41, error: { code: -32603, message: "Internal error", data: { requestId: "r" } } }))
+    await pending
+
+    // Assert: code and data pass through untouched, no reason is invented
+    expect(rejection).toBeInstanceOf(KiroACPError)
+    expect((rejection as KiroACPError).code).toBe(-32603)
+    expect((rejection as KiroACPError).data).toEqual({ requestId: "r" })
+    expect(isKiroNotLoggedInError(rejection)).toBe(false)
+  })
+})
+
+describe("isKiroNotLoggedInError", () => {
+  test("the marker value is the documented string", () => {
+    expect(KIRO_NOT_LOGGED_IN_REASON).toBe("not-logged-in")
+  })
+
+  test("true for any object whose data.reason is the marker, regardless of message", () => {
+    expect(isKiroNotLoggedInError(new KiroACPError("anything", -32603, { reason: "not-logged-in" }))).toBe(true)
+    expect(isKiroNotLoggedInError({ data: { reason: "not-logged-in" } })).toBe(true)
+    expect(isKiroNotLoggedInError({ message: "unrelated", data: { reason: "not-logged-in", extra: 1 } })).toBe(true)
+  })
+
+  test("true for a { message } carrying either package phrase", () => {
+    expect(isKiroNotLoggedInError({ message: "Not logged in. Run 'kiro-cli login' to authenticate." })).toBe(true)
+    expect(
+      isKiroNotLoggedInError({
+        message: "Kiro could not complete the request and does not appear logged in. Run 'kiro-cli whoami' to check auth. Original: Internal error",
+      }),
+    ).toBe(true)
+    expect(isKiroNotLoggedInError(new Error("Not logged in. Run 'kiro-cli login' to authenticate."))).toBe(true)
+  })
+
+  test("true for a bare string carrying either phrase", () => {
+    expect(isKiroNotLoggedInError("Not logged in. Run 'kiro-cli login' to authenticate.")).toBe(true)
+    expect(isKiroNotLoggedInError("prefix: Kiro does not appear logged in. suffix")).toBe(true)
+  })
+
+  test("false for unrelated errors, timeouts and other reasons", () => {
+    expect(isKiroNotLoggedInError(new Error("Connection lost"))).toBe(false)
+    expect(isKiroNotLoggedInError(new KiroACPError("Request timed out after 30000ms: initialize"))).toBe(false)
+    expect(isKiroNotLoggedInError(new KiroACPError("Internal error", -32603, { reason: "throttled" }))).toBe(false)
+    expect(isKiroNotLoggedInError({ message: "Not logged in to Kiro" })).toBe(false)
+    expect(isKiroNotLoggedInError("logged in")).toBe(false)
+  })
+
+  test("false and never throws for non-error values", () => {
+    expect(isKiroNotLoggedInError(undefined)).toBe(false)
+    expect(isKiroNotLoggedInError(null)).toBe(false)
+    expect(isKiroNotLoggedInError(42)).toBe(false)
+    expect(isKiroNotLoggedInError({})).toBe(false)
+    expect(isKiroNotLoggedInError({ data: null })).toBe(false)
+    expect(isKiroNotLoggedInError({ data: "not-logged-in" })).toBe(false)
+    expect(isKiroNotLoggedInError({ message: 7 })).toBe(false)
   })
 })

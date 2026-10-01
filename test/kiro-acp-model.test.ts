@@ -1,7 +1,7 @@
 import { describe, test, expect, mock, beforeEach, spyOn } from "bun:test"
 import { KiroACPLanguageModel, type KiroACPModelConfig } from "../src/kiro-acp-model"
 import { resetAuthCache } from "../src/kiro-auth"
-import { KiroACPError, KiroACPConnectionError } from "../src/acp-client"
+import { KiroACPError, KiroACPConnectionError, KIRO_NOT_LOGGED_IN_REASON, isKiroNotLoggedInError } from "../src/acp-client"
 import type { ACPClient, ACPSession, SessionUpdate, PromptOptions } from "../src/acp-client"
 import type { IPCServer, PendingToolCall, ToolResultRequest } from "../src/ipc-server"
 import { LaneRouter } from "../src/lane-router"
@@ -16,18 +16,18 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import * as childProcess from "node:child_process"
 
-// `extractErrorMessage` corroborates -32603 via `verifyAuth()`, which spawns
+// `buildStreamError` corroborates -32603 via `verifyAuth()`, which spawns
 // `kiro-cli`. Mock execFileSync so the auth probe is deterministic (no real
-// kiro-cli spawn): `whoami --format json` returns the chosen fixture and
-// `--version` succeeds so kiro-cli reads as installed. Returns the spy.
+// kiro-cli spawn): each probe returns its fixture or throws its supplied error.
+// `--version` succeeds by default so kiro-cli reads as installed. Returns the spy.
 const WHOAMI_LOGGED_IN_LINE =
   '{"accountType":"IamIdentityCenter","email":"user@example.com","region":"eu-west-1","startUrl":"https://d-0000000000.awsapps.com/start"}'
-function mockWhoami(whoami: string) {
+function mockWhoami(whoami: string | Error, version: string | Error = "kiro-cli 2.7.1") {
   const impl = (_file: string, args?: readonly string[]) => {
     const argv = args ?? []
-    if (argv.includes("--version")) return "kiro-cli 2.7.1"
-    if (argv.includes("whoami")) return whoami
-    return ""
+    const result = argv.includes("--version") ? version : argv.includes("whoami") ? whoami : ""
+    if (result instanceof Error) throw result
+    return result
   }
   return spyOn(childProcess, "execFileSync").mockImplementation(
     impl as unknown as typeof childProcess.execFileSync,
@@ -256,16 +256,23 @@ describe("KiroACPLanguageModel", () => {
   })
 
   describe("model switching", () => {
-    test("calls setModel when modelId differs from session default", async () => {
+    test("applies a non-default model before prompts on two distinct sessions", async () => {
+      const events: string[] = []
+      let sessionCount = 0
       const client = createMockClient({
+        isRunning: mock(() => true),
         createSession: mock(() =>
           Promise.resolve({
-            sessionId: "sess-1",
+            sessionId: `sess-${++sessionCount}`,
             modes: { currentModeId: "agent", availableModes: [] },
             models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
           } satisfies ACPSession),
         ),
+        setModel: mock(async (sessionId: string, modelId: string) => {
+          events.push(`model:${sessionId}:${modelId}`)
+        }),
         prompt: mock(async (opts: PromptOptions) => {
+          events.push(`prompt:${opts.sessionId}`)
           opts.onUpdate({
             sessionUpdate: "agent_message_chunk",
             content: { text: "opus response" },
@@ -276,12 +283,17 @@ describe("KiroACPLanguageModel", () => {
 
       const model = new KiroACPLanguageModel("claude-opus-4.6", { client })
 
-      const result = await model.doStream(
-        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
-      )
-      await collectStream(result.stream)
+      const options = makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }])
+      await collectStream((await model.doStream(options)).stream)
+      await collectStream((await model.doStream(options)).stream)
 
-      expect(client.setModel).toHaveBeenCalledWith("sess-1", "claude-opus-4.6")
+      expect(client.setModel).toHaveBeenCalledTimes(2)
+      expect(events).toEqual([
+        "model:sess-1:claude-opus-4.6",
+        "prompt:sess-1",
+        "model:sess-2:claude-opus-4.6",
+        "prompt:sess-2",
+      ])
     })
 
     test("does not call setModel when modelId matches session default", async () => {
@@ -297,12 +309,131 @@ describe("KiroACPLanguageModel", () => {
 
       const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
 
-      const result = await model.doStream(
-        makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
-      )
-      await collectStream(result.stream)
+      const options = makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }])
+      await collectStream((await model.doStream(options)).stream)
+      await collectStream((await model.doStream(options)).stream)
 
+      expect(client.prompt).toHaveBeenCalledTimes(2)
       expect(client.setModel).not.toHaveBeenCalled()
+    })
+
+    test("reapplies a non-default model after the client stops and starts", async () => {
+      let running = false
+      let generation = 0
+      const events: string[] = []
+      const client = createMockClient({
+        isRunning: mock(() => running),
+        start: mock(async () => {
+          running = true
+          generation++
+          return {
+            agentInfo: { name: "kiro-cli", version: "1.0.0" },
+            agentCapabilities: {},
+          }
+        }),
+        stop: mock(async () => { running = false }),
+        createSession: mock(async () => ({
+          sessionId: `sess-process-${generation}`,
+          modes: { currentModeId: "agent", availableModes: [] },
+          models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+        } satisfies ACPSession)),
+        setModel: mock(async (sessionId: string, modelId: string) => {
+          events.push(`model:${sessionId}:${modelId}`)
+        }),
+        prompt: mock(async (opts: PromptOptions) => {
+          events.push(`prompt:${opts.sessionId}`)
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+      const model = new KiroACPLanguageModel("claude-opus-4.6", { client })
+      const options = makeCallOptions([{ role: "user", content: [{ type: "text", text: "hi" }] }])
+
+      await collectStream((await model.doStream(options)).stream)
+      await client.stop()
+      await collectStream((await model.doStream(options)).stream)
+
+      expect(client.stop).toHaveBeenCalledTimes(1)
+      expect(client.start).toHaveBeenCalledTimes(2)
+      expect(events).toEqual([
+        "model:sess-process-1:claude-opus-4.6",
+        "prompt:sess-process-1",
+        "model:sess-process-2:claude-opus-4.6",
+        "prompt:sess-process-2",
+      ])
+    })
+
+    test("reapplies model A after model B shares the same session", async () => {
+      const session: ACPSession = {
+        sessionId: "sess-shared",
+        modes: { currentModeId: "agent", availableModes: [] },
+        models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+      }
+      const models = session.models
+      const promptedModels: string[] = []
+      const client = createMockClient({
+        isRunning: mock(() => true),
+        createSession: mock(async () => session),
+        prompt: mock(async () => {
+          promptedModels.push(session.models.currentModelId)
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
+      const a = new KiroACPLanguageModel("claude-opus-4.6", { client })
+      const b = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const options = makeCallOptions([{ role: "user", content: [{ type: "text", text: "hi" }] }])
+
+      for (const model of [a, b, a]) {
+        await collectStream((await model.doStream(options)).stream)
+      }
+
+      expect(client.setModel).toHaveBeenCalledTimes(3)
+      expect(client.setModel).toHaveBeenNthCalledWith(1, "sess-shared", "claude-opus-4.6")
+      expect(client.setModel).toHaveBeenNthCalledWith(2, "sess-shared", "claude-sonnet-4.6")
+      expect(client.setModel).toHaveBeenNthCalledWith(3, "sess-shared", "claude-opus-4.6")
+      expect(promptedModels).toEqual(["claude-opus-4.6", "claude-sonnet-4.6", "claude-opus-4.6"])
+      expect(session.models).toBe(models)
+    })
+
+    test("sets the model when the session omits models and records it for later checks", async () => {
+      // Runtime session responses can omit models despite the static ACP type.
+      const session = {
+        sessionId: "sess-no-models",
+        modes: { currentModeId: "agent", availableModes: [] },
+      } as ACPSession
+      const client = createMockClient({
+        isRunning: mock(() => true),
+        createSession: mock(async () => session),
+      })
+      const model = new KiroACPLanguageModel("claude-opus-4.6", { client })
+      const options = makeCallOptions([{ role: "user", content: [{ type: "text", text: "hi" }] }])
+
+      await collectStream((await model.doStream(options)).stream)
+      await collectStream((await model.doStream(options)).stream)
+
+      expect(client.setModel).toHaveBeenCalledTimes(1)
+      expect(client.setModel).toHaveBeenCalledWith("sess-no-models", "claude-opus-4.6")
+      expect(session.models).toEqual({ currentModelId: "claude-opus-4.6", availableModels: [] })
+      expect(client.prompt).toHaveBeenCalledTimes(2)
+    })
+
+    test("propagates setModel rejection without changing the session or prompting", async () => {
+      const session: ACPSession = {
+        sessionId: "sess-failure",
+        modes: { currentModeId: "agent", availableModes: [] },
+        models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+      }
+      const failure = new Error("model switch failed")
+      const client = createMockClient({
+        createSession: mock(async () => session),
+        setModel: mock(async () => { throw failure }),
+      })
+      const model = new KiroACPLanguageModel("claude-opus-4.6", { client })
+      const options = makeCallOptions([{ role: "user", content: [{ type: "text", text: "hi" }] }])
+
+      await expect(model.doStream(options)).rejects.toBe(failure)
+
+      expect(session.models.currentModelId).toBe("claude-sonnet-4.6")
+      expect(client.prompt).not.toHaveBeenCalled()
     })
   })
 
@@ -405,11 +536,26 @@ describe("KiroACPLanguageModel", () => {
       expect(parts.find((p) => p.type === "error")).toBeUndefined()
     })
 
-    test("skips redundant setEffort when currentEffort matches", async () => {
-      const setEffort = mock(async () => ({ success: true, message: "ok" }))
+    test("applies the same requested effort before prompts on distinct sessions", async () => {
+      const events: string[] = []
+      let sessionCount = 0
+      const setEffort = mock(async (sessionId: string, effort: string) => {
+        events.push(`effort:${sessionId}:${effort}`)
+        return { success: true, message: "ok" }
+      })
+      const complete = completingPrompt()
       const client = createMockClient({
+        isRunning: mock(() => true),
+        createSession: mock(async () => ({
+          sessionId: `sess-${++sessionCount}`,
+          modes: { currentModeId: "agent", availableModes: [] },
+          models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+        } satisfies ACPSession)),
         setEffort,
-        prompt: completingPrompt(),
+        prompt: mock(async (opts: PromptOptions) => {
+          events.push(`prompt:${opts.sessionId}`)
+          return complete(opts)
+        }),
       } as unknown as Partial<ACPClient>)
 
       const model = new KiroACPLanguageModel("Runtime/Exact.ID", { client })
@@ -418,7 +564,83 @@ describe("KiroACPLanguageModel", () => {
       await collectStream((await model.doStream(effortRequest(effort))).stream)
       await collectStream((await model.doStream(effortRequest(effort))).stream)
 
-      expect(setEffort).toHaveBeenCalledTimes(1)
+      expect(setEffort).toHaveBeenCalledTimes(2)
+      expect(events).toEqual([
+        "effort:sess-1:Stable/Effort",
+        "prompt:sess-1",
+        "effort:sess-2:Stable/Effort",
+        "prompt:sess-2",
+      ])
+    })
+
+    test("reapplies high after another model sets medium on the same session", async () => {
+      let sessionEffort = "medium"
+      const promptedEfforts: string[] = []
+      const setEffort = mock(async (_sessionId: string, effort: string) => {
+        sessionEffort = effort
+        return { success: true, message: "ok" }
+      })
+      const complete = completingPrompt()
+      // The shared client returns sess-1 to both model instances.
+      const client = createMockClient({
+        isRunning: mock(() => true),
+        setEffort,
+        prompt: mock(async (opts: PromptOptions) => {
+          promptedEfforts.push(sessionEffort)
+          return complete(opts)
+        }),
+      } as unknown as Partial<ACPClient>)
+      const high = new KiroACPLanguageModel("Runtime/Exact.ID", { client, effort: "high" })
+      const medium = new KiroACPLanguageModel("Runtime/Exact.ID", { client, effort: "medium" })
+      const options = makeCallOptions([{ role: "user", content: [{ type: "text", text: "hi" }] }])
+
+      for (const model of [high, medium, high]) {
+        await collectStream((await model.doStream(options)).stream)
+      }
+
+      expect(setEffort).toHaveBeenCalledTimes(3)
+      expect(setEffort).toHaveBeenNthCalledWith(1, "sess-1", "high")
+      expect(setEffort).toHaveBeenNthCalledWith(2, "sess-1", "medium")
+      expect(setEffort).toHaveBeenNthCalledWith(3, "sess-1", "high")
+      expect(promptedEfforts).toEqual(["high", "medium", "high"])
+    })
+
+    test("reapplies configured effort after the client stops and starts a new process", async () => {
+      let running = false
+      let generation = 0
+      const setEffort = mock(async () => ({ success: true, message: "ok" }))
+      const client = createMockClient({
+        isRunning: mock(() => running),
+        start: mock(async () => {
+          running = true
+          generation++
+          return {
+            agentInfo: { name: "kiro-cli", version: "1.0.0" },
+            agentCapabilities: {},
+          }
+        }),
+        stop: mock(async () => { running = false }),
+        createSession: mock(async () => ({
+          sessionId: `sess-process-${generation}`,
+          modes: { currentModeId: "agent", availableModes: [] },
+          models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+        } satisfies ACPSession)),
+        setEffort,
+        prompt: completingPrompt(),
+      } as unknown as Partial<ACPClient>)
+      const model = new KiroACPLanguageModel("Runtime/Exact.ID", { client, effort: "high" })
+      const options = makeCallOptions([{ role: "user", content: [{ type: "text", text: "hi" }] }])
+
+      await collectStream((await model.doStream(options)).stream)
+      await client.stop()
+      await collectStream((await model.doStream(options)).stream)
+
+      expect(client.stop).toHaveBeenCalledTimes(1)
+      expect(client.start).toHaveBeenCalledTimes(2)
+      expect(client.prompt).toHaveBeenCalledTimes(2)
+      expect(setEffort).toHaveBeenCalledTimes(2)
+      expect(setEffort).toHaveBeenNthCalledWith(1, "sess-process-1", "high")
+      expect(setEffort).toHaveBeenNthCalledWith(2, "sess-process-2", "high")
     })
 
     test("does not throw when setEffort rejects (swallows the rejection)", async () => {
@@ -984,6 +1206,103 @@ describe("KiroACPLanguageModel", () => {
       } finally {
         spy.mockRestore()
       }
+    })
+
+    describe("not-logged-in marker on the stream error", () => {
+      /** The error part of a failed prompt, with auth probe outputs or failures supplied by the caller. */
+      async function streamError(thrown: unknown, whoami: string | Error, version?: string | Error): Promise<unknown> {
+        const spy = mockWhoami(whoami, version)
+        try {
+          const client = createMockClient({
+            prompt: mock(async () => {
+              throw thrown
+            }),
+          } as unknown as Partial<ACPClient>)
+          const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+          const result = await model.doStream(
+            makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+          )
+          const parts = await collectStream(result.stream)
+          const errorPart = parts.find((p) => p.type === "error")
+          expect(errorPart).toBeDefined()
+          return (errorPart as { error: unknown }).error
+        } finally {
+          spy.mockRestore()
+        }
+      }
+
+      test("corroborated -32603 is a KiroACPError carrying the reason next to the original data", async () => {
+        // Arrange / Act: whoami says logged out, kiro-cli's error carried its own data
+        const error = await streamError(
+          new KiroACPError("Internal error", -32603, { requestId: "req-7" }),
+          '{"account":null}',
+        )
+
+        // Assert: class, code and data survive at the stream boundary
+        expect(error).toBeInstanceOf(KiroACPError)
+        const acpError = error as KiroACPError
+        expect(acpError.code).toBe(-32603)
+        expect(acpError.data).toEqual({ requestId: "req-7", reason: KIRO_NOT_LOGGED_IN_REASON })
+        expect(acpError.message).toContain("does not appear logged in")
+        expect(acpError.message).toContain("Original: Internal error")
+        expect(isKiroNotLoggedInError(acpError)).toBe(true)
+      })
+
+      test("corroborated -32603 without original data still carries the reason", async () => {
+        const error = await streamError(new KiroACPError("Internal error", -32603), '{"account":null}')
+
+        expect(error).toBeInstanceOf(KiroACPError)
+        expect((error as KiroACPError).data).toEqual({ reason: KIRO_NOT_LOGGED_IN_REASON })
+        expect(isKiroNotLoggedInError(error)).toBe(true)
+      })
+
+      for (const [status, whoami, version] of [
+        ["authenticated", WHOAMI_LOGGED_IN_LINE, undefined],
+        ["inconclusive (whoami timeout)", Object.assign(new Error("timed out"), { code: "ETIMEDOUT", signal: "SIGTERM" }), undefined],
+        ["inconclusive (whoami spawn failure)", Object.assign(new Error("spawn failed"), { code: "EACCES" }), undefined],
+        ["not installed", WHOAMI_LOGGED_IN_LINE, Object.assign(new Error("kiro-cli missing"), { code: "ENOENT" })],
+      ] as const) {
+        test(`-32603 stays a plain Error without the marker when ${status}`, async () => {
+          for (const message of ["Backend stream aborted", ""]) {
+            const error = await streamError(
+              new KiroACPError(message, -32603, { requestId: "req-8" }),
+              whoami,
+              version,
+            )
+
+            expect(error).toBeInstanceOf(Error)
+            expect(error).not.toBeInstanceOf(KiroACPError)
+            expect((error as Error).message).toBe(message || "Kiro internal error (-32603)")
+            expect("data" in (error as object)).toBe(false)
+            expect(isKiroNotLoggedInError(error)).toBe(false)
+          }
+        })
+      }
+
+      test("other KiroACPError codes are re-wrapped without a marker even when whoami is logged out", async () => {
+        const error = await streamError(
+          new KiroACPError("Session not found", -32000, { reason: "something-else" }),
+          '{"account":null}',
+        )
+
+        expect(error).not.toBeInstanceOf(KiroACPError)
+        expect((error as Error).message).toBe("Session not found")
+        expect(isKiroNotLoggedInError(error)).toBe(false)
+      })
+
+      test("the client's initialize-timeout error is still recognized by its wording after re-wrapping", async () => {
+        // Arrange / Act: the client raised its marked error; the stream boundary
+        // re-wraps everything but the corroborated -32603 case as a plain Error
+        const error = await streamError(
+          new KiroACPError("Not logged in. Run 'kiro-cli login' to authenticate.", -1, { reason: KIRO_NOT_LOGGED_IN_REASON }),
+          '{"account":null}',
+        )
+
+        // Assert: the wording keeps the matcher true for message-only consumers
+        expect((error as Error).message).toBe("Not logged in. Run 'kiro-cli login' to authenticate.")
+        expect(isKiroNotLoggedInError(error)).toBe(true)
+        expect(isKiroNotLoggedInError({ message: (error as Error).message })).toBe(true)
+      })
     })
 
     test("does NOT rewrite non -32603 KiroACPError codes", async () => {
@@ -3825,17 +4144,79 @@ function kiroOf(part: LanguageModelV3StreamPart | undefined): Record<string, unk
   return metadata?.kiro
 }
 
+interface StallStatusShape {
+  stalledMs: number
+  hint?: string
+  reason?: string
+}
+
 /** Assert a well-formed stall status and return it. */
-function expectStallStatus(kiro: Record<string, unknown> | undefined): { stalledMs: number; hint?: string } {
+function expectStallStatus(kiro: Record<string, unknown> | undefined): StallStatusShape {
   expect(kiro).toBeDefined()
-  const status = kiro!.status as { stalledMs: number; hint?: string } | undefined
+  const status = kiro!.status as StallStatusShape | undefined
   expect(status).toBeDefined()
   expect(typeof status!.stalledMs).toBe("number")
   expect(status!.stalledMs).toBeGreaterThanOrEqual(STALL_AFTER_MS)
   expect(status!.stalledMs).toBeLessThan(10_000)
   // Only the documented keys, ever
-  for (const key of Object.keys(status!)) expect(["stalledMs", "hint"]).toContain(key)
+  for (const key of Object.keys(status!)) expect(["stalledMs", "hint", "reason"]).toContain(key)
+  // A reason is only ever derived from a hint
+  if (status!.reason !== undefined) expect(status!.hint).toBeDefined()
   return status!
+}
+
+/**
+ * Closing lines of the narrated stall: the wording is fixed, the seconds vary,
+ * and a short reason in parentheses follows only when the kiro-cli log yielded
+ * one. Tests that control the log assert the exact form instead.
+ */
+const RESUMED_LINE = /^\noutput resumed after \d+(\.\d)?s( \([A-Za-z0-9]+\))?$/
+const TURN_ENDED_LINE = /^\nturn ended after \d+(\.\d)?s without further output( \([A-Za-z0-9]+\))?$/
+
+/**
+ * Append ERROR lines to the real kiro-cli chat log while `run` executes, then
+ * trim the log back to its original size (or remove the file and directory
+ * created here) so the developer's own log is left as it was. The hint reader
+ * has no injection point: it always reads that file. `appendErrorLine` stamps
+ * the line with the current time, so call it after the prompt started or the
+ * reader ignores it.
+ */
+async function withKiroLogLines<T>(run: (appendErrorLine: (body: string) => void) => Promise<T>): Promise<T> {
+  const { kiroChatLogPath } = await import("../src/kiro-log-hint")
+  const { appendFileSync, statSync, truncateSync, unlinkSync, rmdirSync } = await import("node:fs")
+  const { dirname } = await import("node:path")
+  const logPath = kiroChatLogPath()
+  const logDir = dirname(logPath)
+  const dirExisted = existsSync(logDir)
+  const fileExisted = existsSync(logPath)
+  const originalSize = fileExisted ? statSync(logPath).size : 0
+  if (!dirExisted) mkdirSync(logDir, { recursive: true })
+
+  const appendErrorLine = (body: string): void => {
+    const stamp = new Date().toISOString().replace("Z", "000Z")
+    appendFileSync(logPath, `${stamp} \x1b[31mERROR\x1b[0m ${body}\n`)
+  }
+
+  try {
+    return await run(appendErrorLine)
+  } finally {
+    if (fileExisted) {
+      truncateSync(logPath, originalSize)
+    } else {
+      try {
+        unlinkSync(logPath)
+      } catch {
+        // Already gone
+      }
+      if (!dirExisted) {
+        try {
+          rmdirSync(logDir)
+        } catch {
+          // Not empty or already gone
+        }
+      }
+    }
+  }
 }
 
 function partsOfType<T extends LanguageModelV3StreamPart["type"]>(
@@ -3919,7 +4300,7 @@ describe("doStream() - stall watchdog", () => {
       .filter((p) => p.id === "stall-0-1")
       .map((p) => p.delta)
     expect(noticeDeltas[0]).toBe(FIRST_NOTICE)
-    expect(noticeDeltas.at(-1)).toMatch(/^\noutput resumed after \d+(\.\d)?s$/)
+    expect(noticeDeltas.at(-1)).toMatch(RESUMED_LINE)
 
     const noticeEndIndex = parts.findIndex((p) => p.type === "reasoning-end" && p.id === "stall-0-1")
     const textStartIndex = types.indexOf("text-start")
@@ -3956,7 +4337,7 @@ describe("doStream() - stall watchdog", () => {
     expect(notices.length).toBeGreaterThanOrEqual(2)
     expect(notices[0]).toBe(FIRST_NOTICE)
     expect(notices[1]).toBe(SECOND_NOTICE)
-    expect(deltas.at(-1)).toMatch(/^\noutput resumed after/)
+    expect(deltas.at(-1)).toMatch(RESUMED_LINE)
   })
 
   test("closes the text block for the notice and continues the text afterwards", async () => {
@@ -4205,7 +4586,7 @@ describe("doStream() - stall watchdog", () => {
     expect(types).not.toContain("finish")
     const noticeDeltas = partsOfType(parts, "reasoning-delta").map((p) => p.delta)
     expect(noticeDeltas[0]).toBe(FIRST_NOTICE)
-    expect(noticeDeltas.at(-1)).toMatch(/^\nturn ended after \d+(\.\d)?s without further output$/)
+    expect(noticeDeltas.at(-1)).toMatch(TURN_ENDED_LINE)
 
     const noticeEnd = partsOfType(parts, "reasoning-end").find((p) => p.id === "stall-0-1")
     const kiro = kiroOf(noticeEnd)!
@@ -4243,64 +4624,235 @@ describe("doStream() - stall watchdog", () => {
     expect(Object.keys(kiro)).toEqual(["status"])
   })
 
-  test("attaches the newest kiro-cli error line written during the turn as the hint", async () => {
-    // Arrange: append a fresh ERROR line to the real kiro-cli log while the
-    // turn is stalled, then trim the log back to its original size afterwards
-    // so the developer's own log is left as it was.
-    const { kiroChatLogPath } = await import("../src/kiro-log-hint")
-    const { appendFileSync, statSync, truncateSync, unlinkSync, rmdirSync } = await import("node:fs")
-    const { dirname } = await import("node:path")
-    const logPath = kiroChatLogPath()
-    const logDir = dirname(logPath)
-    const dirExisted = existsSync(logDir)
-    const fileExisted = existsSync(logPath)
-    const originalSize = fileExisted ? statSync(logPath).size : 0
-    if (!dirExisted) mkdirSync(logDir, { recursive: true })
-    const marker = `test-marker-${Date.now().toString(36)}`
+  test("attaches the newest kiro-cli error line written during the turn as the hint and derives the reason", async () => {
+    await withKiroLogLines(async (appendErrorLine) => {
+      // Arrange: a fresh ERROR line lands in the kiro-cli log while the turn
+      // is stalled, carrying an error-kind token the reason is derived from
+      const marker = `test-marker-${Date.now().toString(36)}`
+      const client = createMockClient({
+        prompt: mock(async (opts: PromptOptions) => {
+          appendErrorLine(`chat_cli_v2::agent::rts: failed to send rts request err=ModelOverloadedError ${marker}`)
+          await sleep(STALL_GAP_MS)
+          opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+          return { stopReason: "end_turn" }
+        }),
+      } as unknown as Partial<ACPClient>)
 
-    const client = createMockClient({
-      prompt: mock(async (opts: PromptOptions) => {
-        // Stamped after the prompt started, so the reader accepts it
-        const stamp = new Date().toISOString().replace("Z", "000Z")
-        appendFileSync(
-          logPath,
-          `${stamp} \x1b[31mERROR\x1b[0m chat_cli_v2::agent::rts: failed to send rts request err=ModelOverloadedError ${marker}\n`,
-        )
-        await sleep(STALL_GAP_MS)
-        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
-        return { stopReason: "end_turn" }
-      }),
-    } as unknown as Partial<ACPClient>)
-
-    try {
       // Act
       const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
 
-      // Assert
+      // Assert: hint and reason travel together on the status
       const status = expectStallStatus(kiroOf(partsOfType(parts, "text-end")[0]))
       expect(status.hint).toBeDefined()
       expect(status.hint).toContain("ERROR chat_cli_v2::agent::rts: failed to send rts request")
       expect(status.hint).toContain(marker)
       expect(status.hint).not.toContain("\x1b")
       expect(status.hint!.length).toBeLessThanOrEqual(160)
-    } finally {
-      if (fileExisted) {
-        truncateSync(logPath, originalSize)
-      } else {
-        try {
-          unlinkSync(logPath)
-        } catch {
-          // Already gone
+      expect(status.reason).toBe("ModelOverloaded")
+
+      // The closing line names the same reason
+      const closingLine = partsOfType(parts, "reasoning-delta").map((p) => p.delta).at(-1)
+      expect(closingLine).toMatch(/^\noutput resumed after \d+(\.\d)?s \(ModelOverloaded\)$/)
+    })
+  })
+
+  describe("reason in the closing line", () => {
+    const longError = 'chat_cli_v2::agent::rts: failed to send rts request err=ConverseStreamError { source: ServiceError { kind: ModelOverloadedError, message: "The model is overloaded. Please try again.", retryable: true } }'
+
+    test("output resumed: keeps the full reason when the display hint truncates the kind token", async () => {
+      await withKiroLogLines(async (appendErrorLine) => {
+        expect(longError.length).toBeGreaterThanOrEqual(170)
+        const client = createMockClient({
+          prompt: mock(async (opts: PromptOptions) => {
+            appendErrorLine(longError)
+            await sleep(STALL_GAP_MS)
+            opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+            return { stopReason: "end_turn" }
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+        const closingLine = partsOfType(parts, "reasoning-delta").map((p) => p.delta).at(-1)
+        expect(closingLine).toMatch(/^\noutput resumed after \d+(\.\d)?s \(ModelOverloaded\)$/)
+        const status = expectStallStatus(kiroOf(partsOfType(parts, "text-end")[0]))
+        expect(status.hint!.length).toBe(160)
+        expect(status.hint).toMatch(/kind: Model[A-Za-z]+\.\.\.$/)
+        expect(status.reason).toBe("ModelOverloaded")
+      })
+    })
+
+    test("output resumed: prefers the kind token over an earlier error token", async () => {
+      await withKiroLogLines(async (appendErrorLine) => {
+        // Arrange: the line names two candidates; `kind:` wins
+        const client = createMockClient({
+          prompt: mock(async (opts: PromptOptions) => {
+            appendErrorLine("chat_cli_v2::agent::rts: err=ConverseStreamError { kind: ThrottlingError, retry: 2 }")
+            await sleep(STALL_GAP_MS)
+            opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+            return { stopReason: "end_turn" }
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        // Act
+        const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+        // Assert
+        const closingLine = partsOfType(parts, "reasoning-delta").map((p) => p.delta).at(-1)
+        expect(closingLine).toMatch(/^\noutput resumed after \d+(\.\d)?s \(Throttling\)$/)
+        const status = expectStallStatus(kiroOf(partsOfType(parts, "text-end")[0]))
+        expect(status.reason).toBe("Throttling")
+      })
+    })
+
+    test("turn ended: carries the full reason on the closing line and status when the hint is truncated", async () => {
+      await withKiroLogLines(async (appendErrorLine) => {
+        // Arrange: the turn fails after the stall without any real output
+        const client = createMockClient({
+          prompt: mock(async () => {
+            appendErrorLine(longError)
+            await sleep(STALL_GAP_MS)
+            throw new Error("boom")
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        // Act
+        const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+        // Assert
+        const closingLine = partsOfType(parts, "reasoning-delta").map((p) => p.delta).at(-1)
+        expect(closingLine).toMatch(/^\nturn ended after \d+(\.\d)?s without further output \(ModelOverloaded\)$/)
+        const noticeEnd = partsOfType(parts, "reasoning-end").find((p) => p.id === "stall-0-1")
+        const status = expectStallStatus(kiroOf(noticeEnd))
+        expect(status.reason).toBe("ModelOverloaded")
+        expect(status.hint!.length).toBe(160)
+        expect(status.hint).toMatch(/kind: Model[A-Za-z]+\.\.\.$/)
+      })
+    })
+
+    test("tool flush: keeps the full reason across closing lines and the resumed segment with a truncated hint", async () => {
+      await withKiroLogLines(async (appendErrorLine) => {
+        // Arrange: segment 1 stalls with an ERROR line, then a tool call arrives;
+        // another stall opens during the tool-call debounce and closes on flush.
+        // Segment 2 resumes with the tool result and finishes with text.
+        const laneRouter = new LaneRouter()
+        const mockIPC = createMockIPCServer({
+          getLaneRouter: mock(() => laneRouter),
+          resolveToolResult: mock(() => {}),
+        })
+        let promptResolve: ((value: { stopReason: string }) => void) | null = null
+        let resumedOnUpdate: ((update: SessionUpdate) => void) | null = null
+
+        const client = createMockClient({
+          getIPCServer: mock(() => mockIPC),
+          getLaneRouter: mock(() => laneRouter),
+          setPromptCallback: mock((_sessionId: string, cb: (update: SessionUpdate) => void) => {
+            resumedOnUpdate = cb
+          }),
+          prompt: mock(async () => {
+            appendErrorLine(longError)
+            await sleep(STALL_GAP_MS)
+            laneRouter.route({ callId: "tc-reason", toolName: "bash", args: { command: "ls" } })
+            return new Promise<{ stopReason: string }>((resolve) => {
+              promptResolve = resolve
+            })
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        // Shorter than the 100 ms tool-call debounce so the flush itself also
+        // closes a stall window, separately from the tool-arrival activity.
+        const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, stall: { afterMs: 50 } })
+
+        // Act 1: the first segment ends in a tool call
+        const result1 = await model.doStream(makeCallOptions(USER_TURN))
+        const parts1 = await collectStream(result1.stream)
+
+        // Assert 1: tool arrival and tool flush each close a notice with the reason
+        expect(parts1.map((p) => p.type)).toContain("tool-call")
+        const closingLines = partsOfType(parts1, "reasoning-delta")
+          .filter((p) => p.delta.startsWith("\noutput resumed after"))
+        expect(closingLines.map((p) => p.id)).toEqual(["stall-0-1", "stall-0-2"])
+        for (const line of closingLines) {
+          expect(line.delta).toMatch(/^\noutput resumed after \d+(\.\d)?s \(ModelOverloaded\)$/)
         }
-        if (!dirExisted) {
-          try {
-            rmdirSync(logDir)
-          } catch {
-            // Not empty or already gone
-          }
-        }
-      }
-    }
+
+        // Act 2: resume with the tool result; kiro answers promptly
+        setTimeout(() => {
+          resumedOnUpdate?.({ sessionUpdate: "agent_message_chunk", content: { text: "done" } })
+          promptResolve?.({ stopReason: "end_turn" })
+        }, 30)
+        const result2 = await model.doStream(
+          makeCallOptions([
+            ...USER_TURN,
+            {
+              role: "assistant",
+              content: [{ type: "tool-call", toolCallId: "tc-reason", toolName: "bash", input: JSON.stringify({ command: "ls" }) }],
+            },
+            {
+              role: "tool",
+              content: [
+                { type: "tool-result", toolCallId: "tc-reason", toolName: "bash", output: { type: "text" as const, value: "ok" } },
+              ],
+            },
+          ]),
+        )
+        const parts2 = await collectStream(result2.stream)
+
+        // Assert 2: the carried-over status keeps hint and reason
+        const status = expectStallStatus(kiroOf(partsOfType(parts2, "text-end")[0]))
+        expect(status.hint!.length).toBe(160)
+        expect(status.hint).toMatch(/kind: Model[A-Za-z]+\.\.\.$/)
+        expect(status.reason).toBe("ModelOverloaded")
+      })
+    })
+
+    test("output resumed: a hint without an error token keeps the plain wording and no reason key", async () => {
+      await withKiroLogLines(async (appendErrorLine) => {
+        // Arrange: an ERROR line exists but names no error kind
+        const client = createMockClient({
+          prompt: mock(async (opts: PromptOptions) => {
+            appendErrorLine("chat_cli_v2::agent::rts: connection reset by peer while streaming")
+            await sleep(STALL_GAP_MS)
+            opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "answer" } })
+            return { stopReason: "end_turn" }
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        // Act
+        const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+        // Assert: exact form, no parentheses
+        const closingLine = partsOfType(parts, "reasoning-delta").map((p) => p.delta).at(-1)
+        expect(closingLine).toMatch(/^\noutput resumed after \d+(\.\d)?s$/)
+        const status = expectStallStatus(kiroOf(partsOfType(parts, "text-end")[0]))
+        expect(status.hint).toContain("connection reset by peer")
+        expect("reason" in status).toBe(false)
+      })
+    })
+
+    test("turn ended: a hint without an error token keeps the plain wording and no reason key", async () => {
+      await withKiroLogLines(async (appendErrorLine) => {
+        // Arrange
+        const client = createMockClient({
+          prompt: mock(async () => {
+            appendErrorLine("chat_cli_v2::agent::rts: connection reset by peer while streaming")
+            await sleep(STALL_GAP_MS)
+            throw new Error("boom")
+          }),
+        } as unknown as Partial<ACPClient>)
+
+        // Act
+        const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
+
+        // Assert
+        const closingLine = partsOfType(parts, "reasoning-delta").map((p) => p.delta).at(-1)
+        expect(closingLine).toMatch(/^\nturn ended after \d+(\.\d)?s without further output$/)
+        const noticeEnd = partsOfType(parts, "reasoning-end").find((p) => p.id === "stall-0-1")
+        const status = expectStallStatus(kiroOf(noticeEnd))
+        expect(status.hint).toBeDefined()
+        expect("reason" in status).toBe(false)
+      })
+    })
   })
 
   test("carries the stall total across a tool-call segment to the final text-end", async () => {
@@ -4339,7 +4891,7 @@ describe("doStream() - stall watchdog", () => {
     // Assert 1: the notice was closed by the tool call; no status on this segment
     expect(types1).toContain("tool-call")
     expect(partsOfType(parts1, "reasoning-start")[0].id).toBe("stall-0-1")
-    expect(partsOfType(parts1, "reasoning-delta").map((p) => p.delta).at(-1)).toMatch(/^\noutput resumed after/)
+    expect(partsOfType(parts1, "reasoning-delta").map((p) => p.delta).at(-1)).toMatch(RESUMED_LINE)
     expect(parts1.some((p) => kiroOf(p)?.status !== undefined)).toBe(false)
     expect(partsOfType(parts1, "finish")[0].finishReason.unified).toBe("tool-calls")
 

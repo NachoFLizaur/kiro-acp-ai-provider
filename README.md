@@ -91,7 +91,7 @@ When the provider receives an `x-parent-session-id` header (indicating a subagen
 
 ### Session Reset (Revert / Fork)
 
-The `x-session-reset: true` header clears the persisted session and creates a fresh kiro session. The full conversation history is replayed as `<context>` text in a single message, since ACP doesn't support native fork/truncate. This enables revert-to-message and fork operations in consumers like [opencode](https://opencode.ai).
+The `x-session-reset: true` header clears the persisted session and creates a fresh kiro session. The full conversation history is replayed as `<context>` text in a single message, since ACP doesn't support native fork/truncate. The replay needs at least one assistant or tool message in the prompt; a prompt that contains only user messages (for example a host compaction checkpoint) is sent using only the latest user message, without replaying earlier history (see Known limitations in the changelog). This enables revert-to-message and fork operations in consumers like [opencode](https://opencode.ai).
 
 ### MCP Timeout
 
@@ -111,7 +111,7 @@ const kiro = createKiroAcp({
 ```
 
 - **`afterMs`** (default `10_000`): how long `kiro-cli` may stay silent during a turn before it counts as stalled. The timer starts when the prompt (or a batch of tool results) is sent, resets on every update from `kiro-cli`, and is cleared when the turn finishes, errors, or hands tool calls back to your application. `0` turns stall detection off entirely: no live notice and no `status` field in the provider metadata described below.
-- **`live`** (default `"reasoning"`): with `"reasoning"`, the provider streams a small reasoning fragment (separate from the model's own reasoning) while the turn is stalled. It opens with a notice that no output has arrived for the configured time and that kiro-cli is likely retrying, adds a line at each further `afterMs` of silence, and closes with a line reporting how long the stall lasted: `output resumed after Ns` once real output arrives, or `turn ended after Ns without further output` if the turn ends first. With `"off"`, nothing is streamed; the stall is only recorded in the metadata described next.
+- **`live`** (default `"reasoning"`): with `"reasoning"`, the provider streams a small reasoning fragment (separate from the model's own reasoning) while the turn is stalled. It opens with a notice that no output has arrived for the configured time and that kiro-cli is likely retrying, adds a line at each further `afterMs` of silence, and closes with a line reporting how long the stall lasted: `output resumed after Ns` once real output arrives, or `turn ended after Ns without further output` if the turn ends first. When the kiro-cli log hint described below yields a short reason, the closing line ends with it in parentheses, for example `output resumed after 24s (ModelOverloaded)`. With `"off"`, nothing is streamed; the stall is only recorded in the metadata described next.
 
 Whenever a turn stalled (regardless of `live`), the turn's final `text-end` or `reasoning-end` part carries `providerMetadata.kiro.status` next to the credits:
 
@@ -119,10 +119,13 @@ Whenever a turn stalled (regardless of `live`), the turn's final `text-end` or `
 providerMetadata.kiro.status = {
   stalledMs: number, // total time the turn spent stalled, in ms
   hint?: string,     // most recent ERROR line from kiro-cli's own chat log during this turn
+  reason?: string,   // short reason from the full log line, e.g. "ModelOverloaded" (since 3.3.0)
 }
 ```
 
 `hint` is best-effort: it is read from kiro-cli's log file (`kiro-log/kiro-chat.log` in the OS temp directory), ANSI-stripped and truncated to about 160 characters, and is omitted when the log is missing or unreadable. It never blocks or fails the stream.
+
+`reason` is derived by `stallReason` from the full ANSI-stripped, whitespace-collapsed kiro-cli ERROR log line before `hint` is truncated. It prefers the `kind:` value (`kind: ModelOverloadedError`), otherwise the first error-kind-like word (`ConverseStreamError`), and drops a trailing `Error`, giving `ModelOverloaded` and `ConverseStream`. It is omitted when no qualifying log line is available or no reason can be derived. `stallReason` is also exported for your own use, but calling `stallReason(hint)` on the displayed, truncated hint may return a different reason or `undefined`. The same captured reason is used in the closing line of the live notice.
 
 Separately from stalls, every `finish` part reports the provider's own wall-clock measurement of the turn:
 
@@ -160,6 +163,9 @@ const status = verifyAuth()
 // Same check without blocking the event loop
 const asyncStatus = await verifyAuthAsync()
 
+// Skip the short-lived memo and probe kiro-cli again (since 3.3.0)
+const freshStatus = await verifyAuthAsync({ fresh: true })
+
 // Discover exact runtime model IDs and their effort options
 const models = await listModels({ cwd: process.cwd() })
 
@@ -170,6 +176,10 @@ const quota = await getQuota({ client: kiro.getClient() })
 `verifyAuth()` determines authentication solely from `kiro-cli whoami`, which abstracts the per-OS credential store. The on-disk SSO token file and its expiry are not consulted for the auth decision, so a stale token file never misreports a logged-in user. The returned `tokenPath` is provided only as an optional refresh hint for consumers.
 
 `verifyAuthAsync()` runs the same probe and returns the same `AuthStatus`, but the two `kiro-cli` invocations (`--version` and `whoami`) run without blocking the event loop. Prefer it anywhere a stalled event loop would be visible, such as an interactive host, a login poll, or a server request handler; `verifyAuth()` remains available for callers that need a synchronous answer. Both functions share one short-TTL result cache and the same per-command timeouts, so mixing them is safe, and concurrent `verifyAuthAsync()` calls coalesce onto a single in-flight probe. `verifyAuthAsync()` never rejects: a missing `kiro-cli` resolves to `{ installed: false, authenticated: false }`, and a failing or timed-out `whoami` resolves to `authenticated: false`.
+
+`verifyAuthAsync({ fresh: true })` (since 3.3.0) skips a warm memo and runs a new probe, for callers that need to notice a logout that happened after the memo was filled. A probe already in flight is joined rather than duplicated, and the result replaces the shared memo, so a following default call on either path reads it. Without options the behavior is unchanged.
+
+`AuthStatus.inconclusive` (since 3.3.0, always `true` when present) tells you that `authenticated: false` is a default rather than evidence: kiro-cli is installed, but the `whoami` probe timed out or could not be spawned at all (an error such as `ENOENT` or `EACCES` with no exit status). It is absent whenever kiro-cli answered, including a non-zero exit that still printed output, and on every `installed: false` result. Consumers that act on a logout (for example by removing stored credentials) should ignore inconclusive results and probe again later. The `--version` step is unaffected: a timeout there still means `installed: true` and `whoami` decides, and any other failure still means `installed: false`.
 
 ## Models
 
@@ -248,6 +258,31 @@ This is necessary because kiro-cli's MCP tool result path doesn't reliably handl
 ## Errors
 
 When kiro-cli returns a JSON-RPC `-32603` internal error and `kiro-cli whoami` reports you are logged out, the provider raises an actionable error asking you to re-authenticate with `kiro-cli login` (run `kiro-cli doctor` to help diagnose). Recent kiro-cli stderr is appended to the message to aid diagnosis.
+
+Two errors mean "kiro-cli is not logged in" and carry a stable marker (since 3.3.0) so you can match on it instead of on the message text: the `KiroACPError` raised when `initialize` or `session/new` times out while `whoami` reports logged out (`Not logged in. Run 'kiro-cli login' to authenticate.`), and the `-32603` error described above once `whoami` corroborates the logout. Both have `data.reason === KIRO_NOT_LOGGED_IN_REASON` (`"not-logged-in"`). The marker is attached only when `kiro-cli whoami` answered logged out. If the probe is inconclusive, kiro-cli is missing, or `whoami` reports logged in, the generic error is kept without a marker.
+
+Handle streaming errors with `onError` and consume the stream; `streamText` returns a result object, not a promise for the completed response:
+
+```typescript
+import { streamText } from "ai"
+import { isKiroNotLoggedInError } from "kiro-acp-ai-provider"
+
+const result = streamText({
+  model: kiro("claude-sonnet-4.6"),
+  prompt,
+  onError({ error }) {
+    if (isKiroNotLoggedInError(error)) {
+      console.error("Run kiro-cli login before retrying.")
+    } else {
+      console.error(error)
+    }
+  },
+})
+
+await result.consumeStream()
+```
+
+`isKiroNotLoggedInError(value)` checks `value.data.reason` first, then falls back to the provider's own not-logged-in phrases on a string or on any `{ message }` value. The fallback matters when a host re-wraps errors as plain `Error` objects, which keeps the message but drops `data`. It never throws and returns `false` for anything else, including timeouts and other `-32603` failures.
 
 ## License
 

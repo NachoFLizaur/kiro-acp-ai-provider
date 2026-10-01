@@ -224,6 +224,60 @@ export class KiroACPConnectionError extends Error {
   }
 }
 
+/**
+ * Value of `KiroACPError.data.reason` on errors that mean "kiro-cli is not
+ * logged in": the initialize / session-new timeout that whoami corroborates,
+ * and the whoami-corroborated `-32603` turn failure. A stable machine-readable
+ * marker so consumers can match on it rather than on the message text.
+ *
+ * @since 3.3.0
+ */
+export const KIRO_NOT_LOGGED_IN_REASON = "not-logged-in" as const
+
+/**
+ * Message written on the initialize / session-new timeout path when whoami
+ * reports logged out (kiro-cli hangs silently when not authenticated).
+ */
+const NOT_LOGGED_IN_MESSAGE = "Not logged in. Run 'kiro-cli login' to authenticate."
+
+/**
+ * Phrases owned by this package that identify a not-logged-in error by its
+ * message alone; the fallback for consumers that receive a re-wrapped plain
+ * `Error` (or just its message) where `data.reason` did not survive.
+ */
+const NOT_LOGGED_IN_PHRASES: readonly string[] = [
+  "Not logged in. Run 'kiro-cli login'",
+  "does not appear logged in",
+]
+
+/**
+ * True when `value` is one of this package's not-logged-in errors: a
+ * `KiroACPError` (or any object) whose `data.reason` is
+ * `KIRO_NOT_LOGGED_IN_REASON`, or a string / `{ message }` carrying one of the
+ * package's not-logged-in phrases. The marker is checked first; the phrase
+ * check exists because hosts commonly re-wrap errors as plain `Error`, which
+ * keeps the message but drops `data`. Never throws.
+ *
+ * @since 3.3.0
+ */
+export function isKiroNotLoggedInError(value: unknown): boolean {
+  if (typeof value === "string") return containsNotLoggedInPhrase(value)
+  if (typeof value !== "object" || value === null) return false
+  const data = (value as { data?: unknown }).data
+  if (
+    typeof data === "object" && data !== null &&
+    (data as { reason?: unknown }).reason === KIRO_NOT_LOGGED_IN_REASON
+  ) {
+    return true
+  }
+  const message = (value as { message?: unknown }).message
+  return typeof message === "string" && containsNotLoggedInPhrase(message)
+}
+
+function containsNotLoggedInPhrase(message: string): boolean {
+  return NOT_LOGGED_IN_PHRASES.some((phrase) => message.includes(phrase))
+}
+
 // ---------------------------------------------------------------------------
 // Pending request tracker
 // ---------------------------------------------------------------------------
@@ -1203,9 +1257,14 @@ export class ACPClient {
             }
             // On initialize/session/new timeout, check if auth expired (kiro-cli hangs silently when not authenticated)
             if (method === "initialize" || method === "session/new") {
+              /**
+               * Read whoami status before rejecting with a logout error. Only a
+               * definitive installed, logged-out result permits the marker;
+               * all other results fall through to the generic timeout with stderr.
+               */
               const auth = verifyAuth()
-              if (!auth.authenticated) {
-                reject(new KiroACPError("Not logged in. Run 'kiro-cli login' to authenticate.", -1))
+              if (auth.installed && !auth.authenticated && !auth.inconclusive) {
+                reject(new KiroACPError(NOT_LOGGED_IN_MESSAGE, -1, { reason: KIRO_NOT_LOGGED_IN_REASON }))
                 return
               }
             }

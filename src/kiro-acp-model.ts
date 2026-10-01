@@ -14,7 +14,7 @@ import type {
 } from "@ai-sdk/provider"
 import { appendFileSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs"
 import { randomBytes } from "node:crypto"
-import { KiroACPError, type ACPClient, type ACPSession, type SessionUpdate, type ContentBlock, type SessionMetadata } from "./acp-client"
+import { KiroACPError, KIRO_NOT_LOGGED_IN_REASON, type ACPClient, type ACPSession, type SessionUpdate, type ContentBlock, type SessionMetadata } from "./acp-client"
 import type { KiroEffort } from "./kiro-effort"
 import { verifyAuth } from "./kiro-auth"
 import { persistSession, loadPersistedSession, clearPersistedSession } from "./session-storage"
@@ -22,7 +22,7 @@ import { interceptSessionAffinity } from "./session-affinity"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
-import { readStallHint } from "./kiro-log-hint"
+import { readStallHintDetail } from "./kiro-log-hint"
 
 // ---------------------------------------------------------------------------
 // Data conversion helpers
@@ -97,6 +97,7 @@ interface PendingTurnState {
   /** Stall accounting carried across tool-call segments of the same turn. */
   stalledMs: number
   stallHint: string | undefined
+  stallReason: string | undefined
 }
 
 /**
@@ -319,6 +320,12 @@ interface StallStatus {
   stalledMs: number
   /** Newest kiro-cli ERROR log line seen during the turn, when available. */
   hint?: string
+  /**
+   * Short reason derived from the full log line before `hint` is truncated,
+   * e.g. `ModelOverloaded`. Present only when the full line yields one.
+   * @since 3.3.0
+   */
+  reason?: string
 }
 
 /**
@@ -332,9 +339,9 @@ function partProviderMetadata(
   status: StallStatus | undefined,
 ): SharedV3ProviderMetadata | undefined {
   if (!status) return credits
-  const statusRecord = status.hint === undefined
-    ? { stalledMs: status.stalledMs }
-    : { stalledMs: status.stalledMs, hint: status.hint }
+  const statusRecord: Record<string, number | string> = { stalledMs: status.stalledMs }
+  if (status.hint !== undefined) statusRecord.hint = status.hint
+  if (status.reason !== undefined) statusRecord.reason = status.reason
   return { kiro: { ...(credits?.kiro ?? {}), status: statusRecord } }
 }
 
@@ -346,11 +353,23 @@ function formatSeconds(ms: number): string {
     : `${Math.round(seconds * 10) / 10}s`
 }
 
+/** ` (ModelOverloaded)` when a reason was captured, otherwise empty. */
+function formatReasonSuffix(reason: string | undefined): string {
+  return reason === undefined ? "" : ` (${reason})`
+}
+
 // ---------------------------------------------------------------------------
-// Error message extraction
+// Stream error construction
 // ---------------------------------------------------------------------------
 
-function extractErrorMessage(err: unknown): string {
+/**
+ * Build the error emitted on the stream when a turn fails. Every failure is
+ * surfaced as a plain Error carrying the best available message, except the
+ * whoami-corroborated -32603 case, which is a `KiroACPError` marked with
+ * `data.reason === KIRO_NOT_LOGGED_IN_REASON` so in-process consumers can
+ * recognize it without matching text.
+ */
+function buildStreamError(err: unknown): Error {
   // -32603 is the GENERIC JSON-RPC "Internal error", NOT a token-expiry signal.
   // Only claim an auth problem when kiro-cli itself reports NOT logged in (per
   // the whoami --format json detection rule in kiro-auth); otherwise surface
@@ -360,13 +379,24 @@ function extractErrorMessage(err: unknown): string {
   // the real cause). verifyAuth() is synchronous with a bounded timeout and
   // runs only on this error path. ASCII punctuation only (no em/en dashes).
   if (err instanceof KiroACPError && err.code === -32603) {
-    if (!verifyAuth().authenticated) {
-      return `Kiro could not complete the request and does not appear logged in. Run 'kiro-cli whoami' to check auth and 'kiro-cli doctor' to diagnose installation, credential, or environment issues; then 'kiro-cli login' if needed (or /connect in opencode). Original: ${err.message}`
+    /**
+     * Read whoami status before constructing a marked error. Only a definitive
+     * installed, logged-out result permits logout wording and the marker;
+     * authenticated, inconclusive or missing-CLI results keep the generic error.
+     */
+    const auth = verifyAuth()
+    if (auth.installed && !auth.authenticated && !auth.inconclusive) {
+      const originalData = typeof err.data === "object" && err.data !== null ? err.data : {}
+      return new KiroACPError(
+        `Kiro could not complete the request and does not appear logged in. Run 'kiro-cli whoami' to check auth and 'kiro-cli doctor' to diagnose installation, credential, or environment issues; then 'kiro-cli login' if needed (or /connect in opencode). Original: ${err.message}`,
+        -32603,
+        { ...originalData, reason: KIRO_NOT_LOGGED_IN_REASON },
+      )
     }
-    return err.message || `Kiro internal error (-32603)`
+    return new Error(err.message || `Kiro internal error (-32603)`)
   }
-  if (err instanceof Error) return err.message
-  return String(err)
+  if (err instanceof Error) return new Error(err.message)
+  return new Error(String(err))
 }
 
 // ---------------------------------------------------------------------------
@@ -581,8 +611,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
   private readonly client: ACPClient
   private readonly config: KiroACPModelConfig
-  private currentModelId: string | null = null
-  private currentEffort: KiroEffort | null = null
   private initPromise: Promise<void> | null = null
   private totalCredits = 0
   private currentAffinityId: string | undefined
@@ -716,9 +744,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           const sessionId = loaded.sessionId || this.config.sessionId
           if (!loaded.sessionId) loaded.sessionId = sessionId
           await this.ensureSessionMode(loaded)
-          if (this.currentModelId === null) {
-            this.currentModelId = loaded.models.currentModelId
-          }
           if (toolsFilePath) {
             this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
           }
@@ -737,9 +762,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           if (!session.sessionId) session.sessionId = sessionId
           if (session) {
             await this.ensureSessionMode(session)
-            if (this.currentModelId === null) {
-              this.currentModelId = session.models?.currentModelId ?? null
-            }
             if (toolsFilePath) {
               this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
             }
@@ -759,9 +781,6 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       ? await this.client.createSessionWithToolsPath(toolsFilePath)
       : await this.client.createSession()
     await this.ensureSessionMode(session)
-    if (this.currentModelId === null) {
-      this.currentModelId = session.models.currentModelId
-    }
 
     if (toolsFilePath) {
       this.sessionToolsFiles.set(session.sessionId, { filePath: toolsFilePath, toolNames })
@@ -808,12 +827,21 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     }
   }
 
-  /** Switch model on a session if the requested modelId differs. */
+  /**
+   * Read the acquired session's reported model before each fresh prompt.
+   * Only an exact match skips switching; missing reports also require setModel.
+   * Update the session only after setModel resolves, preserving its model list.
+   * Rejections propagate and prevent the prompt; no instance cache bypasses this.
+   */
   private async ensureModel(session: ACPSession): Promise<void> {
-    if (this.currentModelId === this.modelId) return
+    if (session.models?.currentModelId === this.modelId) return
 
     await this.client.setModel(session.sessionId, this.modelId)
-    this.currentModelId = this.modelId
+    if (session.models) {
+      session.models.currentModelId = this.modelId
+    } else {
+      session.models = { currentModelId: this.modelId, availableModels: [] }
+    }
   }
 
   /**
@@ -828,21 +856,17 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   }
 
   /**
-   * Apply an opaque effort value to the session. Never throws and never changes
-   * the stop reason: rejected values and any setEffort failure are silent no-ops.
+   * Apply the resolved effort to the acquired session before every fresh prompt.
+   * Without an explicit effort, leave the session unchanged. Never memoize:
+   * sessions and processes can change, and another model can alter the same session.
+   * Never throws or changes the stop reason: rejected values and setEffort failures
+   * are silent no-ops, with thrown failures logged only when debug logging is enabled.
    */
   private async ensureEffort(session: ACPSession, requested: KiroEffort | undefined): Promise<void> {
     if (!requested) return
 
-    // Skip redundant calls (mirrors the currentModelId guard).
-    if (this.currentEffort === requested) return
-
     try {
-      const result = await this.client.setEffort(session.sessionId, requested)
-      if (result.success) {
-        this.currentEffort = requested
-      }
-      // success:false (unsupported model/level): leave currentEffort untouched.
+      await this.client.setEffort(session.sessionId, requested)
     } catch (err) {
       // Swallow any setEffort error; log it env-gated for diagnosis.
       debugLogEffortFailure(this.modelId, session.sessionId, requested, err)
@@ -1342,7 +1366,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     streamSegment: number
     options: LanguageModelV3CallOptions
     /** Stall accounting inherited from earlier segments of the same turn. */
-    initialStall?: { stalledMs: number; hint: string | undefined }
+    initialStall?: { stalledMs: number; hint: string | undefined; reason: string | undefined }
     /** Called when tool calls are flushed to save/update pending turn state. */
     savePendingTurn: (state: {
       pendingToolCalls: Map<string, PendingToolCall>
@@ -1350,6 +1374,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       nextSegment: number
       stalledMs: number
       stallHint: string | undefined
+      stallReason: string | undefined
     }) => void
   }): {
     readable: ReadableStream<LanguageModelV3StreamPart>
@@ -1442,6 +1467,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     let stalledMs = initialStall?.stalledMs ?? 0
     let stallHint: string | undefined = initialStall?.hint
+    let stallReason: string | undefined = initialStall?.reason
     let stallTimer: ReturnType<typeof setTimeout> | null = null
     let lastActivityAt = promptStartedAt
     /** Start of the open stall window, or null when output is flowing. */
@@ -1465,12 +1491,18 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       stallTimer = setTimeout(onStallTick, stallAfterMs)
     }
 
-    /** Capture the newest kiro-cli ERROR line for this turn, best-effort. */
+    /**
+     * Capture the newest qualifying ERROR line and its full reason on each
+     * stall tick. After the read, check for a closed stream or missing detail
+     * before updating either value; in those cases keep the previous pair.
+     * The lookup is best-effort and is not run when the watchdog is disabled.
+     */
     const captureStallHint = (): void => {
-      readStallHint(promptStartedAt)
-        .then((hint) => {
-          if (streamClosed || hint === undefined) return
-          stallHint = hint
+      readStallHintDetail(promptStartedAt)
+        .then((detail) => {
+          if (streamClosed || detail === undefined) return
+          stallHint = detail.hint
+          stallReason = detail.reason
         })
         .catch(() => {
           // The reader never rejects; this guard keeps the promise settled anyway.
@@ -1544,7 +1576,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       lastActivityAt = now
       const windowMs = endStallWindow(now)
       if (windowMs > 0) {
-        closeStallFragment(`output resumed after ${formatSeconds(windowMs)}`)
+        closeStallFragment(`output resumed after ${formatSeconds(windowMs)}${formatReasonSuffix(stallReason)}`)
       }
       armStallTimer()
     }
@@ -1561,12 +1593,16 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       clearStallTimer()
       const windowMs = endStallWindow(Date.now())
       const status: StallStatus | undefined = stalledMs > 0
-        ? { stalledMs, ...(stallHint !== undefined ? { hint: stallHint } : {}) }
+        ? {
+            stalledMs,
+            ...(stallHint !== undefined ? { hint: stallHint } : {}),
+            ...(stallReason !== undefined ? { reason: stallReason } : {}),
+          }
         : undefined
       const metadata = buildMetadata(status)
       const realBlockOpen = reasoningStarted || textStarted
       closeStallFragment(
-        `turn ended after ${formatSeconds(windowMs)} without further output`,
+        `turn ended after ${formatSeconds(windowMs)} without further output${formatReasonSuffix(stallReason)}`,
         realBlockOpen ? undefined : metadata,
       )
       return metadata
@@ -1583,7 +1619,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       clearStallTimer()
       const windowMs = endStallWindow(Date.now())
       if (windowMs > 0) {
-        closeStallFragment(`output resumed after ${formatSeconds(windowMs)}`)
+        closeStallFragment(`output resumed after ${formatSeconds(windowMs)}${formatReasonSuffix(stallReason)}`)
       }
 
       if (reasoningStarted) {
@@ -1614,6 +1650,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         nextSegment: streamSegment + 1,
         stalledMs,
         stallHint,
+        stallReason,
       })
 
       const metadata = this.client.getMetadata(sessionId)
@@ -1850,7 +1887,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             })
           }
 
-          writePart({ type: "error", error: new Error(extractErrorMessage(err)) })
+          writePart({ type: "error", error: buildStreamError(err) })
 
           removeAbortListener()
 
@@ -1929,6 +1966,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           promptAbort,
           stalledMs: state.stalledMs,
           stallHint: state.stallHint,
+          stallReason: state.stallReason,
         })
       },
     })
@@ -1988,13 +2026,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         initialOutputCharCount: turn.outputCharCount,
         streamSegment: turn.streamSegment,
         options,
-        initialStall: { stalledMs: turn.stalledMs, hint: turn.stallHint },
+        initialStall: { stalledMs: turn.stalledMs, hint: turn.stallHint, reason: turn.stallReason },
         savePendingTurn: (state) => {
           turn.pendingToolCalls = state.pendingToolCalls
           turn.outputCharCount = state.outputCharCount
           turn.streamSegment = state.nextSegment
           turn.stalledMs = state.stalledMs
           turn.stallHint = state.stallHint
+          turn.stallReason = state.stallReason
         },
       })
 
@@ -2074,6 +2113,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           promptAbort,
           stalledMs: state.stalledMs,
           stallHint: state.stallHint,
+          stallReason: state.stallReason,
         })
       },
     })

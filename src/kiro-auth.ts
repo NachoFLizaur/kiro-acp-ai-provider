@@ -6,8 +6,33 @@ import { join } from "node:path"
 export interface AuthStatus {
   installed: boolean
   authenticated: boolean
+  /**
+   * Present (always `true`) when kiro-cli is installed but the whoami probe
+   * could not answer: it timed out, or it could not be spawned at all (a
+   * spawn error such as `ENOENT`/`EACCES` with no exit status). In that case
+   * `authenticated` is `false` by default rather than by evidence, so
+   * consumers deciding on a logout should not treat it as one. Absent when
+   * kiro-cli answered (including a non-zero exit that still printed output)
+   * and on every `installed: false` result.
+   * @since 3.3.0
+   */
+  inconclusive?: true
   version?: string
   tokenPath?: string
+}
+
+/**
+ * Options for `verifyAuthAsync()`.
+ * @since 3.3.0
+ */
+export interface VerifyAuthOptions {
+  /**
+   * Skip a warm memo and run a new probe. A probe already in flight is joined
+   * rather than duplicated. The result replaces the memo shared with the sync
+   * `verifyAuth()`, so a following default call on either path reads it.
+   * Default: `false`.
+   */
+  fresh?: boolean
 }
 
 // Bounded timeouts for the two synchronous probes. Cold Windows launches can be
@@ -95,6 +120,18 @@ function isTimeoutError(err: unknown): boolean {
   return e?.code === "ETIMEDOUT" || e?.signal === "SIGTERM"
 }
 
+/**
+ * True for a spawn failure (the command never ran): execFile/execFileSync
+ * report those with a string `code` such as `ENOENT` or `EACCES` and no
+ * numeric exit `status`. A process that ran and exited non-zero carries a
+ * numeric `status` (sync) or a numeric `code` (async) and is not a spawn
+ * error.
+ */
+function isSpawnError(err: unknown): boolean {
+  const e = err as { code?: unknown; status?: unknown }
+  return typeof e?.code === "string" && typeof e?.status !== "number"
+}
+
 // ---------------------------------------------------------------------------
 // Shared probe core. The sync (verifyAuth) and async (verifyAuthAsync) paths
 // differ only in spawn mechanics (execFileSync vs callback execFile); every
@@ -128,10 +165,19 @@ function deriveVersionStep(outcome: ExecOutcome): { installed: boolean; version?
  * parse the captured stdout and stderr before concluding logged-out (kiro-cli
  * may exit non-zero while still printing the auth JSON). The exit code alone
  * never decides the outcome.
+ *
+ * A logged-out verdict is `inconclusive` when whoami never answered: the
+ * spawn timed out or failed outright (see isSpawnError). A non-zero exit with
+ * output, or any parseable authenticated answer, is definitive.
  */
-function deriveAuthenticated(outcome: ExecOutcome): boolean {
-  if (outcome.error === undefined) return parseWhoamiAuthenticated(outcome.stdout)
-  return parseWhoamiAuthenticated(outcome.stdout, outcome.stderr)
+function deriveWhoamiStep(outcome: ExecOutcome): { authenticated: boolean; inconclusive?: true } {
+  if (outcome.error === undefined) return { authenticated: parseWhoamiAuthenticated(outcome.stdout) }
+  const authenticated = parseWhoamiAuthenticated(outcome.stdout, outcome.stderr)
+  if (authenticated) return { authenticated }
+  if (isTimeoutError(outcome.error) || isSpawnError(outcome.error)) {
+    return { authenticated: false, inconclusive: true }
+  }
+  return { authenticated: false }
 }
 
 /** Token-file step: report the path only when the file exists. */
@@ -199,16 +245,11 @@ function probeAuth(): AuthStatus {
   const versionStep = deriveVersionStep(execSyncOutcome(["--version"], VERSION_TIMEOUT_MS))
   if (!versionStep.installed) return { installed: false, authenticated: false }
 
-  const authenticated = deriveAuthenticated(
+  const whoamiStep = deriveWhoamiStep(
     execSyncOutcome(["whoami", "--format", "json"], WHOAMI_TIMEOUT_MS),
   )
 
-  return {
-    installed: true,
-    authenticated,
-    version: versionStep.version,
-    tokenPath: deriveTokenPath(),
-  }
+  return assembleStatus(versionStep, whoamiStep)
 }
 
 /**
@@ -219,13 +260,22 @@ async function probeAuthAsync(): Promise<AuthStatus> {
   const versionStep = deriveVersionStep(await execAsyncOutcome(["--version"], VERSION_TIMEOUT_MS))
   if (!versionStep.installed) return { installed: false, authenticated: false }
 
-  const authenticated = deriveAuthenticated(
+  const whoamiStep = deriveWhoamiStep(
     await execAsyncOutcome(["whoami", "--format", "json"], WHOAMI_TIMEOUT_MS),
   )
 
+  return assembleStatus(versionStep, whoamiStep)
+}
+
+/** Final AuthStatus for an installed kiro-cli; `inconclusive` is only ever present as `true`. */
+function assembleStatus(
+  versionStep: { version?: string },
+  whoamiStep: { authenticated: boolean; inconclusive?: true },
+): AuthStatus {
   return {
     installed: true,
-    authenticated,
+    authenticated: whoamiStep.authenticated,
+    ...(whoamiStep.inconclusive ? { inconclusive: true as const } : {}),
     version: versionStep.version,
     tokenPath: deriveTokenPath(),
   }
@@ -266,13 +316,18 @@ let inflightProbe: Promise<AuthStatus> | null = null
  * kiro-cli spawns never block the event loop. Concurrent callers coalesce
  * onto one in-flight probe (see inflightProbe). Never rejects.
  *
+ * `{ fresh: true }` skips a warm memo and runs a new probe (still joining a
+ * probe already in flight); its result replaces the shared memo, so the sync
+ * path reads it too. Without options the behavior is unchanged.
+ *
  * Note: an in-flight probe always completes and re-memos its result, even if
  * the memo expires or is cleared while it is running.
  *
  * @since 3.1.0
+ * @since 3.3.0 `options.fresh`
  */
-export async function verifyAuthAsync(): Promise<AuthStatus> {
-  if (authCache && Date.now() < authCache.expiresAt) return authCache.value
+export async function verifyAuthAsync(options?: VerifyAuthOptions): Promise<AuthStatus> {
+  if (!options?.fresh && authCache && Date.now() < authCache.expiresAt) return authCache.value
   if (inflightProbe) return inflightProbe
   inflightProbe = (async () => {
     try {

@@ -3,6 +3,8 @@ export {
   ACPClient,
   KiroACPError,
   KiroACPConnectionError,
+  KIRO_NOT_LOGGED_IN_REASON,
+  isKiroNotLoggedInError,
   type ACPClientOptions,
   type ACPSession,
   type AvailableTool,
@@ -67,7 +69,8 @@ export type { KiroEffort } from "./kiro-effort"
 
 // Utilities. `verifyAuthAsync` starts with "v" — safe for the auto-discovery
 // invariant above (no new `create*` root export).
-export { verifyAuth, verifyAuthAsync, type AuthStatus } from "./kiro-auth"
+export { verifyAuth, verifyAuthAsync, type AuthStatus, type VerifyAuthOptions } from "./kiro-auth"
+export { stallReason } from "./kiro-log-hint"
 export {
   listModels,
   type ListModelsOptions,

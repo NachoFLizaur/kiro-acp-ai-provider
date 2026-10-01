@@ -42,6 +42,12 @@ const ANSI_PATTERN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[
 /** Leading ISO-8601 UTC timestamp as written by kiro-cli's tracing layer. */
 const TIMESTAMP_PATTERN = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z/
 
+/** Display hint paired with the reason derived before display truncation. */
+interface StallHintDetail {
+  hint: string
+  reason: string | undefined
+}
+
 /** Absolute path of the kiro-cli chat log for the current user. */
 export function kiroChatLogPath(): string {
   return join(tmpdir(), "kiro-log", "kiro-chat.log")
@@ -61,10 +67,27 @@ export async function readStallHint(
   sinceEpochMs: number,
   logPath: string = kiroChatLogPath(),
 ): Promise<string | undefined> {
+  return (await readStallHintDetail(sinceEpochMs, logPath))?.hint
+}
+
+/**
+ * Read the same newest ERROR line as `readStallHint`, with its short reason
+ * derived from the full ANSI-stripped, whitespace-collapsed line before the
+ * display hint is truncated. Resolves `undefined` when no qualifying line
+ * exists or the log cannot be read. Never rejects.
+ *
+ * @param sinceEpochMs Lower bound (inclusive) for the line timestamp.
+ * @param logPath Log file to read. Defaults to `kiroChatLogPath()`.
+ * @since 3.3.0
+ */
+export async function readStallHintDetail(
+  sinceEpochMs: number,
+  logPath: string = kiroChatLogPath(),
+): Promise<StallHintDetail | undefined> {
   try {
     const tail = await readTail(logPath, LOG_TAIL_BYTES)
     if (tail === undefined) return undefined
-    return pickHint(tail.text, tail.truncatedHead, sinceEpochMs)
+    return pickHintDetail(tail.text, tail.truncatedHead, sinceEpochMs)
   } catch {
     return undefined
   }
@@ -105,6 +128,15 @@ export function pickHint(
   truncatedHead: boolean,
   sinceEpochMs: number,
 ): string | undefined {
+  return pickHintDetail(text, truncatedHead, sinceEpochMs)?.hint
+}
+
+/** Select a line once so its display hint and full reason stay paired. */
+function pickHintDetail(
+  text: string,
+  truncatedHead: boolean,
+  sinceEpochMs: number,
+): StallHintDetail | undefined {
   const lines = text.split(/\r?\n/)
   // The first line of a mid-file read is a fragment; never trust it.
   const firstIndex = truncatedHead ? 1 : 0
@@ -116,7 +148,9 @@ export function pickHint(
     const timestamp = parseLeadingTimestamp(line)
     if (timestamp === undefined || timestamp < sinceEpochMs) continue
 
-    return truncate(line.replace(/\s+/g, " ").trim(), STALL_HINT_MAX_CHARS)
+    const normalized = line.replace(/\s+/g, " ").trim()
+    const reason = stallReason(normalized)
+    return { hint: truncate(normalized, STALL_HINT_MAX_CHARS), reason }
   }
 
   return undefined
@@ -136,4 +170,41 @@ function parseLeadingTimestamp(line: string): number | undefined {
 function truncate(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value
   return value.slice(0, maxChars - TRUNCATION_MARKER.length) + TRUNCATION_MARKER
+}
+
+// ---------------------------------------------------------------------------
+// Short reason derivation
+// ---------------------------------------------------------------------------
+
+const ERROR_SUFFIX = "Error"
+
+/** `kind: ModelOverloadedError` as serialized by kiro-cli's request errors. */
+const KIND_TOKEN_PATTERN = /\bkind:\s*([A-Z][A-Za-z0-9]*)/
+
+/** First error-kind-like word, e.g. `ConverseStreamError`. */
+const ERROR_TOKEN_PATTERN = /\b([A-Z][A-Za-z0-9]*Error)\b/
+
+/**
+ * Short, recognizable reason derived from a stall hint (a kiro-cli ERROR log
+ * line as returned by `readStallHint`). Prefers the `kind:` value when the
+ * line carries one (e.g. `kind: ModelOverloadedError`), otherwise the first
+ * error-kind-like word (e.g. `ConverseStreamError`); either way a trailing
+ * `Error` is dropped, so both examples yield `ModelOverloaded` and
+ * `ConverseStream`. Returns `undefined` when the hint is absent or carries no
+ * such token. After matching, a token immediately followed by `...` is
+ * rejected before suffix removal: it may be incomplete, so the reason is
+ * omitted rather than guessed (with no fallback for a rejected `kind:`).
+ * Tokens separated from the marker are unaffected. Pure: never throws for
+ * any input.
+ *
+ * @since 3.3.0
+ */
+export function stallReason(hint: string | undefined): string | undefined {
+  if (typeof hint !== "string" || hint.length === 0) return undefined
+  const match = KIND_TOKEN_PATTERN.exec(hint) ?? ERROR_TOKEN_PATTERN.exec(hint)
+  if (!match) return undefined
+  if (hint.startsWith(TRUNCATION_MARKER, match.index + match[0].length)) return undefined
+  const token = match[1]
+  const reason = token.endsWith(ERROR_SUFFIX) ? token.slice(0, -ERROR_SUFFIX.length) : token
+  return reason.length > 0 ? reason : undefined
 }

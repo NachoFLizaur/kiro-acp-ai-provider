@@ -261,6 +261,104 @@ describe("verifyAuth: whoami --format json detection rule", () => {
     expect(typeof status!.installed).toBe("boolean")
     expect(typeof status!.authenticated).toBe("boolean")
   })
+
+  // --- inconclusive: whoami never answered ------------------------------------
+  // Sync twin of the async cases below; both paths share one classifier.
+
+  describe("inconclusive marker (sync)", () => {
+    test("whoami timeout => authenticated false, inconclusive true", () => {
+      const err = Object.assign(new Error("Command timed out"), { code: "ETIMEDOUT", signal: "SIGTERM" })
+      spies.push(mockKiroCli({ whoami: err }))
+      mockHome()
+
+      const status = verifyAuth()
+
+      expect(status.installed).toBe(true)
+      expect(status.authenticated).toBe(false)
+      expect(status.inconclusive).toBe(true)
+    })
+
+    test("whoami spawn error (string code, no exit status) => inconclusive true", () => {
+      // execFileSync reports a failed spawn with a string code and a null status
+      const err = Object.assign(new Error("spawn kiro-cli EACCES"), { code: "EACCES", status: null })
+      spies.push(mockKiroCli({ whoami: err }))
+      mockHome()
+
+      const status = verifyAuth()
+
+      expect(status.installed).toBe(true)
+      expect(status.authenticated).toBe(false)
+      expect(status.inconclusive).toBe(true)
+    })
+
+    test("whoami non-zero exit with logged-out output => definitive, no inconclusive key", () => {
+      // kiro-cli ran and answered; the exit code alone never decides
+      const err = Object.assign(new Error("Command failed: kiro-cli whoami"), {
+        status: 1,
+        stdout: Buffer.from(WHOAMI_LOGGED_OUT),
+        stderr: Buffer.from(""),
+      })
+      spies.push(mockKiroCli({ whoami: err }))
+      mockHome()
+
+      const status = verifyAuth()
+
+      expect(status.installed).toBe(true)
+      expect(status.authenticated).toBe(false)
+      expect("inconclusive" in status).toBe(false)
+    })
+
+    test("whoami non-zero exit with logged-in output => authenticated, no inconclusive key", () => {
+      const err = Object.assign(new Error("Command failed: kiro-cli whoami"), {
+        status: 2,
+        stdout: Buffer.from(""),
+        stderr: Buffer.from(WHOAMI_LOGGED_IN),
+      })
+      spies.push(mockKiroCli({ whoami: err }))
+      mockHome()
+
+      const status = verifyAuth()
+
+      expect(status.authenticated).toBe(true)
+      expect("inconclusive" in status).toBe(false)
+    })
+
+    test("definitive JSON answers carry no inconclusive key", () => {
+      mockHome()
+      const loggedOut = mockKiroCli({ whoami: WHOAMI_LOGGED_OUT })
+      expect("inconclusive" in verifyAuth()).toBe(false)
+      loggedOut.mockRestore()
+
+      resetAuthCache()
+      spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
+      expect("inconclusive" in verifyAuth()).toBe(false)
+    })
+
+    test("version timeout => installed true and whoami decides, including its inconclusive verdict", () => {
+      const timeout = Object.assign(new Error("Command timed out"), { code: "ETIMEDOUT", signal: "SIGTERM" })
+      mockHome()
+      const answered = mockKiroCli({ version: timeout, whoami: WHOAMI_LOGGED_OUT })
+      const definitive = verifyAuth()
+      expect(definitive.installed).toBe(true)
+      expect(definitive.authenticated).toBe(false)
+      expect("inconclusive" in definitive).toBe(false)
+      answered.mockRestore()
+
+      resetAuthCache()
+      spies.push(mockKiroCli({ version: timeout, whoami: timeout }))
+      const undecided = verifyAuth()
+      expect(undecided.installed).toBe(true)
+      expect(undecided.inconclusive).toBe(true)
+    })
+
+    test("any other version failure => installed false and never inconclusive", () => {
+      const err = Object.assign(new Error("spawn kiro-cli ENOENT"), { code: "ENOENT", status: null })
+      spies.push(mockKiroCli({ version: err, whoami: WHOAMI_LOGGED_IN }))
+      mockHome()
+
+      expect(verifyAuth()).toEqual({ installed: false, authenticated: false })
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -444,6 +542,262 @@ describe("verifyAuthAsync: async probe, shared memo, coalescing", () => {
     expect(calls.length).toBe(2) // exactly one version+whoami pair
     expect(a).toEqual(b)
     expect(a.authenticated).toBe(true)
+  })
+
+  // --- fresh: memo bypass that still coalesces and refreshes the shared memo --
+
+  describe("fresh option", () => {
+    test("default call within the TTL reads the memo and spawns nothing", async () => {
+      mockHome()
+      const warm = mockAsync({ whoami: WHOAMI_LOGGED_IN })
+      await verifyAuthAsync()
+      warm.spy.mockRestore()
+
+      const { calls } = mockAsync({ whoami: WHOAMI_LOGGED_OUT }) // would flip the result if spawned
+      const status = await verifyAuthAsync()
+
+      expect(calls.length).toBe(0)
+      expect(status.authenticated).toBe(true)
+    })
+
+    test("fresh: false behaves exactly like the default", async () => {
+      mockHome()
+      const warm = mockAsync({ whoami: WHOAMI_LOGGED_IN })
+      await verifyAuthAsync()
+      warm.spy.mockRestore()
+
+      const { calls } = mockAsync({ whoami: WHOAMI_LOGGED_OUT })
+      const status = await verifyAuthAsync({ fresh: false })
+
+      expect(calls.length).toBe(0)
+      expect(status.authenticated).toBe(true)
+    })
+
+    test("fresh: true bypasses a warm memo and runs a new probe", async () => {
+      // Arrange: memo says logged in; kiro-cli has since logged out
+      mockHome()
+      const warm = mockAsync({ whoami: WHOAMI_LOGGED_IN })
+      const memoized = await verifyAuthAsync()
+      expect(memoized.authenticated).toBe(true)
+      warm.spy.mockRestore()
+
+      // Act
+      const { calls } = mockAsync({ whoami: WHOAMI_LOGGED_OUT })
+      const status = await verifyAuthAsync({ fresh: true })
+
+      // Assert: one new version+whoami pair, and the answer reflects it
+      expect(calls.filter((c) => c.args.includes("--version")).length).toBe(1)
+      expect(calls.filter((c) => c.args.includes("whoami")).length).toBe(1)
+      expect(status.authenticated).toBe(false)
+    })
+
+    test("fresh: true overwrites the shared memo that a following default call reads", async () => {
+      mockHome()
+      const warm = mockAsync({ whoami: WHOAMI_LOGGED_IN })
+      await verifyAuthAsync()
+      warm.spy.mockRestore()
+
+      const refreshed = mockAsync({ whoami: WHOAMI_LOGGED_OUT })
+      const fresh = await verifyAuthAsync({ fresh: true })
+      refreshed.spy.mockRestore()
+
+      // A default call now reads the refreshed memo without spawning
+      const { calls } = mockAsync({ whoami: WHOAMI_LOGGED_IN })
+      const afterwards = await verifyAuthAsync()
+
+      expect(calls.length).toBe(0)
+      expect(afterwards).toEqual(fresh)
+      expect(afterwards.authenticated).toBe(false)
+    })
+
+    test("fresh: true overwrites the memo the sync verifyAuth() reads too", async () => {
+      mockHome()
+      const warm = mockAsync({ whoami: WHOAMI_LOGGED_IN })
+      await verifyAuthAsync()
+      warm.spy.mockRestore()
+
+      const refreshed = mockAsync({ whoami: WHOAMI_LOGGED_OUT })
+      const fresh = await verifyAuthAsync({ fresh: true })
+      refreshed.spy.mockRestore()
+
+      const syncSpy = mockKiroCli({ whoami: WHOAMI_LOGGED_IN }) // would flip the result if spawned
+      spies.push(syncSpy)
+      const syncStatus = verifyAuth()
+
+      expect(syncSpy).toHaveBeenCalledTimes(0)
+      expect(syncStatus).toEqual(fresh)
+      expect(syncStatus.authenticated).toBe(false)
+    })
+
+    test("fresh: true joins a probe already in flight instead of spawning a second", async () => {
+      mockHome()
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      const { calls } = mockAsync({ whoami: WHOAMI_LOGGED_IN, gate })
+
+      // A default probe is in flight; a fresh caller arrives before it answers
+      const inFlight = verifyAuthAsync()
+      const fresh = verifyAuthAsync({ fresh: true })
+      release()
+      const [a, b] = await Promise.all([inFlight, fresh])
+
+      expect(calls.length).toBe(2) // exactly one version+whoami pair
+      expect(a).toEqual(b)
+      expect(a.authenticated).toBe(true)
+    })
+
+    test("two fresh callers in flight coalesce onto one probe", async () => {
+      mockHome()
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      const { calls } = mockAsync({ whoami: WHOAMI_LOGGED_OUT, gate })
+
+      const first = verifyAuthAsync({ fresh: true })
+      const second = verifyAuthAsync({ fresh: true })
+      release()
+      const [a, b] = await Promise.all([first, second])
+
+      expect(calls.length).toBe(2)
+      expect(a).toEqual(b)
+      expect(a.authenticated).toBe(false)
+    })
+
+    test("fresh: true on a cold memo probes once, like the default", async () => {
+      mockHome()
+      const { calls } = mockAsync({ whoami: WHOAMI_LOGGED_IN })
+
+      const status = await verifyAuthAsync({ fresh: true })
+
+      expect(calls.length).toBe(2)
+      expect(status.authenticated).toBe(true)
+    })
+
+    test("fresh: true never rejects when both spawns fail", async () => {
+      mockHome()
+      mockAsync({ version: new Error("boom"), whoami: new Error("kaboom") })
+
+      await expect(verifyAuthAsync({ fresh: true })).resolves.toEqual({ installed: false, authenticated: false })
+    })
+  })
+
+  // --- inconclusive: whoami never answered (async twin of the sync cases) ------
+
+  describe("inconclusive marker (async)", () => {
+    test("whoami timeout (SIGTERM kill) => authenticated false, inconclusive true", async () => {
+      mockHome()
+      const err = Object.assign(new Error("Command timed out"), { killed: true, signal: "SIGTERM", code: null })
+      mockAsync({ whoami: err })
+
+      const status = await verifyAuthAsync()
+
+      expect(status.installed).toBe(true)
+      expect(status.authenticated).toBe(false)
+      expect(status.inconclusive).toBe(true)
+    })
+
+    test("whoami spawn error (string code, no exit status) => inconclusive true", async () => {
+      mockHome()
+      const err = Object.assign(new Error("spawn kiro-cli ENOENT"), { code: "ENOENT", syscall: "spawn kiro-cli" })
+      mockAsync({ whoami: err })
+
+      const status = await verifyAuthAsync()
+
+      expect(status.installed).toBe(true)
+      expect(status.authenticated).toBe(false)
+      expect(status.inconclusive).toBe(true)
+    })
+
+    test("whoami non-zero exit with logged-out output => definitive, no inconclusive key", async () => {
+      // execFile reports a non-zero exit with a numeric code; kiro-cli answered
+      mockHome()
+      const err = Object.assign(new Error("exit 1"), { code: 1 })
+      mockAsync({ whoami: { error: err, stdout: WHOAMI_LOGGED_OUT } })
+
+      const status = await verifyAuthAsync()
+
+      expect(status.installed).toBe(true)
+      expect(status.authenticated).toBe(false)
+      expect("inconclusive" in status).toBe(false)
+    })
+
+    test("whoami non-zero exit with logged-in output => authenticated, no inconclusive key", async () => {
+      mockHome()
+      const err = Object.assign(new Error("exit 1"), { code: 1 })
+      mockAsync({ whoami: { error: err, stderr: WHOAMI_LOGGED_IN } })
+
+      const status = await verifyAuthAsync()
+
+      expect(status.authenticated).toBe(true)
+      expect("inconclusive" in status).toBe(false)
+    })
+
+    test("definitive JSON answers carry no inconclusive key", async () => {
+      mockHome()
+      const loggedOut = mockAsync({ whoami: WHOAMI_LOGGED_OUT })
+      expect("inconclusive" in (await verifyAuthAsync())).toBe(false)
+      loggedOut.spy.mockRestore()
+
+      resetAuthCache()
+      mockAsync({ whoami: WHOAMI_LOGGED_IN })
+      expect("inconclusive" in (await verifyAuthAsync())).toBe(false)
+    })
+
+    test("version timeout => installed true and whoami decides, including its inconclusive verdict", async () => {
+      mockHome()
+      const timeout = Object.assign(new Error("Command timed out"), { killed: true, signal: "SIGTERM", code: null })
+      const answered = mockAsync({ version: timeout, whoami: WHOAMI_LOGGED_OUT })
+      const definitive = await verifyAuthAsync()
+      expect(definitive.installed).toBe(true)
+      expect(definitive.authenticated).toBe(false)
+      expect(definitive.version).toBeUndefined()
+      expect("inconclusive" in definitive).toBe(false)
+      answered.spy.mockRestore()
+
+      resetAuthCache()
+      mockAsync({ version: timeout, whoami: timeout })
+      const undecided = await verifyAuthAsync()
+      expect(undecided.installed).toBe(true)
+      expect(undecided.inconclusive).toBe(true)
+    })
+
+    test("any other version failure => installed false and never inconclusive", async () => {
+      mockHome()
+      const err = Object.assign(new Error("spawn kiro-cli ENOENT"), { code: "ENOENT" })
+      const { calls } = mockAsync({ version: err, whoami: WHOAMI_LOGGED_IN })
+
+      const status = await verifyAuthAsync()
+
+      expect(status).toEqual({ installed: false, authenticated: false })
+      expect(calls.filter((c) => c.args.includes("whoami")).length).toBe(0)
+    })
+
+    test("sync and async paths agree on the inconclusive verdict", async () => {
+      // Arrange: the same whoami timeout on both spawn mechanics
+      mockHome()
+      const syncTimeout = Object.assign(new Error("Command timed out"), { code: "ETIMEDOUT", signal: "SIGTERM" })
+      const asyncTimeout = Object.assign(new Error("Command timed out"), { killed: true, signal: "SIGTERM", code: null })
+
+      spies.push(mockKiroCli({ whoami: syncTimeout }))
+      const syncStatus = verifyAuth()
+      resetAuthCache()
+      mockAsync({ whoami: asyncTimeout })
+      const asyncStatus = await verifyAuthAsync({ fresh: true })
+
+      // Assert
+      expect(syncStatus.inconclusive).toBe(true)
+      expect(asyncStatus.inconclusive).toBe(true)
+      expect(asyncStatus).toEqual(syncStatus)
+    })
+
+    test("a fresh probe reports inconclusive the same way as the default", async () => {
+      mockHome()
+      const err = Object.assign(new Error("spawn kiro-cli EACCES"), { code: "EACCES" })
+      mockAsync({ whoami: err })
+
+      const status = await verifyAuthAsync({ fresh: true })
+
+      expect(status).toMatchObject({ installed: true, authenticated: false, inconclusive: true })
+    })
   })
 
   // --- spawn options: win32 shell resolution + verbatim timeouts -------------
