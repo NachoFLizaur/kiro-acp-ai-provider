@@ -56,8 +56,9 @@ const STALE_AGENT_CONFIG_PATTERN = /^opencode-[a-zA-Z0-9_-]+\.json$/
  * Generate the agent configuration object for kiro-cli.
  *
  * Configures: MCP-only tools (no built-ins), auto-approve all MCP calls,
- * MCP bridge server via stdio, and a meta-prompt that defers to per-request
- * `<system_instructions>`.
+ * MCP bridge server via stdio, and a meta-prompt that follows the latest
+ * `<system_instructions>` block received in the session
+ * (see `KiroACPLanguageModel` for when the block is sent).
  */
 export function generateAgentConfig(options: AgentConfigOptions): Record<string, unknown> {
   // Extract unique suffix from tools file path for per-session MCP server naming.
@@ -84,7 +85,7 @@ export function generateAgentConfig(options: AgentConfigOptions): Record<string,
     },
     prompt:
       options.prompt ??
-      `You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block included with each request. Always follow the latest <system_instructions> as your primary directive — they define who you are, how you behave, and what tools you should use. If no <system_instructions> are present, act as a helpful coding assistant that follows instructions precisely and uses tools proactively. If a tool call fails, retry it or try alternative approaches — do not assume a tool is permanently unavailable based on a single failure.`,
+      `You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block received in this session. A <system_instructions> block received earlier in this session stays in force until a newer one arrives. Always follow the most recent <system_instructions> block received in this session as your primary directive — it defines who you are, how you behave, and what tools you should use. Only if no <system_instructions> block has been received in this session, act as a helpful coding assistant that follows instructions precisely and uses tools proactively. If a tool call fails, retry it or try alternative approaches — do not assume a tool is permanently unavailable based on a single failure.`,
     ...(options.model ? { model: options.model } : {}),
   }
 }
@@ -102,7 +103,7 @@ export function generateToollessAgentConfig(options: { name?: string; prompt?: s
     mcpServers: {},
     prompt:
       options.prompt ??
-      `You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block included with each request. Always follow the latest <system_instructions> as your primary directive — they define who you are, how you behave, and what tools you should use. If no <system_instructions> are present, act as a helpful coding assistant that follows instructions precisely and uses tools proactively. If a tool call fails, retry it or try alternative approaches — do not assume a tool is permanently unavailable based on a single failure.`,
+      `You are a coding assistant that operates under different agent identities. Your identity, behavior, and instructions are defined by the <system_instructions> block received in this session. A <system_instructions> block received earlier in this session stays in force until a newer one arrives. Always follow the most recent <system_instructions> block received in this session as your primary directive — it defines who you are, how you behave, and what tools you should use. Only if no <system_instructions> block has been received in this session, act as a helpful coding assistant that follows instructions precisely and uses tools proactively. If a tool call fails, retry it or try alternative approaches — do not assume a tool is permanently unavailable based on a single failure.`,
     ...(options.model ? { model: options.model } : {}),
   }
 }

@@ -1,5 +1,11 @@
 import { describe, test, expect, afterEach } from "bun:test"
-import { writeAgentConfig, removeAgentConfig, agentConfigPath } from "../src/agent-config"
+import {
+  writeAgentConfig,
+  removeAgentConfig,
+  agentConfigPath,
+  generateAgentConfig,
+  generateToollessAgentConfig,
+} from "../src/agent-config"
 import {
   mkdtempSync,
   mkdirSync,
@@ -16,6 +22,43 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 
 const DAY_MS = 24 * 60 * 60 * 1000
+
+describe("agent config meta-prompt", () => {
+  const baseOptions = {
+    mcpBridgePath: "/path/to/bridge.js",
+    toolsFilePath: "/path/to/tools.json",
+    cwd: "/project",
+  }
+
+  for (const [name, generate] of [
+    ["generateAgentConfig", (prompt?: string) => generateAgentConfig({ ...baseOptions, prompt })],
+    ["generateToollessAgentConfig", (prompt?: string) => generateToollessAgentConfig({ prompt })],
+  ] as const) {
+    test(`${name} keeps session instructions in force until replaced`, () => {
+      const { prompt } = generate()
+
+      expect(prompt).toContain(
+        "A <system_instructions> block received earlier in this session stays in force until a newer one arrives.",
+      )
+      expect(prompt).toContain(
+        "Always follow the most recent <system_instructions> block received in this session as your primary directive",
+      )
+      expect(prompt).toContain(
+        "Only if no <system_instructions> block has been received in this session, act as a helpful coding assistant",
+      )
+      expect(prompt).not.toContain("each request")
+    })
+
+    test(`${name} preserves explicit prompt overrides, including an empty string`, () => {
+      expect(generate("Custom instructions").prompt).toBe("Custom instructions")
+      expect(generate("").prompt).toBe("")
+    })
+  }
+
+  test("both generators use identical default meta-prompts", () => {
+    expect(generateAgentConfig(baseOptions).prompt).toBe(generateToollessAgentConfig({}).prompt)
+  })
+})
 
 /** Create `path` with the given content and back-date its modification time. */
 function writeAged(path: string, ageMs: number, content = "{}"): void {

@@ -1,4 +1,5 @@
 import { describe, test, expect, afterEach } from "bun:test"
+import { createConnection } from "node:net"
 import {
   createIPCServer,
   type IPCServer,
@@ -130,6 +131,45 @@ describe("IPCServer", () => {
         expect(body.status).toBe("error")
       } catch {
         // Connection error is also acceptable — server closed
+      }
+    })
+
+    test("stops with an open connection and delivers pending shutdown responses", async () => {
+      server = createIPCServer()
+      port = await server.start()
+      secret = server.getSecret()
+
+      // An accepted connection without a request must not keep stop() waiting.
+      const idleSocket = createConnection({ host: "127.0.0.1", port })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          idleSocket.once("connect", resolve)
+          idleSocket.once("error", reject)
+        })
+
+        const registered = new Promise<void>((resolve) => {
+          server.getLaneRouter().register("sess-shutdown", () => resolve())
+        })
+        const callPromise = httpRequest(port, "POST", "/tool/pending", {
+          callId: "call-shutdown",
+          toolName: "bash",
+          args: {},
+        }, secret)
+        await registered
+        expect(server.getPendingCount()).toBe(1)
+
+        // No connection-error fallback: the complete shutdown JSON must arrive.
+        const [response] = await Promise.all([callPromise, server.stop()])
+        expect(response.status).toBe(200)
+        expect(response.body).toEqual({
+          status: "error",
+          error: "IPC server shutting down",
+          code: "SERVER_SHUTDOWN",
+        })
+        expect(server.getPendingCount()).toBe(0)
+        expect(server.getPort()).toBeNull()
+      } finally {
+        idleSocket.destroy()
       }
     })
   })

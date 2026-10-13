@@ -8,6 +8,23 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file was introduced after 3.1.0 was published; the 3.1.0 entry below is
 retroactive and earlier releases are recorded by their git tags only.
 
+## [3.3.1] - 2026-10-13
+
+### Fixed
+
+- The system prompt is no longer re-sent with every prompt. Each turn used to
+  add another full copy to the kiro session's history (about 4.5k tokens per turn
+  with OpenCode). It is now sent once per kiro session, and again when it changes,
+  after kiro compacts or clears the session, after kiro-cli restarts, after a
+  cancelled or failed send, or on every prompt while context usage is at or above
+  70%. If kiro compacts during a long tool loop below 70% usage, the instructions
+  can be missing until the next prompt.
+- The default agent prompt now tells the model that earlier instructions stay
+  in force until a newer block arrives. If you set `agentPrompt`, remove any
+  wording that says instructions come with each request.
+- Stopping the provider no longer hangs when a connection to its internal
+  tool-bridge (IPC) server is still open, as happened with Bun 1.4.
+
 ## [3.3.0] - 2026-10-01
 
 ### Added
@@ -154,7 +171,8 @@ These issues are pre-existing, with fixes planned for the next release:
 See the [v3.0.0 tag](https://github.com/NachoFLizaur/kiro-acp-ai-provider/releases/tag/v3.0.0)
 and its commit history for the changes in this release.
 
-[3.3.0]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.2.0...HEAD
+[3.3.1]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.3.0...HEAD
+[3.3.0]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.1.1...v3.2.0
 [3.1.1]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.1.0...v3.1.1
 [3.1.0]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.0.0...v3.1.0

@@ -246,7 +246,7 @@ This is necessary because kiro-cli's MCP tool result path doesn't reliably handl
 
 ## Known Limitations
 
-- **System prompt**: Kiro's base context is always present; yours is injected via `<system_instructions>` tags
+- **System prompt**: Kiro's own base context is always present and can't be replaced. The host's system prompt is sent in `<system_instructions>` tags on the first prompt of a kiro session, and again only when it changes, after kiro compacts or clears the session, after kiro-cli restarts, after a cancelled or failed send, or on every prompt once context usage reaches 70%. If kiro compacts during a long tool loop below 70% usage, the instructions can be missing for the rest of that turn and are sent again with the next prompt.
 - **Limited per-turn options**: Temperature and similar sampling parameters are controlled by kiro-cli. Reasoning effort is the exception (see Reasoning effort)
 - **Estimated token counts**: Input tokens estimated from context usage %, output from character count
 - **Process model**: One kiro-cli per provider instance (subagent sessions get their own isolated process); concurrent sessions use lane routing

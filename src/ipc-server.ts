@@ -165,8 +165,13 @@ class IPCServerImpl implements IPCServer {
     this.laneRouter.clear()
 
     if (this.server) {
+      // Resolving pending calls resumes their handlers in the next microtask.
+      // Let respond() end the SERVER_SHUTDOWN responses before dropping sockets.
+      await Promise.resolve()
       await new Promise<void>((resolve) => {
         this.server!.close(() => resolve())
+        this.server!.closeIdleConnections?.()
+        this.server!.closeAllConnections?.()
       })
       this.server = null
       this.port = null

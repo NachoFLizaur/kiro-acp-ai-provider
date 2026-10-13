@@ -3,6 +3,7 @@ import { KiroACPLanguageModel, type KiroACPModelConfig } from "../src/kiro-acp-m
 import { resetAuthCache } from "../src/kiro-auth"
 import { KiroACPError, KiroACPConnectionError, KIRO_NOT_LOGGED_IN_REASON, isKiroNotLoggedInError } from "../src/acp-client"
 import type { ACPClient, ACPSession, SessionUpdate, PromptOptions } from "../src/acp-client"
+import { InstructionDeliveryLedger, INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT, type InstructionDeliveryToken } from "../src/delivery-ledger"
 import type { IPCServer, PendingToolCall, ToolResultRequest } from "../src/ipc-server"
 import { LaneRouter } from "../src/lane-router"
 import type {
@@ -51,9 +52,17 @@ function createMockIPCServer(overrides: Partial<IPCServer> = {}): IPCServer {
   }
 }
 
-/** Create a minimal mock ACPClient. */
-function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
+/** One client-owned ledger and shared session, even across model instances. */
+function createMockClient(
+  overrides: Partial<ACPClient> = {},
+  deliveryLedger = new InstructionDeliveryLedger(),
+): ACPClient {
   const mockLaneRouter = new LaneRouter()
+  const sharedSession: ACPSession = {
+    sessionId: "sess-1",
+    modes: { currentModeId: "agent", availableModes: [] },
+    models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+  }
   // Real promise-chain mutex (mirrors ACPClient.withEnsureClientLock) so that
   // ensureClient() serializes concurrent callers in tests just like production.
   let ensureClientLock: Promise<void> = Promise.resolve()
@@ -80,22 +89,20 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
       }),
     ),
     stop: mock(() => Promise.resolve()),
-    createSession: mock(() =>
-      Promise.resolve({
-        sessionId: "sess-1",
-        modes: { currentModeId: "agent", availableModes: [] },
-        models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
-      } satisfies ACPSession),
-    ),
-    createSessionWithToolsPath: mock(() =>
-      Promise.resolve({
-        sessionId: "sess-1",
-        modes: { currentModeId: "agent", availableModes: [] },
-        models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
-      } satisfies ACPSession),
-    ),
+    createSession: mock(() => Promise.resolve(sharedSession)),
+    createSessionWithToolsPath: mock(() => Promise.resolve(sharedSession)),
     loadSession: mock(() => Promise.resolve({} as ACPSession)),
     prompt: mock(() => Promise.resolve({ stopReason: "end_turn" })),
+    needsInstructions: mock((sessionId: string, text: string, options?: { highWater?: number }) =>
+      deliveryLedger.needsInstructions(sessionId, text, options)),
+    openInstructionDelivery: mock((sessionId: string, text: string) => deliveryLedger.open(sessionId, text)),
+    acknowledgeInstructionDelivery: mock((token: InstructionDeliveryToken, stopReason: string) =>
+      deliveryLedger.acknowledge(token, stopReason)),
+    failInstructionDelivery: mock((token: InstructionDeliveryToken) => deliveryLedger.fail(token)),
+    invalidateInstructions: mock((sessionId?: string) => {
+      if (sessionId) deliveryLedger.invalidate(sessionId)
+      else deliveryLedger.invalidateAll()
+    }),
     setModel: mock(() => Promise.resolve()),
     setMode: mock(() => Promise.resolve()),
     executeCommand: mock(() =>
@@ -869,6 +876,440 @@ describe("KiroACPLanguageModel", () => {
       const textContent = (capturedPrompt[0] as { text: string }).text
       expect(textContent).not.toContain("<system_instructions>")
       expect(textContent).toBe("just a question")
+    })
+  })
+
+  describe("instruction delivery ledger — AC1/AC2/AC4/AC5", () => {
+    function deliveryOptions(systemText: string | undefined = "A", image = false): LanguageModelV3CallOptions {
+      const prompt: LanguageModelV3Prompt = []
+      if (systemText !== undefined) prompt.push({ role: "system", content: systemText })
+      prompt.push({
+        role: "user",
+        content: image
+          ? [{ type: "text", text: "hello" }, { type: "file", data: "imgdata", mediaType: "image/png" }]
+          : [{ type: "text", text: "hello" }],
+      })
+      return makeCallOptions(prompt)
+    }
+
+    function deferredPrompt() {
+      let resolve!: (result: { stopReason: string }) => void
+      let reject!: (error: Error) => void
+      const promise = new Promise<{ stopReason: string }>((res, rej) => {
+        resolve = res
+        reject = rej
+      })
+      return { promise, resolve, reject }
+    }
+
+    function deliveryFixture(onPrompt?: (opts: PromptOptions, index: number) => Promise<{ stopReason: string }>) {
+      const ledger = new InstructionDeliveryLedger()
+      const calls: PromptOptions[] = []
+      const cwd = createTempToolsDir()
+      // Every acquisition (including another model's) returns THIS session.
+      // Tests change its ID explicitly when they need another ACP session.
+      const session: ACPSession = {
+        sessionId: "sess-1",
+        modes: { currentModeId: "agent", availableModes: [] },
+        models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+      }
+      const client = createMockClient({
+        isRunning: mock(() => true),
+        getCwd: mock(() => cwd),
+        createSession: mock(async () => session),
+        createSessionWithToolsPath: mock(async () => session),
+        loadSession: mock(async () => session),
+        createSessionToolsFilePath: mock((id: string) => join(cwd, `tools-${id}.json`)),
+        prompt: mock((opts: PromptOptions) => {
+          calls.push(opts)
+          opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "response" } })
+          return onPrompt?.(opts, calls.length - 1) ?? Promise.resolve({ stopReason: "end_turn" })
+        }),
+      }, ledger)
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, stall: { afterMs: 0 } })
+      return { ledger, calls, session, client, model }
+    }
+
+    function carriesInstructions(call: PromptOptions): boolean {
+      return call.prompt.some((block) => block.type === "text" && block.text?.includes("<system_instructions>"))
+    }
+
+    async function finish(model: KiroACPLanguageModel, options = deliveryOptions()) {
+      return collectStream((await model.doStream(options)).stream)
+    }
+
+    function toolResultOptions(image: boolean): LanguageModelV3CallOptions {
+      return makeCallOptions([
+        ...deliveryOptions().prompt,
+        { role: "assistant", content: [{ type: "tool-call", toolCallId: "tc-delivery", toolName: "screenshot", input: "{}" }] },
+        {
+          role: "tool",
+          content: [{
+            type: "tool-result",
+            toolCallId: "tc-delivery",
+            toolName: "screenshot",
+            output: image
+              ? { type: "content", value: [{ type: "image-data", data: "imgdata", mediaType: "image/png" }] }
+              : { type: "text", value: "done" },
+          }],
+        },
+      ])
+    }
+
+    for (const image of [false, true]) {
+      test(`AC1: turn 2 on the same session omits instructions (${image ? "image" : "text"})`, async () => {
+        const { client, calls, model } = deliveryFixture()
+        await finish(model, deliveryOptions("A", image))
+        await finish(model, deliveryOptions("A", image))
+
+        expect(calls.map(carriesInstructions)).toEqual([true, false])
+        expect(calls.map((call) => call.sessionId)).toEqual(["sess-1", "sess-1"])
+        expect(calls[0].prompt[0]).toEqual({
+          type: "text",
+          text: `<system_instructions>\nA\n</system_instructions>${image ? "" : "\n\nhello"}`,
+        })
+        expect(calls[1].prompt).toEqual(image
+          ? [{ type: "text", text: "hello" }, { type: "image", data: "imgdata", mimeType: "image/png" }]
+          : [{ type: "text", text: "hello" }])
+        expect(client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+        expect(client.acknowledgeInstructionDelivery).toHaveBeenCalledTimes(1)
+      })
+    }
+
+    test("AC2: two model instances sharing one client/session deliver once, regardless of affinity", async () => {
+      const { client, calls, model } = deliveryFixture()
+      const other = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const first = deliveryOptions()
+      first.headers = { "x-session-affinity": "first-model" }
+      const second = deliveryOptions()
+      second.headers = { "x-session-affinity": "second-model" }
+      await finish(model, first)
+      await finish(other, second)
+
+      expect(calls.map((call) => call.sessionId)).toEqual(["sess-1", "sess-1"])
+      expect(calls.map(carriesInstructions)).toEqual([true, false])
+      expect(client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+    })
+
+    test("AC2: a different acquired session ID receives its own first delivery", async () => {
+      const { calls, session, model } = deliveryFixture()
+      await finish(model)
+      session.sessionId = "sess-2"
+      await finish(model)
+      await finish(model)
+      session.sessionId = "sess-1"
+      await finish(model)
+
+      expect(calls.map((call) => call.sessionId)).toEqual(["sess-1", "sess-2", "sess-2", "sess-1"])
+      expect(calls.map(carriesInstructions)).toEqual([true, true, false, false])
+    })
+
+    test("AC1/AC2: exact joined system text controls change detection", async () => {
+      const { calls, model } = deliveryFixture()
+      const multiple = deliveryOptions("A")
+      multiple.prompt.splice(1, 0, { role: "system", content: "B" })
+      await finish(model, multiple)
+      await finish(model, deliveryOptions("A\n\nB"))
+      await finish(model, deliveryOptions("A\n\nB "))
+
+      expect(calls[0].prompt[0].text).toBe("<system_instructions>\nA\n\nB\n</system_instructions>\n\nhello")
+      expect(calls.map(carriesInstructions)).toEqual([true, false, true])
+    })
+
+    for (const allSessions of [false, true]) {
+      test(`AC2: ${allSessions ? "client-wide" : "session"} invalidation re-sends`, async () => {
+        const { client, calls, model } = deliveryFixture()
+        await finish(model)
+        client.invalidateInstructions(allSessions ? undefined : "sess-1")
+        await finish(model)
+        await finish(model)
+        expect(calls.map(carriesInstructions)).toEqual([true, true, false])
+      })
+    }
+
+    test("AC13: lower recorded usage preserves suppression on later turns", async () => {
+      const { ledger, calls, model } = deliveryFixture()
+      ledger.recordUsage("sess-1", 40)
+      await finish(model)
+      ledger.recordUsage("sess-1", 20)
+      await finish(model)
+      await finish(model)
+      expect(calls.map(carriesInstructions)).toEqual([true, false, false])
+    })
+
+    test("AC1/AC2: below 70 suppresses; at and above 70 re-send on every fresh turn", async () => {
+      const { ledger, client, calls, model } = deliveryFixture()
+      ledger.recordUsage("sess-1", INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT - 1)
+      await finish(model)
+      await finish(model)
+      ledger.recordUsage("sess-1", INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT)
+      await finish(model)
+      await finish(model)
+      ledger.recordUsage("sess-1", INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT + 1)
+      await finish(model)
+      expect(calls.map(carriesInstructions)).toEqual([true, false, true, true, true])
+      expect(client.needsInstructions).toHaveBeenCalledWith("sess-1", "A", {
+        highWater: INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT,
+      })
+    })
+
+    test("AC4: token opens before transport send and non-cancelled completion acknowledges it", async () => {
+      const fixture = deliveryFixture(() => {
+        expect(fixture.client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+        expect(fixture.client.acknowledgeInstructionDelivery).not.toHaveBeenCalled()
+        expect(fixture.ledger.needsInstructions("sess-1", "A")).toBe(true)
+        return Promise.resolve({ stopReason: "max_tokens" })
+      })
+      await finish(fixture.model)
+      expect(fixture.client.acknowledgeInstructionDelivery).toHaveBeenCalledTimes(1)
+      expect(fixture.ledger.needsInstructions("sess-1", "A")).toBe(false)
+    })
+
+    for (const outcome of ["cancelled", "rejected", "invalidated-in-flight", "previous-generation"] as const) {
+      test(`AC4: ${outcome} delivery cannot suppress the next turn`, async () => {
+        const pending = deferredPrompt()
+        const { ledger, client, calls, model } = deliveryFixture((_opts, index) => index === 0
+          ? pending.promise : Promise.resolve({ stopReason: "end_turn" }))
+        const first = await model.doStream(deliveryOptions())
+        const collected = collectStream(first.stream)
+        expect(client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+        expect(client.acknowledgeInstructionDelivery).not.toHaveBeenCalled()
+        if (outcome === "invalidated-in-flight") client.invalidateInstructions("sess-1")
+        if (outcome === "previous-generation") ledger.advanceGeneration()
+        if (outcome === "rejected") pending.reject(new Error("delivery rejected"))
+        else pending.resolve({ stopReason: outcome === "cancelled" ? "cancelled" : "end_turn" })
+        const parts = await collected
+        if (outcome === "rejected") expect(parts.some((part) => part.type === "error")).toBe(true)
+        await finish(model)
+        await finish(model)
+        expect(calls.map(carriesInstructions)).toEqual([true, true, false])
+      })
+    }
+
+    for (const outcome of ["cancelled", "rejected"] as const) {
+      test(`AC4: acknowledged A then ${outcome} B does not restore A's proof`, async () => {
+        const { calls, model } = deliveryFixture((_opts, index) => {
+          if (index === 1) return outcome === "cancelled"
+            ? Promise.resolve({ stopReason: "cancelled" })
+            : Promise.reject(new Error("replacement rejected"))
+          return Promise.resolve({ stopReason: "end_turn" })
+        })
+        await finish(model, deliveryOptions("A"))
+        await finish(model, deliveryOptions("B"))
+        await finish(model, deliveryOptions("A"))
+        await finish(model, deliveryOptions("A"))
+        expect(calls.map(carriesInstructions)).toEqual([true, true, true, false])
+      })
+    }
+
+    test("AC4: in-flight delivery never suppresses another send of the same text", async () => {
+      const older = deferredPrompt()
+      const newer = deferredPrompt()
+      const { client, calls, model } = deliveryFixture((_opts, index) => index === 0
+        ? older.promise : index === 1 ? newer.promise : Promise.resolve({ stopReason: "end_turn" }))
+      const other = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const first = await model.doStream(deliveryOptions())
+      const firstCollected = collectStream(first.stream)
+      const second = await other.doStream(deliveryOptions())
+      const secondCollected = collectStream(second.stream)
+      expect(calls.map(carriesInstructions)).toEqual([true, true])
+      newer.resolve({ stopReason: "end_turn" })
+      await secondCollected
+      older.resolve({ stopReason: "end_turn" })
+      await firstCollected
+      await finish(other)
+      expect(calls.map(carriesInstructions)).toEqual([true, true, false])
+    })
+
+    test("AC4: overlapping A/B reverse settlement preserves B's newer proof", async () => {
+      const older = deferredPrompt()
+      const newer = deferredPrompt()
+      const { ledger, client, calls, model } = deliveryFixture((_opts, index) => index === 0
+        ? older.promise : index === 1 ? newer.promise : Promise.resolve({ stopReason: "end_turn" }))
+      ledger.recordUsage("sess-1", INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT - 1)
+      const other = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const first = await model.doStream(deliveryOptions("A"))
+      const firstCollected = collectStream(first.stream)
+      const second = await other.doStream(deliveryOptions("B"))
+      const secondCollected = collectStream(second.stream)
+      newer.resolve({ stopReason: "end_turn" })
+      await secondCollected
+      older.resolve({ stopReason: "end_turn" })
+      await firstCollected
+      await finish(other, deliveryOptions("B"))
+      expect(calls.map(carriesInstructions)).toEqual([true, true, false])
+      expect(client.acknowledgeInstructionDelivery).toHaveBeenCalledTimes(2)
+      expect(ledger.needsInstructions("sess-1", "B")).toBe(false)
+    })
+
+    test("AC4: a throwing acknowledgement is guarded without changing stream completion", async () => {
+      const { client, calls, model } = deliveryFixture()
+      const acknowledge = spyOn(client, "acknowledgeInstructionDelivery").mockImplementation(() => {
+        throw new Error("acknowledgement failed")
+      })
+      try {
+        const parts = await finish(model)
+        const completed = parts.find((part) => part.type === "finish")
+        expect(completed).toMatchObject({ type: "finish", finishReason: { unified: "stop" } })
+        expect(parts.some((part) => part.type === "error")).toBe(false)
+      } finally {
+        acknowledge.mockRestore()
+      }
+      await finish(model)
+      expect(calls.map(carriesInstructions)).toEqual([true, true])
+    })
+
+    test("AC4/AC5: a tool-result resume acknowledges once, only when the original promise settles", async () => {
+      const pending = deferredPrompt()
+      const fixture = deliveryFixture((_opts, index) => {
+        if (index !== 0) return Promise.resolve({ stopReason: "end_turn" })
+        fixture.client.getLaneRouter().route({ callId: "tc-delivery", toolName: "screenshot", args: {} })
+        return pending.promise
+      })
+      await finish(fixture.model)
+      expect(fixture.client.acknowledgeInstructionDelivery).not.toHaveBeenCalled()
+      expect(fixture.ledger.needsInstructions("sess-1", "A")).toBe(true)
+      const resume = await fixture.model.doStream(toolResultOptions(false))
+      const collected = collectStream(resume.stream)
+      expect(resume.request?.body).toBe("[tool result resumption]")
+      expect(fixture.client.prompt).toHaveBeenCalledTimes(1)
+      expect(fixture.client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+      expect(fixture.client.acknowledgeInstructionDelivery).not.toHaveBeenCalled()
+      pending.resolve({ stopReason: "end_turn" })
+      await collected
+      expect(fixture.client.acknowledgeInstructionDelivery).toHaveBeenCalledTimes(1)
+      await finish(fixture.model)
+      expect(fixture.calls.map(carriesInstructions)).toEqual([true, false])
+    })
+
+    for (const abortOutcome of ["cancelled", "rejected", "end_turn"] as const) {
+      test(`AC4/AC5: image follow-up abort (${abortOutcome}) fails original delivery and stays block-free`, async () => {
+        const pending = deferredPrompt()
+        const fixture = deliveryFixture((opts, index) => {
+          if (index !== 0) return Promise.resolve({ stopReason: "end_turn" })
+          fixture.client.getLaneRouter().route({ callId: "tc-delivery", toolName: "screenshot", args: {} })
+          opts.signal?.addEventListener("abort", () => {
+            if (abortOutcome === "rejected") pending.reject(new Error("original aborted"))
+            else pending.resolve({ stopReason: abortOutcome })
+          }, { once: true })
+          return pending.promise
+        })
+        await finish(fixture.model)
+        await finish(fixture.model, toolResultOptions(true))
+        expect(fixture.calls[0].signal?.aborted).toBe(true)
+        expect(fixture.calls[1].prompt[1]).toEqual({ type: "image", data: "imgdata", mimeType: "image/png" })
+        expect(fixture.client.failInstructionDelivery).toHaveBeenCalledTimes(1)
+        expect(fixture.client.acknowledgeInstructionDelivery).not.toHaveBeenCalled()
+        await finish(fixture.model)
+        expect(fixture.calls.map(carriesInstructions)).toEqual([true, false, true])
+      })
+    }
+
+    test("AC5: replay text is unchanged and its delivery suppresses the next normal turn", async () => {
+      const { client, calls, model } = deliveryFixture()
+      const replay = makeCallOptions([
+        { role: "system", content: "A" },
+        { role: "system", content: "B" },
+        { role: "user", content: [{ type: "text", text: "first question" }] },
+        { role: "assistant", content: [{ type: "text", text: "first answer" }] },
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+      ], { headers: { "x-session-reset": "true" } })
+      await finish(model, replay)
+      expect(calls[0].prompt).toEqual([{
+        type: "text",
+        text: "<system_instructions>\nA\n\nB\n</system_instructions>\n\n<context>\nAssistant: first answer\n\nUser: first question\n</context>\n\nResume and act on the following message.\n\nhello",
+      }])
+      await finish(model, deliveryOptions("A\n\nB"))
+      expect(calls.map(carriesInstructions)).toEqual([true, false])
+      expect(client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+      expect(client.acknowledgeInstructionDelivery).toHaveBeenCalledTimes(1)
+    })
+
+    test("AC5: tool results without a pending turn fall through the ledger-aware fresh path", async () => {
+      const { calls, model } = deliveryFixture()
+      await finish(model, toolResultOptions(false))
+      await finish(model, toolResultOptions(false))
+      expect(calls.map(carriesInstructions)).toEqual([true, false])
+      expect(calls[1].prompt).toEqual([{ type: "text", text: "hello" }])
+    })
+
+    test("AC5: absent/empty system text (text, image and replay) makes no ledger calls or changes", async () => {
+      const { client, calls, model, ledger } = deliveryFixture()
+      await finish(model)
+      const checkLedgerCalls = () => {
+        expect(client.needsInstructions).toHaveBeenCalledTimes(1)
+        expect(client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+        expect(client.acknowledgeInstructionDelivery).toHaveBeenCalledTimes(1)
+        expect(client.failInstructionDelivery).not.toHaveBeenCalled()
+        expect(client.invalidateInstructions).not.toHaveBeenCalled()
+      }
+      for (const systemText of [undefined, ""]) {
+        for (const image of [false, true]) {
+          // Passing undefined to a defaulted helper would select A; omit explicitly.
+          const plain = deliveryOptions(systemText, image)
+          if (systemText === undefined) plain.prompt = plain.prompt.filter((message) => message.role !== "system")
+          await finish(model, plain)
+          const replay = makeCallOptions([
+            ...plain.prompt,
+            { role: "assistant", content: [{ type: "text", text: "previous answer" }] },
+            { role: "user", content: [{ type: "text", text: "continue" }] },
+          ], { headers: { "x-session-reset": "true" } })
+          await finish(model, replay)
+          checkLedgerCalls()
+        }
+      }
+      expect(calls.slice(1).every((call) => !carriesInstructions(call))).toBe(true)
+      expect(ledger.needsInstructions("sess-1", "A")).toBe(false)
+      await finish(model)
+      expect(carriesInstructions(calls[calls.length - 1])).toBe(false)
+    })
+
+    test("AC5: injectContext stays block-free and leaves acknowledged instructions intact", async () => {
+      const { client, calls, model, ledger } = deliveryFixture()
+      await finish(model)
+      await model.injectContext("previous work")
+      expect(calls[1].prompt[0].text).toContain("<context_rehydration>")
+      expect(carriesInstructions(calls[1])).toBe(false)
+      expect(client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+      expect(client.acknowledgeInstructionDelivery).toHaveBeenCalledTimes(1)
+      expect(ledger.needsInstructions("sess-1", "A")).toBe(false)
+    })
+
+    test("AC2/AC5: ephemeral child consults its own client's ledger, not the parent's", async () => {
+      const main = deliveryFixture()
+      const ephemeral = deliveryFixture()
+      await finish(main.model)
+      const parent = new KiroACPLanguageModel("claude-sonnet-4.6", {
+        client: main.client,
+        getEphemeralClient: () => ephemeral.client,
+      })
+      await finish(parent)
+      await finish(parent)
+      expect(ephemeral.calls.map(carriesInstructions)).toEqual([true, false])
+      expect(ephemeral.calls.map((call) => call.sessionId)).toEqual(["sess-1", "sess-1"])
+      expect(main.client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+      expect(ephemeral.client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+    })
+
+    test("AC2/AC5: isolated child consults its clone's empty ledger, not the parent's", async () => {
+      const main = deliveryFixture()
+      const isolated = deliveryFixture()
+      await finish(main.model)
+      main.client.clone = mock(() => isolated.client)
+      const options = deliveryOptions()
+      options.headers = { "x-session-affinity": "isolated-child", "x-parent-session-id": "parent" }
+      options.tools = [{ type: "function", name: "screenshot", inputSchema: { type: "object" } }]
+      try {
+        await finish(main.model, options)
+        await finish(main.model, options)
+        expect(isolated.calls.map(carriesInstructions)).toEqual([true, false])
+        expect(isolated.calls.map((call) => call.sessionId)).toEqual(["sess-1", "sess-1"])
+        expect(main.client.clone).toHaveBeenCalledTimes(1)
+        expect(main.client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+        expect(isolated.client.openInstructionDelivery).toHaveBeenCalledTimes(1)
+      } finally {
+        await main.model.shutdownSubClients()
+      }
     })
   })
 

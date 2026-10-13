@@ -15,6 +15,7 @@ import type { LaneRouter } from "./lane-router"
 import type { KiroEffort } from "./kiro-effort"
 import { verifyAuth } from "./kiro-auth"
 import { MCP_BRIDGE_SOURCE } from "./mcp-bridge-source"
+import { InstructionDeliveryLedger, type InstructionDeliveryToken } from "./delivery-ledger"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -380,6 +381,7 @@ export class ACPClient {
   private nextId = 0
   private readonly pending = new Map<number, PendingRequest>()
   private readonly metadata = new Map<string, SessionMetadata>()
+  private readonly instructionDelivery = new InstructionDeliveryLedger()
   private readonly promptCallbacks = new Map<string, (update: SessionUpdate) => void>()
   private running = false
   startedToolless = false
@@ -486,6 +488,9 @@ export class ACPClient {
     }
     if (this.options.trustAllTools) args.push("--trust-all-tools")
 
+    // A crash/error restart calls start() without releaseResources(). Proof
+    // must therefore change generation on every spawn, not just on stop().
+    this.instructionDelivery.advanceGeneration()
     this.process = childProcess.spawn("kiro-cli", args, {
       cwd: this.options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
@@ -609,6 +614,8 @@ export class ACPClient {
    * failure in one cannot prevent the others from running.
    */
   private async releaseResources(): Promise<void> {
+    // Void proof and outstanding tokens before teardown can settle requests.
+    this.instructionDelivery.advanceGeneration()
     try {
       this.readline?.close()
     } catch {
@@ -712,6 +719,47 @@ export class ACPClient {
   // -------------------------------------------------------------------------
   // Prompting
   // -------------------------------------------------------------------------
+
+  /**
+   * Consult before constructing a fresh prompt. Exact acknowledged text is
+   * suppressed only in the same session/process/invalidation state and below
+   * the high-water percentage (default 70). In-flight sends never establish
+   * proof. Empty text returns false without changing delivery state.
+   */
+  needsInstructions(sessionId: string, text: string, options: { highWater?: number } = {}): boolean {
+    return this.instructionDelivery.needsInstructions(sessionId, text, options)
+  }
+
+  /**
+   * Open immediately before sending an instruction-bearing prompt or replay.
+   * Different text voids previous proof; only this session's latest token can
+   * acknowledge. Skip this method for block-free prompts and empty text.
+   */
+  openInstructionDelivery(sessionId: string, text: string): InstructionDeliveryToken {
+    return this.instructionDelivery.open(sessionId, text)
+  }
+
+  /**
+   * Acknowledge only the token's own resolved prompt. Non-cancelled completion,
+   * latest-token identity and unchanged generation/invalidation/epoch are required
+   * before proof is written. Returns false for stale/cancelled tokens without
+   * overwriting newer proof. For an aborted/rejected prompt use fail instead.
+   * Synchronous: creates no derived promise or unhandled rejection.
+   */
+  acknowledgeInstructionDelivery(token: InstructionDeliveryToken, stopReason: string): boolean {
+    return this.instructionDelivery.acknowledge(token, stopReason)
+  }
+
+  /** Settle an aborted/rejected send; never restore voided or overwrite newer proof. */
+  failInstructionDelivery(token: InstructionDeliveryToken): void {
+    this.instructionDelivery.fail(token)
+  }
+
+  /** Invalidate one session, or advance the client-wide epoch when no id is known. */
+  invalidateInstructions(sessionId?: string): void {
+    if (sessionId) this.instructionDelivery.invalidate(sessionId)
+    else this.instructionDelivery.invalidateAll()
+  }
 
   async prompt(options: PromptOptions): Promise<{ stopReason: string }> {
     const { sessionId, prompt, onUpdate, signal } = options
@@ -854,7 +902,8 @@ export class ACPClient {
 
   /**
    * Create a new ACPClient with the same options.
-   * The returned client is NOT started — call `start()` separately.
+   * The returned client has an empty delivery ledger and is NOT started — call
+   * `start()` separately.
    */
   clone(): ACPClient {
     return new ACPClient(this.getOptions())
@@ -1385,6 +1434,12 @@ export class ACPClient {
         this.handleSessionUpdate(params)
         break
 
+      case "_kiro.dev/compaction/status":
+      case "_kiro.dev/clear/status":
+        this.handleHistoryStatus(msg.method, params)
+        this.options.onExtension?.(msg.method, params)
+        break
+
       case "_kiro.dev/commands/available": {
         const tools = (Array.isArray(params.tools) ? params.tools : []) as AvailableTool[]
         this.availableTools = tools
@@ -1400,11 +1455,41 @@ export class ACPClient {
     }
   }
 
+  /**
+   * Match kiro-cli 2.28.0's completion shape (see the acp-client test fixtures).
+   * Read status before invalidating: compaction requires
+   * status.type === "completed" (or the defensive string form). A bare clear
+   * notification is completion on kiro-cli 2.28.0; with status present it must
+   * likewise be completed. Progress, unknown and failure values disable this
+   * signal, never guessing completion. A missing/invalid id fails toward an
+   * all-session resend via the client epoch. Extension forwarding still runs.
+   */
+  private handleHistoryStatus(method: string, params: Record<string, unknown>): void {
+    const status = params.status
+    const type = typeof status === "string" ? status :
+      typeof status === "object" && status !== null ? (status as { type?: unknown }).type : undefined
+    const bareClear = method === "_kiro.dev/clear/status" && !("status" in params)
+    if (bareClear || type === "completed") {
+      this.invalidateInstructions(typeof params.sessionId === "string" ? params.sessionId : undefined)
+    }
+  }
+
   private handleSessionUpdate(params: Record<string, unknown>): void {
     const sessionId = params.sessionId as string | undefined
     const update = params.update as SessionUpdate | undefined
 
     if (!update) return
+
+    /**
+     * Kiro's summarization completion (`_meta.kiro.kind`) is read from the update,
+     * not a top-level kind. Read before callbacks can open/settle deliveries. Missing
+     * or other kinds disable the signal; completion without an id invalidates
+     * all sessions conservatively. Both session-update channels use this path.
+     */
+    const meta = update._meta as { kiro?: { kind?: unknown } } | undefined
+    if (update.sessionUpdate === "session_info_update" && meta?.kiro?.kind === "summarization_completed") {
+      this.invalidateInstructions(typeof params.sessionId === "string" ? params.sessionId : undefined)
+    }
 
     if (sessionId) {
       const callback = this.promptCallbacks.get(sessionId)
@@ -1420,6 +1505,7 @@ export class ACPClient {
     const sessionId = params.sessionId as string | undefined
     if (!sessionId) return
 
+    this.instructionDelivery.recordUsage(sessionId, params.contextUsagePercentage as number | undefined)
     this.metadata.set(sessionId, {
       sessionId,
       contextUsagePercentage: params.contextUsagePercentage as number | undefined,

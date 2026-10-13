@@ -23,6 +23,7 @@ import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 import { readStallHintDetail } from "./kiro-log-hint"
+import { INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT } from "./delivery-ledger"
 
 // ---------------------------------------------------------------------------
 // Data conversion helpers
@@ -570,8 +571,9 @@ function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
 
   const sections: string[] = []
 
-  if (systemParts.length > 0) {
-    sections.push(`<system_instructions>\n${systemParts.join("\n\n")}\n</system_instructions>`)
+  const systemPrompt = systemParts.join("\n\n")
+  if (systemPrompt) {
+    sections.push(`<system_instructions>\n${systemPrompt}\n</system_instructions>`)
   }
 
   if (historyParts.length > 0) {
@@ -599,7 +601,10 @@ const TOOL_CALL_DEBOUNCE_MS = 100
  * Sessions with affinity (`x-session-affinity` header) are persisted
  * and resumed; sessions without affinity are one-shot.
  *
- * System prompts are injected via `<system_instructions>` tags.
+ * The host's system prompt is sent in `<system_instructions>` tags on the first prompt of a kiro session,
+ * and again when it changes, after kiro compacts or clears the session, after kiro-cli restarts,
+ * after a cancelled or failed send, or on every prompt once context usage reaches 70%. If kiro compacts during
+ * a long tool loop below 70% usage, instructions can be missing for the rest of that turn until the next prompt.
  * Tool calls use the standard AI SDK contract (no providerExecuted flag).
  */
 export class KiroACPLanguageModel implements LanguageModelV3 {
@@ -1908,6 +1913,20 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   // Fresh prompt flow
   // -------------------------------------------------------------------------
 
+  /**
+   * Read the acquired session's client-owned instruction proof before building
+   * a fresh prompt. Missing, in-flight or invalidated proof fails toward resend;
+   * at the named high-water percentage, resend on every fresh prompt because
+   * kiro keeps the last 2 message pairs verbatim when compacting. Replay always
+   * carries non-empty instructions and counts as delivery. Empty/absent joined
+   * text disables both injection and ledger calls.
+   *
+   * Open immediately before the send, then settle once from that prompt's own
+   * promise (not a tool-resume stream). Read abort state before acknowledgement;
+   * cancelled/rejected/aborted sends cannot prove delivery. The client checks
+   * token identity, invalidation and generation before writing proof. A guarded
+   * derived promise cannot change the original stream's completion/error chain.
+   */
   private async startFreshPrompt(
     options: LanguageModelV3CallOptions,
     reset = false,
@@ -1916,6 +1935,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     await this.ensureModel(session)
     await this.ensureEffort(session, this.resolveRequestedEffort(options))
 
+    const { systemPrompt, userParts } = extractPrompt(options.prompt)
+    let deliversInstructions = false
     let promptBlocks: ContentBlock[]
 
     const hasHistory = reset && options.prompt.some(
@@ -1925,19 +1946,24 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     if (hasHistory) {
       const compositeText = formatConversationReplay(options.prompt)
       promptBlocks = [{ type: "text", text: compositeText }]
+      deliversInstructions = !!systemPrompt
     } else {
-      const { systemPrompt, userParts } = extractPrompt(options.prompt)
+      deliversInstructions = !!systemPrompt && this.client.needsInstructions(
+        session.sessionId,
+        systemPrompt,
+        { highWater: INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT },
+      )
       const hasImages = userParts.some((p) => p.type === "image")
 
       if (hasImages) {
-        // Mixed content: send system prompt + user parts as separate blocks
-        promptBlocks = systemPrompt
+        // Mixed content: prepend a separate system block only when delivery is needed.
+        promptBlocks = deliversInstructions
           ? [{ type: "text" as const, text: `<system_instructions>\n${systemPrompt}\n</system_instructions>` }, ...userParts]
           : [...userParts]
       } else {
-        // Text-only: combine into single ContentBlock (original behavior kiro-cli expects)
+        // Text-only: keep kiro-cli's single-block format, omitting proven instructions.
         const userText = userParts.map((p) => p.text ?? "").join("\n")
-        const compositeText = systemPrompt
+        const compositeText = deliversInstructions
           ? `<system_instructions>\n${systemPrompt}\n</system_instructions>\n\n${userText}`
           : userText
         promptBlocks = [{ type: "text", text: compositeText }]
@@ -1976,12 +2002,25 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
     // Start the prompt after stream infrastructure is ready so onUpdate
     // can receive synchronous callbacks from client.prompt().
+    const deliveryToken = deliversInstructions
+      ? this.client.openInstructionDelivery(sessionId, systemPrompt!)
+      : undefined
     const promptPromise = this.client.prompt({
       sessionId,
       prompt: promptBlocks,
       onUpdate,
       signal: promptAbort.signal,
     })
+
+    if (deliveryToken) {
+      void promptPromise.then(
+        (result) => {
+          if (promptAbort.signal.aborted) this.client.failInstructionDelivery(deliveryToken)
+          else this.client.acknowledgeInstructionDelivery(deliveryToken, result.stopReason)
+        },
+        () => this.client.failInstructionDelivery(deliveryToken),
+      ).catch(() => {})
+    }
 
     attachPromise(promptPromise)
 

@@ -280,6 +280,215 @@ describe("ACPClient", () => {
     })
   })
 
+  describe("instruction delivery notifications", () => {
+    const sessionA = "bd758318-111f-4e16-b67c-d81098f2ed41"
+    const sessionB = "e145f07e-c625-491b-9159-9ea134655e51"
+
+    function notify(client: ACPClient, method: string, params: Record<string, unknown>): void {
+      ;(client as any).handleLine(JSON.stringify({ jsonrpc: "2.0", method, params }))
+    }
+
+    function prove(client: ACPClient, id = sessionA, text = "A"): void {
+      expect(client.acknowledgeInstructionDelivery(client.openInstructionDelivery(id, text), "end_turn")).toBe(true)
+      expect(client.needsInstructions(id, text)).toBe(false)
+    }
+
+    test("AC2: two callers share proof on one client, but different session ids do not", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      const callerOne = () => client.needsInstructions(sessionA, "A")
+      const callerTwo = () => client.needsInstructions(sessionA, "A")
+      expect(callerOne()).toBe(true)
+      prove(client)
+      expect(callerTwo()).toBe(false)
+      expect(client.needsInstructions(sessionB, "A")).toBe(true)
+    })
+
+    // T10 kiro-cli 2.28.0 shapes; completed summary abbreviated because it is
+    // not a discriminator. String-status variants are defensive, not captured.
+    const completions: Array<{ name: string; method: string; params: Record<string, unknown> }> = [
+      { name: "T10 completed compaction", method: "_kiro.dev/compaction/status", params: { sessionId: sessionA, status: { type: "completed" }, summary: "## OBJECTIVE\nNo user task or project objective has been provided in this chat session." } },
+      { name: "defensive string completed compaction", method: "_kiro.dev/compaction/status", params: { sessionId: sessionA, status: "completed" } },
+      { name: "T10 bare clear", method: "_kiro.dev/clear/status", params: { sessionId: sessionA } },
+      { name: "defensive completed clear", method: "_kiro.dev/clear/status", params: { sessionId: sessionA, status: { type: "completed" } } },
+      { name: "defensive string completed clear", method: "_kiro.dev/clear/status", params: { sessionId: sessionA, status: "completed" } },
+    ]
+    for (const { name, method, params } of completions) {
+      test(`AC3/AC4: ${name} invalidates only its session and blocks in-flight acknowledgement`, () => {
+        const onExtension = mock(() => {})
+        const client = new ACPClient({ cwd: "/tmp", onExtension })
+        prove(client)
+        prove(client, sessionB)
+        // Equal usage before/after compaction does not cancel its invalidation.
+        notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: 0.15160000324249268 })
+        const token = client.openInstructionDelivery(sessionA, "A")
+        notify(client, method, params)
+        notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: 0.15160000324249268 })
+        expect(client.acknowledgeInstructionDelivery(token, "end_turn")).toBe(false)
+        expect(client.needsInstructions(sessionA, "A")).toBe(true)
+        expect(client.needsInstructions(sessionB, "A")).toBe(false)
+        expect(onExtension).toHaveBeenCalledWith(method, params)
+        prove(client)
+      })
+    }
+
+    for (const method of ["_kiro.dev/compaction/status", "_kiro.dev/clear/status"]) {
+      // Only started was observed. Failure/unknown values below are synthetic
+      // negative probes: no actual failure/no-op envelope was captured by T10.
+      for (const status of [{ type: "started" }, { type: "failed" }, { type: "unknown" }, "started", "failed", "unknown", null, {}]) {
+        test(`AC3: ${method} ignores non-completion ${JSON.stringify(status)} and forwards it`, () => {
+          const onExtension = mock(() => {})
+          const client = new ACPClient({ cwd: "/tmp", onExtension })
+          prove(client)
+          prove(client, sessionB)
+          const params = { sessionId: sessionA, status, summary: null }
+          notify(client, method, params)
+          expect(client.needsInstructions(sessionA, "A")).toBe(false)
+          expect(onExtension).toHaveBeenCalledWith(method, params)
+          // Missing ids broaden only completion signals, never progress/failure.
+          notify(client, method, { status, summary: null })
+          expect(client.needsInstructions(sessionA, "A")).toBe(false)
+          expect(client.needsInstructions(sessionB, "A")).toBe(false)
+        })
+      }
+    }
+
+    test("AC3: bare compaction is not completion", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      prove(client)
+      notify(client, "_kiro.dev/compaction/status", { sessionId: sessionA })
+      expect(client.needsInstructions(sessionA, "A")).toBe(false)
+    })
+
+    for (const { name, method, params } of completions) {
+      test(`AC3/AC4: ${name} without sessionId invalidates all via the epoch`, () => {
+        const client = new ACPClient({ cwd: "/tmp" })
+        prove(client)
+        prove(client, sessionB)
+        const pending = client.openInstructionDelivery(sessionA, "A")
+        const { sessionId: _ignored, ...globalParams } = params
+        notify(client, method, globalParams)
+        expect(client.acknowledgeInstructionDelivery(pending, "end_turn")).toBe(false)
+        expect(client.needsInstructions(sessionA, "A")).toBe(true)
+        expect(client.needsInstructions(sessionB, "A")).toBe(true)
+        prove(client, sessionB)
+        // A late settlement cannot invalidate this newer acknowledged proof.
+        client.failInstructionDelivery(pending)
+        expect(client.needsInstructions(sessionB, "A")).toBe(false)
+      })
+    }
+
+    for (const method of ["session/update", "_kiro.dev/session/update"]) {
+      test(`AC3: ${method} V3 summarization_completed invalidates before callbacks and is not forwarded`, () => {
+        let client: ACPClient
+        const onUpdate = mock(() => expect(client.needsInstructions(sessionA, "A")).toBe(true))
+        const onExtension = mock(() => {})
+        client = new ACPClient({ cwd: "/tmp", onUpdate, onExtension })
+        prove(client)
+        prove(client, sessionB)
+        const params = {
+          sessionId: sessionA,
+          update: { sessionUpdate: "session_info_update", _meta: { kiro: { kind: "summarization_completed" } } },
+        }
+        notify(client, method, params)
+        expect(client.needsInstructions(sessionA, "A")).toBe(true)
+        expect(client.needsInstructions(sessionB, "A")).toBe(false)
+        expect(onUpdate).toHaveBeenCalledWith(sessionA, params.update)
+        expect(onExtension).not.toHaveBeenCalled()
+      })
+
+      test(`AC3: ${method} V3 completion without id invalidates all`, () => {
+        const client = new ACPClient({ cwd: "/tmp" })
+        prove(client)
+        prove(client, sessionB)
+        notify(client, method, { update: { sessionUpdate: "session_info_update", _meta: { kiro: { kind: "summarization_completed" } } } })
+        expect(client.needsInstructions(sessionA, "A")).toBe(true)
+        expect(client.needsInstructions(sessionB, "A")).toBe(true)
+      })
+
+      test(`AC3: ${method} ignores non-completed V3 kinds and wrongly placed selectors`, () => {
+        const client = new ACPClient({ cwd: "/tmp" })
+        prove(client)
+        for (const update of [
+          { sessionUpdate: "session_info_update", _meta: { kiro: { kind: "summarization_started" } } },
+          { sessionUpdate: "session_info_update", _meta: { kiro: { kind: "summarization_failed" } } },
+          { sessionUpdate: "session_info_update", kind: "summarization_completed" },
+          { sessionUpdate: "session_info_update" },
+          { sessionUpdate: "agent_message_chunk", _meta: { kiro: { kind: "summarization_completed" } } },
+        ]) {
+          notify(client, method, { sessionId: sessionA, kind: "summarization_completed", update })
+          expect(client.needsInstructions(sessionA, "A")).toBe(false)
+        }
+      })
+    }
+
+    test("AC13: live metadata preserves delivery on turns 2, 3 and later; high-water still re-sends", () => {
+      const onExtension = mock(() => {})
+      const client = new ACPClient({ cwd: "/tmp", onExtension })
+      prove(client)
+      prove(client, sessionB)
+      // kiro-cli 2.28.0 session S from DISCOVERY's 5a live findings, in percentage points.
+      notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: 0.3299 }) // turn 1 end
+      for (const [start, end] of [[0.1782, 0.3445], [0.1783, 0.3863]]) {
+        expect(client.needsInstructions(sessionA, "A")).toBe(false)
+        notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: start })
+        expect(client.needsInstructions(sessionA, "A")).toBe(false)
+        expect(client.getMetadata(sessionA)?.contextUsagePercentage).toBe(start)
+        notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: end })
+        expect(client.needsInstructions(sessionA, "A")).toBe(false)
+      }
+      notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: 0.2192 }) // turn 4 start
+      notify(client, "_kiro.dev/metadata", { sessionId: sessionA })
+      expect(client.needsInstructions(sessionA, "A")).toBe(false)
+      notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: 70 })
+      for (let i = 0; i < 2; i++) {
+        expect(client.needsInstructions(sessionA, "A")).toBe(true)
+        expect(client.acknowledgeInstructionDelivery(client.openInstructionDelivery(sessionA, "A"), "end_turn")).toBe(true)
+      }
+      notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: 69.999 })
+      expect(client.needsInstructions(sessionA, "A")).toBe(false)
+      expect(client.needsInstructions(sessionB, "A")).toBe(false)
+      expect(onExtension).not.toHaveBeenCalled()
+    })
+
+    test("AC13/AC4: live start-of-turn metadata does not void an in-flight token", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: 0.3299 })
+      for (const [start, end] of [[0.1782, 0.3445], [0.1783, 0.3863]]) {
+        const token = client.openInstructionDelivery(sessionA, "A")
+        notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: start })
+        expect(client.acknowledgeInstructionDelivery(token, "end_turn")).toBe(true)
+        expect(client.needsInstructions(sessionA, "A")).toBe(false)
+        notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: end })
+        expect(client.needsInstructions(sessionA, "A")).toBe(false)
+      }
+    })
+
+    test.each([69.999, 70, 80])("AC3: metadata usage %s uses the inclusive high-water rule, even after missing usage", (pct) => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      prove(client)
+      notify(client, "_kiro.dev/metadata", { sessionId: sessionA, contextUsagePercentage: pct })
+      notify(client, "_kiro.dev/metadata", { sessionId: sessionA })
+      for (let i = 0; i < 2; i++) {
+        expect(client.needsInstructions(sessionA, "A")).toBe(pct >= 70)
+        client.acknowledgeInstructionDelivery(client.openInstructionDelivery(sessionA, "A"), "end_turn")
+      }
+    })
+
+    test("AC2/AC3: clone starts empty and invalidation is isolated", () => {
+      const client = new ACPClient({ cwd: "/tmp" })
+      prove(client)
+      const clone = client.clone()
+      expect(clone.needsInstructions(sessionA, "A")).toBe(true)
+      prove(clone)
+      notify(clone, "_kiro.dev/clear/status", {})
+      expect(clone.needsInstructions(sessionA, "A")).toBe(true)
+      expect(client.needsInstructions(sessionA, "A")).toBe(false)
+      prove(clone)
+      client.invalidateInstructions(sessionA)
+      expect(clone.needsInstructions(sessionA, "A")).toBe(false)
+    })
+  })
+
   describe("permission handling", () => {
     test("auto-approves with allow_always by default", () => {
       const client = new ACPClient({ cwd: "/tmp" })
@@ -871,6 +1080,105 @@ function installChildProcessSpies(params: { execDelayMs?: number; execFails?: ()
     },
   }
 }
+
+describe("ACPClient instruction delivery process generations", () => {
+  const clients: ACPClient[] = []
+  const tempDirs: string[] = []
+  const oldIpcServers: Array<ReturnType<typeof createIPCServer>> = []
+  let spies: ReturnType<typeof installChildProcessSpies> | undefined
+
+  beforeEach(() => {
+    resetMcpTimeoutSettingMemo()
+    spies = installChildProcessSpies()
+  })
+
+  afterEach(async () => {
+    for (const client of clients) await client.stop()
+    // Existing crash recovery replaces IPC without releasing the old server.
+    // Clean up that pre-existing lifecycle exposure in the fixture only.
+    for (const ipc of oldIpcServers) await ipc.stop()
+    for (const proc of spies?.processes ?? []) {
+      proc.stdin.destroy()
+      proc.stdout.destroy()
+      proc.stderr.destroy()
+    }
+    spies?.restore()
+    spies = undefined
+    resetMcpTimeoutSettingMemo()
+    for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true })
+    clients.length = tempDirs.length = oldIpcServers.length = 0
+  })
+
+  function makeClient(): ACPClient {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-delivery-generation-test-"))
+    tempDirs.push(cwd)
+    const client = new ACPClient({ cwd })
+    clients.push(client)
+    return client
+  }
+
+  test("AC3/AC4: every start invalidates pre-start proof and tokens", async () => {
+    const client = makeClient()
+    client.acknowledgeInstructionDelivery(client.openInstructionDelivery("sess-proof", "A"), "end_turn")
+    const old = client.openInstructionDelivery("sess-pending", "B")
+    await client.start()
+    expect(client.needsInstructions("sess-proof", "A")).toBe(true)
+    expect(client.acknowledgeInstructionDelivery(old, "end_turn")).toBe(false)
+    expect(client.needsInstructions("sess-pending", "B")).toBe(true)
+  })
+
+  test("AC3/AC4: stop/start invalidates proof, usage and late previous-generation acknowledgement", async () => {
+    const client = makeClient()
+    await client.start()
+    client.acknowledgeInstructionDelivery(client.openInstructionDelivery("sess-proof", "A"), "end_turn")
+    const old = client.openInstructionDelivery("sess-pending", "B")
+    ;(client as any).handleLine(JSON.stringify({ method: "_kiro.dev/metadata", params: { sessionId: "sess-proof", contextUsagePercentage: 90 } }))
+    await client.stop()
+    expect(client.needsInstructions("sess-proof", "A")).toBe(true)
+    expect(client.acknowledgeInstructionDelivery(old, "end_turn")).toBe(false)
+    await client.start()
+    const current = client.openInstructionDelivery("sess-proof", "A")
+    expect(current.generation).toBeGreaterThan(old.generation)
+    client.acknowledgeInstructionDelivery(current, "end_turn")
+    expect(client.needsInstructions("sess-proof", "A")).toBe(false)
+    expect(client.acknowledgeInstructionDelivery(old, "end_turn")).toBe(false)
+  })
+
+  test("AC3/AC4: resource release invalidates even a never-started client", async () => {
+    const client = makeClient()
+    client.acknowledgeInstructionDelivery(client.openInstructionDelivery("sess-proof", "A"), "end_turn")
+    const old = client.openInstructionDelivery("sess-pending", "B")
+    await client.stop()
+    expect(client.needsInstructions("sess-proof", "A")).toBe(true)
+    expect(client.acknowledgeInstructionDelivery(old, "end_turn")).toBe(false)
+  })
+
+  test.each(["exit", "error"])("AC3/AC4: unexpected %s then direct start ignores old-generation tokens", async (event) => {
+    const client = makeClient()
+    await client.start()
+    client.acknowledgeInstructionDelivery(client.openInstructionDelivery("sess-proof", "A"), "end_turn")
+    const old = client.openInstructionDelivery("sess-pending", "B")
+    const oldIpc = (client as any).ipcServer as ReturnType<typeof createIPCServer>
+    oldIpcServers.push(oldIpc)
+    const proc = spies!.processes[0]!
+    const closed = new Promise<void>((resolve) => (client as any).readline.once("close", resolve))
+    if (event === "exit") proc.emit("exit", 1, null)
+    else proc.emit("error", new Error("simulated process failure"))
+    proc.stdout.end()
+    await closed
+    expect(client.isRunning()).toBe(false)
+    // No client.stop()/releaseResources(): exercise the real recovery seam.
+    await client.start()
+    expect(client.needsInstructions("sess-proof", "A")).toBe(true)
+    expect(client.acknowledgeInstructionDelivery(old, "end_turn")).toBe(false)
+    const current = client.openInstructionDelivery("sess-pending", "B")
+    expect(current.generation).toBeGreaterThan(old.generation)
+    expect(client.acknowledgeInstructionDelivery(current, "end_turn")).toBe(true)
+    expect(client.acknowledgeInstructionDelivery(old, "end_turn")).toBe(false)
+    client.failInstructionDelivery(old)
+    expect(client.needsInstructions("sess-pending", "B")).toBe(false)
+  })
+})
 
 describe("ACPClient start() - MCP timeout setting", () => {
   const tempDirs: string[] = []
