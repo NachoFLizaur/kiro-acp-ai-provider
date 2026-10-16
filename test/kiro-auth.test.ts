@@ -35,10 +35,15 @@ const VERSION_STDOUT = "kiro-cli 2.7.1"
 
 // Mock `execFileSync` so `verifyAuth()` sees controlled `--version` and
 // `whoami --format json` output. A value is returned as stdout; an Error is
-// thrown (spawn error / timeout). Returns the spy for restoration.
-function mockKiroCli(opts: { version?: string | Error; whoami?: string | Error }) {
-  const impl = (_file: string, args?: readonly string[]) => {
+// thrown (spawn error / timeout). Records options in `calls` when supplied;
+// returns the spy for restoration.
+function mockKiroCli(
+  opts: { version?: string | Error; whoami?: string | Error },
+  calls: RecordedExecFileCall[] = [],
+) {
+  const impl = (file: string, args?: readonly string[], options?: Record<string, unknown>) => {
     const argv = args ?? []
+    calls.push({ file, args: argv, options })
     if (argv.includes("--version")) {
       if (opts.version instanceof Error) throw opts.version
       return opts.version ?? VERSION_STDOUT
@@ -146,6 +151,42 @@ describe("verifyAuth: whoami --format json detection rule", () => {
     writeFileSync(tokenPath, JSON.stringify({ expiresAt: "2025-04-01T00:00:00.000Z" }))
     return tokenPath
   }
+
+  test("sync spawns use shell:true and hide console children when process.platform is win32", () => {
+    mockHome()
+    const calls: RecordedExecFileCall[] = []
+    spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }, calls))
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!
+    Object.defineProperty(process, "platform", { value: "win32" })
+    try {
+      verifyAuth()
+    } finally {
+      Object.defineProperty(process, "platform", original) // restore even on failure
+    }
+
+    expect(calls.map((call) => call.args)).toEqual([["--version"], ["whoami", "--format", "json"]])
+    for (const call of calls) {
+      expect(call.file).toBe("kiro-cli")
+      expect(call.options?.shell).toBe(true)
+      expect(call.options?.windowsHide).toBe(true)
+    }
+  })
+
+  test("sync spawns branch shell on the real process.platform and hide console children", () => {
+    mockHome()
+    const calls: RecordedExecFileCall[] = []
+    spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }, calls))
+
+    verifyAuth()
+
+    const expectedShell = process.platform === "win32"
+    expect(calls.map((call) => call.args)).toEqual([["--version"], ["whoami", "--format", "json"]])
+    for (const call of calls) {
+      expect(call.file).toBe("kiro-cli")
+      expect(call.options?.shell).toBe(expectedShell)
+      expect(call.options?.windowsHide).toBe(true)
+    }
+  })
 
   test("logged-in fixture with trailing Profile block => authenticated true (parser ignores the non-JSON trailer)", () => {
     spies.push(mockKiroCli({ whoami: WHOAMI_LOGGED_IN }))
@@ -814,9 +855,11 @@ describe("verifyAuthAsync: async probe, shared memo, coalescing", () => {
     }
 
     expect(calls.length).toBe(2)
+    expect(calls.map((call) => call.args)).toEqual([["--version"], ["whoami", "--format", "json"]])
     for (const call of calls) {
       expect(call.file).toBe("kiro-cli")
       expect(call.options?.shell).toBe(true)
+      expect(call.options?.windowsHide).toBe(true)
     }
   })
 
@@ -829,7 +872,11 @@ describe("verifyAuthAsync: async probe, shared memo, coalescing", () => {
 
     const expectedShell = process.platform === "win32"
     expect(calls.length).toBe(2)
-    for (const call of calls) expect(call.options?.shell).toBe(expectedShell)
+    expect(calls.map((call) => call.args)).toEqual([["--version"], ["whoami", "--format", "json"]])
+    for (const call of calls) {
+      expect(call.options?.shell).toBe(expectedShell)
+      expect(call.options?.windowsHide).toBe(true)
+    }
   })
 
   test("async spawns carry the verbatim 10s timeouts", async () => {

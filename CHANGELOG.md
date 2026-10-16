@@ -8,6 +8,16 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file was introduced after 3.1.0 was published; the 3.1.0 entry below is
 retroactive and earlier releases are recorded by their git tags only.
 
+## [3.3.2] - 2026-10-16
+
+### Fixed
+
+- On Windows, kiro-cli no longer opens empty console windows when the host
+  process has no console of its own, such as OpenCode 2's background service (the
+  default for its TUI and Desktop). The kiro-cli ACP process, the settings call
+  and both auth checks (`verifyAuth()` and `verifyAuthAsync()`) now start with a
+  hidden console; `kiro-cli` is still found through the Windows shell as before.
+
 ## [3.3.1] - 2026-10-13
 
 ### Fixed
@@ -171,7 +181,8 @@ These issues are pre-existing, with fixes planned for the next release:
 See the [v3.0.0 tag](https://github.com/NachoFLizaur/kiro-acp-ai-provider/releases/tag/v3.0.0)
 and its commit history for the changes in this release.
 
-[3.3.1]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.3.0...HEAD
+[3.3.2]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.3.1...HEAD
+[3.3.1]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.1.1...v3.2.0
 [3.1.1]: https://github.com/NachoFLizaur/kiro-acp-ai-provider/compare/v3.1.0...v3.1.1

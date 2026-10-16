@@ -362,6 +362,7 @@ function ensureMcpTimeoutSetting(value: string): Promise<void> {
       {
         timeout: SETTINGS_EXEC_TIMEOUT_MS,
         shell: process.platform === "win32", // resolve kiro-cli.exe / PATHEXT on Windows
+        windowsHide: true, // no empty console window when the host has none
       },
       (error) => settle(error != null),
     )
@@ -496,6 +497,7 @@ export class ACPClient {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...this.options.env },
       shell: isWin, // resolve kiro-cli.exe / PATHEXT on Windows
+      windowsHide: true, // no empty console window when the host has none (OpenCode 2 service)
     })
 
     this.running = true

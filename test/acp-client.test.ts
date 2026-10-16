@@ -1308,18 +1308,22 @@ describe("ACPClient start() - MCP timeout setting", () => {
     // Assert
     expect(spies.execCalls[0].options.shell).toBe(true)
     expect(spies.spawnCalls[0].options.shell).toBe(true)
+    expect(spies.execCalls[0].options.windowsHide).toBe(true)
+    expect(spies.spawnCalls[0].options.windowsHide).toBe(true)
   })
 
-  test("does not use a shell on other platforms", async () => {
+  test("branches shell on the real process.platform and hides both console children", async () => {
     spies = installChildProcessSpies()
-    if (process.platform === "win32") return
     const client = new ACPClient({ cwd: makeCwd() })
 
     await client.start()
     await client.stop()
 
-    expect(spies.execCalls[0].options.shell).toBe(false)
-    expect(spies.spawnCalls[0].options.shell).toBe(false)
+    const expectedShell = process.platform === "win32"
+    expect(spies.execCalls[0].options.shell).toBe(expectedShell)
+    expect(spies.spawnCalls[0].options.shell).toBe(expectedShell)
+    expect(spies.execCalls[0].options.windowsHide).toBe(true)
+    expect(spies.spawnCalls[0].options.windowsHide).toBe(true)
   })
 })
 

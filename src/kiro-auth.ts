@@ -187,7 +187,7 @@ function deriveTokenPath(): string | undefined {
 }
 
 /**
- * Sync exec adapter: execFileSync with the exact historical options. On the
+ * Sync exec adapter: execFileSync with piped stdio and bounded timeouts. On the
  * throw path execFileSync attaches captured stdout/stderr to the error, so
  * they are read from the error object and coerced into the outcome.
  */
@@ -197,6 +197,7 @@ function execSyncOutcome(args: readonly string[], timeoutMs: number): ExecOutcom
       stdio: ["pipe", "pipe", "pipe"],
       timeout: timeoutMs,
       shell: process.platform === "win32", // resolve kiro-cli.exe / PATHEXT on Windows
+      windowsHide: true, // no empty console window when the host has none
     }).toString()
     return { stdout, stderr: "", error: undefined }
   } catch (err) {
@@ -224,6 +225,7 @@ function execAsyncOutcome(args: readonly string[], timeoutMs: number): Promise<E
       {
         timeout: timeoutMs,
         shell: process.platform === "win32", // win32 PATHEXT resolution; must match the sync probe
+        windowsHide: true, // no empty console window when the host has none (OpenCode 2 service)
       },
       (error, stdout, stderr) => {
         resolve({
