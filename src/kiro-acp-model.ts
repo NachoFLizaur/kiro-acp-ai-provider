@@ -787,6 +787,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       : await this.client.createSession()
     await this.ensureSessionMode(session)
 
+    if (toolsFilePath && toolNames) {
+      await this.client.waitForSessionTools(session.sessionId, toolsFilePath, toolNames.split(","))
+    }
+
     if (toolsFilePath) {
       this.sessionToolsFiles.set(session.sessionId, { filePath: toolsFilePath, toolNames })
     }

@@ -53,6 +53,22 @@ const STALE_AGENT_CONFIG_PATTERN = /^opencode-[a-zA-Z0-9_-]+\.json$/
 // ---------------------------------------------------------------------------
 
 /**
+ * Name of the MCP server that serves a tools file.
+ *
+ * The unique suffix from the tools file path gives each session its own
+ * server name, which prevents kiro-cli from merging tools across sessions
+ * sharing the same workspace.
+ */
+export function getMcpServerName(agentName: string | undefined, toolsFilePath: string): string {
+  const toolsBaseName = basename(toolsFilePath, ".json")
+  const segments = toolsBaseName.split("-")
+  const streamSuffix = segments.length >= 3 ? segments[segments.length - 1] : ""
+  return streamSuffix
+    ? `${(agentName ?? "kiro-acp")}-tools-${streamSuffix}`
+    : `${(agentName ?? "kiro-acp")}-tools`
+}
+
+/**
  * Generate the agent configuration object for kiro-cli.
  *
  * Configures: MCP-only tools (no built-ins), auto-approve all MCP calls,
@@ -61,14 +77,7 @@ const STALE_AGENT_CONFIG_PATTERN = /^opencode-[a-zA-Z0-9_-]+\.json$/
  * (see `KiroACPLanguageModel` for when the block is sent).
  */
 export function generateAgentConfig(options: AgentConfigOptions): Record<string, unknown> {
-  // Extract unique suffix from tools file path for per-session MCP server naming.
-  // Prevents kiro-cli from merging tools across sessions sharing the same workspace.
-  const toolsBaseName = basename(options.toolsFilePath, ".json")
-  const segments = toolsBaseName.split("-")
-  const streamSuffix = segments.length >= 3 ? segments[segments.length - 1] : ""
-  const mcpServerName = streamSuffix
-    ? `${(options.name ?? "kiro-acp")}-tools-${streamSuffix}`
-    : `${(options.name ?? "kiro-acp")}-tools`
+  const mcpServerName = getMcpServerName(options.name, options.toolsFilePath)
   const mcpServerRef = `@${mcpServerName}`
 
   return {

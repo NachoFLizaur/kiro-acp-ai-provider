@@ -9,7 +9,7 @@ import { dirname, join, isAbsolute } from "node:path"
 import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { getXdgDataHome } from "./session-storage"
-import { generateAgentConfig, generateToollessAgentConfig, writeAgentConfig, removeAgentConfig } from "./agent-config"
+import { generateAgentConfig, generateToollessAgentConfig, getMcpServerName, writeAgentConfig, removeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 import type { KiroEffort } from "./kiro-effort"
@@ -391,7 +391,8 @@ export class ACPClient {
   private ipcServer: IPCServer | null = null
   private ipcPort: number | null = null
   private availableTools: AvailableTool[] = []
-  private toolsReadyListeners = new Set<(tools: AvailableTool[]) => void>()
+  private readonly sessionTools = new Map<string, AvailableTool[]>()
+  private toolsReadyListeners = new Set<(tools: AvailableTool[], sessionId?: string) => void>()
 
   /**
    * Per-instance unique ID for tools file isolation. Without this, concurrent
@@ -639,6 +640,7 @@ export class ACPClient {
     this.promptCallbacks.clear()
     this.toolsReadyListeners.clear()
     this.availableTools = []
+    this.sessionTools.clear()
     this.startedToolless = false
 
     const ipcServer = this.ipcServer
@@ -1072,12 +1074,51 @@ export class ACPClient {
     })
   }
 
-  addToolsReadyListener(listener: (tools: AvailableTool[]) => void): void {
+  addToolsReadyListener(listener: (tools: AvailableTool[], sessionId?: string) => void): void {
     this.toolsReadyListeners.add(listener)
   }
 
-  removeToolsReadyListener(listener: (tools: AvailableTool[]) => void): void {
+  removeToolsReadyListener(listener: (tools: AvailableTool[], sessionId?: string) => void): void {
     this.toolsReadyListeners.delete(listener)
+  }
+
+  /**
+   * Wait until kiro-cli reports, for this session, every expected tool served
+   * by the MCP server of `toolsFilePath`.
+   *
+   * A new session in a running kiro-cli first reports the tools of the
+   * previously loaded MCP server; the tools from its own bridge arrive later.
+   * Resolves false on timeout.
+   */
+  waitForSessionTools(
+    sessionId: string,
+    toolsFilePath: string,
+    expectedTools: string[],
+    timeoutMs = 5000,
+  ): Promise<boolean> {
+    const source = `mcp:${getMcpServerName(this.getAgentName(), toolsFilePath)}`
+    const ready = (tools: AvailableTool[] | undefined): boolean => {
+      if (!tools) return false
+      const names = new Set(tools.filter((t) => t.source === source).map((t) => t.name))
+      return expectedTools.every((name) => names.has(name))
+    }
+
+    if (ready(this.sessionTools.get(sessionId))) return Promise.resolve(true)
+
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.removeToolsReadyListener(handler)
+        resolve(false)
+      }, timeoutMs)
+
+      const handler = (tools: AvailableTool[], toolsSessionId?: string): void => {
+        if (toolsSessionId !== sessionId || !ready(tools)) return
+        clearTimeout(timer)
+        this.removeToolsReadyListener(handler)
+        resolve(true)
+      }
+      this.addToolsReadyListener(handler)
+    })
   }
 
   // -------------------------------------------------------------------------
@@ -1444,9 +1485,11 @@ export class ACPClient {
 
       case "_kiro.dev/commands/available": {
         const tools = (Array.isArray(params.tools) ? params.tools : []) as AvailableTool[]
+        const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined
         this.availableTools = tools
+        if (sessionId) this.sessionTools.set(sessionId, tools)
         for (const listener of this.toolsReadyListeners) {
-          listener(tools)
+          listener(tools, sessionId)
         }
         break
       }

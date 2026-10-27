@@ -648,7 +648,7 @@ describe("ACPClient", () => {
       expect(listener).toHaveBeenCalledTimes(1)
       expect(listener).toHaveBeenCalledWith([
         { name: "bash", source: "mcp:kiro-acp-tools", description: "Run command" },
-      ])
+      ], undefined)
     })
 
     test("stores available tools from _kiro.dev/commands/available", () => {
@@ -877,6 +877,47 @@ describe("ACPClient", () => {
 
       const tools = await promise
       expect(tools).toHaveLength(1)
+    })
+  })
+
+  describe("waitForSessionTools()", () => {
+    const toolsFile = "/tmp/kiro-acp/tools-abcd1234-bbbb2222.json"
+    const notify = (client: ACPClient, sessionId: string, source: string, names: string[]) =>
+      (client as any).handleLine(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_kiro.dev/commands/available",
+          params: { sessionId, tools: names.map((name) => ({ name, source })) },
+        }),
+      )
+
+    test("ignores the previous server's tools and resolves on this session's own", async () => {
+      const client = new ACPClient({ cwd: "/tmp", agent: "opencode" })
+      const agent = client.getAgentName()!
+      let resolved = false
+      const promise = client.waitForSessionTools("s2", toolsFile, ["read", "bash"], 5000)
+        .then((ok) => { resolved = true; return ok })
+
+      notify(client, "s2", `mcp:${agent}-tools-aaaa1111`, ["read", "bash"])
+      notify(client, "s1", `mcp:${agent}-tools-bbbb2222`, ["read", "bash"])
+      await Promise.resolve()
+      expect(resolved).toBe(false)
+
+      notify(client, "s2", `mcp:${agent}-tools-bbbb2222`, ["read", "bash"])
+      expect(await promise).toBe(true)
+      expect((client as any).toolsReadyListeners.size).toBe(0)
+    })
+
+    test("resolves immediately when the session already reported its tools", async () => {
+      const client = new ACPClient({ cwd: "/tmp", agent: "opencode" })
+      notify(client, "s2", `mcp:${client.getAgentName()}-tools-bbbb2222`, ["read"])
+      expect(await client.waitForSessionTools("s2", toolsFile, ["read"], 5000)).toBe(true)
+    })
+
+    test("resolves false on timeout", async () => {
+      const client = new ACPClient({ cwd: "/tmp", agent: "opencode" })
+      expect(await client.waitForSessionTools("s2", toolsFile, ["read"], 50)).toBe(false)
+      expect((client as any).toolsReadyListeners.size).toBe(0)
     })
   })
 
