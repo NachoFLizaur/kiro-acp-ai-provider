@@ -67,6 +67,19 @@ function toBase64Data(data: Uint8Array | string | URL): string {
 }
 
 /**
+ * Read the session-affinity key from a request's own headers.
+ *
+ * Always derive it from the request's `options` and pass it along explicitly.
+ * Several doStream() calls (one per opencode session) can run concurrently on
+ * the same model instance, so shared instance state such as `currentAffinityId`
+ * must not be read after an `await` or from a stream-completion callback.
+ */
+function affinityFromOptions(options: LanguageModelV3CallOptions): string | undefined {
+  const value = options.headers?.["x-session-affinity"]
+  return typeof value === "string" ? value : undefined
+}
+
+/**
  * Normalize an AI SDK mediaType to a concrete MIME type.
  *
  * AI SDK may send `image/*` as a wildcard; default to `image/jpeg`.
@@ -718,6 +731,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private async acquireSession(
     tools?: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
+    affinityId?: string,
   ): Promise<ACPSession> {
     // Write tools BEFORE creating the session so the MCP bridge
     // has them from the very first `tools/list` query.
@@ -741,8 +755,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       this.ensureToolsFileReady(toolsFilePath, tools)
     }
 
-    // Try loading an existing session (affinity-based)
-    if (this.currentAffinityId) {
+    // Try loading an existing session (affinity-based).
+    // `affinityId` is the value captured from THIS request's headers. It must not be
+    // re-read from `this.currentAffinityId` after an await: another concurrent
+    // doStream() on the same model instance may have overwritten that field.
+    if (affinityId) {
       if (this.config.sessionId) {
         try {
           const loaded = await this.client.loadSession(this.config.sessionId)
@@ -752,14 +769,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           if (toolsFilePath) {
             this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
           }
-          persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
+          persistSession(this.client.getCwd(), sessionId, affinityId)
           return loaded
         } catch (err) {
           // Fall through to persisted session or create new
         }
       }
 
-      const persisted = loadPersistedSession(this.client.getCwd(), this.currentAffinityId)
+      const persisted = loadPersistedSession(this.client.getCwd(), affinityId)
       if (persisted) {
         try {
           const session = await this.client.loadSession(persisted.kiroSessionId)
@@ -770,7 +787,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             if (toolsFilePath) {
               this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
             }
-            persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
+            persistSession(this.client.getCwd(), sessionId, affinityId)
             return session
           }
         } catch (err: unknown) {
@@ -791,8 +808,8 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       this.sessionToolsFiles.set(session.sessionId, { filePath: toolsFilePath, toolNames })
     }
 
-    if (this.currentAffinityId) {
-      persistSession(this.client.getCwd(), session.sessionId, this.currentAffinityId)
+    if (affinityId) {
+      persistSession(this.client.getCwd(), session.sessionId, affinityId)
     }
 
     return session
@@ -804,9 +821,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * With affinity: persist mapping, keep kiro session alive, remove tools file.
    * Without affinity: full cleanup (one-shot session).
    */
-  private cleanupAfterStream(sessionId: string): void {
-    if (this.currentAffinityId) {
-      persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
+  private cleanupAfterStream(sessionId: string, affinityId: string | undefined): void {
+    if (affinityId) {
+      persistSession(this.client.getCwd(), sessionId, affinityId)
       // Keep tools file alive — the MCP bridge still references it between turns.
       // Only ephemeral (no affinity) sessions delete their tools file.
     } else {
@@ -900,7 +917,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * Used when session/load fails and we need to rehydrate from the consumer's history.
    */
   async injectContext(summary: string): Promise<void> {
-    const session = await this.acquireSession()
+    // Rehydration is not tied to a request; use the affinity last seen by this model,
+    // captured once so a concurrent doStream() cannot change it mid-flight.
+    const affinityId = this.currentAffinityId
+    const session = await this.acquireSession(undefined, affinityId)
 
     try {
       await this.client.prompt({
@@ -912,7 +932,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         onUpdate: () => {},
       })
     } finally {
-      this.cleanupAfterStream(session.sessionId)
+      this.cleanupAfterStream(session.sessionId, affinityId)
     }
   }
 
@@ -1193,9 +1213,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private async doStreamInner(
     options: LanguageModelV3CallOptions,
   ): Promise<LanguageModelV3StreamResult> {
-    const affinityId = typeof options.headers?.["x-session-affinity"] === "string"
-      ? options.headers["x-session-affinity"]
-      : undefined
+    const affinityId = affinityFromOptions(options)
     this.setAffinityId(affinityId)
 
     const isChild = typeof options.headers?.["x-parent-session-id"] === "string"
@@ -1396,6 +1414,10 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       initialStall,
       savePendingTurn,
     } = params
+
+    // Captured once per stream: the cleanup callbacks below run long after this
+    // call returns, when other concurrent requests may have changed shared state.
+    const affinityId = affinityFromOptions(options)
 
     let streamStarted = false
     let textStarted = false
@@ -1802,7 +1824,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
             this.pendingTurns.delete(sessionId)
             laneRouter?.unregister(sessionId)
-            this.cleanupAfterStream(sessionId)
+            this.cleanupAfterStream(sessionId, affinityId)
             streamClosed = true
             try {
               await writeChain
@@ -1851,7 +1873,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
           this.pendingTurns.delete(sessionId)
           laneRouter?.unregister(sessionId)
-          this.cleanupAfterStream(sessionId)
+          this.cleanupAfterStream(sessionId, affinityId)
           streamClosed = true
           await writeChain
           await writer.close()
@@ -1859,7 +1881,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         .catch(async (err: unknown) => {
           this.pendingTurns.delete(sessionId)
           laneRouter?.unregister(sessionId)
-          this.cleanupAfterStream(sessionId)
+          this.cleanupAfterStream(sessionId, affinityId)
 
           if (streamClosed) {
             clearStallTimer()
@@ -1931,7 +1953,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     options: LanguageModelV3CallOptions,
     reset = false,
   ): Promise<LanguageModelV3StreamResult> {
-    const session = await this.acquireSession(options.tools)
+    const session = await this.acquireSession(options.tools, affinityFromOptions(options))
     await this.ensureModel(session)
     await this.ensureEffort(session, this.resolveRequestedEffort(options))
 
