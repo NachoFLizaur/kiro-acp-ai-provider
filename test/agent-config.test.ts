@@ -5,6 +5,7 @@ import {
   agentConfigPath,
   generateAgentConfig,
   generateToollessAgentConfig,
+  getMcpServerName,
 } from "../src/agent-config"
 import {
   mkdtempSync,
@@ -22,6 +23,64 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 
 const DAY_MS = 24 * 60 * 60 * 1000
+
+describe("getMcpServerName", () => {
+  const cases = [
+    [
+      "per-session tools path with an instance-qualified agent",
+      "opencode-30fd6bfb",
+      "/tmp/kiro-acp/tools-abcd1234-0408df6c.json",
+      "opencode-30fd6bfb-tools-0408df6c",
+      "@opencode-30fd6bfb-tools-0408df6c",
+    ],
+    [
+      "per-session tools path without an agent",
+      undefined,
+      "/tmp/kiro-acp/tools-abcd1234-0408df6c.json",
+      "kiro-acp-tools-0408df6c",
+      "@kiro-acp-tools-0408df6c",
+    ],
+    [
+      "two-segment tools path without a session suffix",
+      "opencode-30fd6bfb",
+      "/tmp/kiro-acp/tools-abcd1234.json",
+      "opencode-30fd6bfb-tools",
+      "@opencode-30fd6bfb-tools",
+    ],
+    [
+      "per-instance tools path",
+      "opencode-30fd6bfb",
+      "/tmp/kiro-acp/tools-abcd1234-30fd6bfb.json",
+      "opencode-30fd6bfb-tools-30fd6bfb",
+      "@opencode-30fd6bfb-tools-30fd6bfb",
+    ],
+  ] as const
+
+  for (const [label, name, toolsFilePath, expectedName, expectedRef] of cases) {
+    test(`preserves the legacy name for a ${label}`, () => {
+      expect(getMcpServerName(name, toolsFilePath)).toBe(expectedName)
+    })
+
+    test(`generateAgentConfig uses the legacy server key and tool refs for a ${label}`, () => {
+      const config = generateAgentConfig({
+        name,
+        mcpBridgePath: "/path/to/bridge.js",
+        toolsFilePath,
+        cwd: "/project",
+      })
+
+      expect(config.mcpServers).toEqual({
+        [expectedName]: {
+          command: "node",
+          args: ["/path/to/bridge.js", "--tools", toolsFilePath],
+          cwd: "/project",
+        },
+      })
+      expect(config.tools).toEqual([expectedRef])
+      expect(config.allowedTools).toEqual([expectedRef])
+    })
+  }
+})
 
 describe("agent config meta-prompt", () => {
   const baseOptions = {

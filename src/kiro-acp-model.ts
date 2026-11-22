@@ -804,6 +804,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       : await this.client.createSession()
     await this.ensureSessionMode(session)
 
+    // Without an agent there is no generated agent config or MCP bridge to wait for.
+    if (toolsFilePath && toolNames && this.client.getAgentName()) {
+      await this.client.waitForSessionTools(session.sessionId, toolsFilePath, toolNames.split(","))
+    }
+
     if (toolsFilePath) {
       this.sessionToolsFiles.set(session.sessionId, { filePath: toolsFilePath, toolNames })
     }

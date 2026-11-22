@@ -104,6 +104,7 @@ function createMockClient(overrides: Partial<ACPClient> = {}): ACPClient {
     getLaneRouter: mock(() => mockLaneRouter),
     setPromptCallback: mock(() => {}),
     waitForToolsReady: mock(() => Promise.resolve()),
+    waitForSessionTools: mock(() => Promise.resolve(true)),
     getOrCreateToolsFilePath: mock(() => "/tmp/tools.json"),
     createSessionToolsFilePath: mock((id: string) => `/tmp/kiro-acp/tools-test-${id}.json`),
     removeSessionToolsFile: mock(() => {}),
