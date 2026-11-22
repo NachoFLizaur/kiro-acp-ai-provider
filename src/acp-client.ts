@@ -1086,6 +1086,10 @@ export class ACPClient {
    * Wait until kiro-cli reports, for this session, every expected tool served
    * by the MCP server of `toolsFilePath`.
    *
+   * kiro-cli (seen on 3.1.0) reports MCP tool names with characters outside
+   * [A-Za-z0-9_-] removed and drops names longer than 64 characters, so expected
+   * names are normalized the same way. If none remain there is nothing to wait for.
+   *
    * A new session in a running kiro-cli first reports the tools of the
    * previously loaded MCP server; the tools from its own bridge arrive later.
    * Resolves false on timeout.
@@ -1096,11 +1100,17 @@ export class ACPClient {
     expectedTools: string[],
     timeoutMs = 5000,
   ): Promise<boolean> {
+    // Assumes the length limit applies after stripping; a wrong guess only falls back to the timeout.
+    const reportedExpectedTools = [...new Set(expectedTools
+      .map((name) => name.replace(/[^A-Za-z0-9_-]/g, ""))
+      .filter((name) => name.length > 0 && name.length <= 64))]
+    if (reportedExpectedTools.length === 0) return Promise.resolve(true)
+
     const source = `mcp:${getMcpServerName(this.getAgentName(), toolsFilePath)}`
     const ready = (tools: AvailableTool[] | undefined): boolean => {
       if (!tools) return false
       const names = new Set(tools.filter((t) => t.source === source).map((t) => t.name))
-      return expectedTools.every((name) => names.has(name))
+      return reportedExpectedTools.every((name) => names.has(name))
     }
 
     if (ready(this.sessionTools.get(sessionId))) return Promise.resolve(true)

@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, beforeEach, spyOn } from "bun:test"
+import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from "bun:test"
 import { KiroACPLanguageModel, type KiroACPModelConfig } from "../src/kiro-acp-model"
 import { resetAuthCache } from "../src/kiro-auth"
 import { KiroACPError, KiroACPConnectionError, KIRO_NOT_LOGGED_IN_REASON, isKiroNotLoggedInError } from "../src/acp-client"
@@ -6,13 +6,14 @@ import type { ACPClient, ACPSession, SessionUpdate, PromptOptions } from "../src
 import { InstructionDeliveryLedger, INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT, type InstructionDeliveryToken } from "../src/delivery-ledger"
 import type { IPCServer, PendingToolCall, ToolResultRequest } from "../src/ipc-server"
 import { LaneRouter } from "../src/lane-router"
+import { persistSession } from "../src/session-storage"
 import type {
   LanguageModelV3CallOptions,
   LanguageModelV3StreamPart,
   LanguageModelV3Prompt,
   LanguageModelV3FunctionTool,
 } from "@ai-sdk/provider"
-import { readFileSync, mkdirSync, mkdtempSync, existsSync } from "node:fs"
+import { readFileSync, mkdirSync, mkdtempSync, existsSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import * as childProcess from "node:child_process"
@@ -4350,6 +4351,236 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
+  describe("session tools wait", () => {
+    const userPrompt: LanguageModelV3Prompt = [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+    ]
+    const functionTools: LanguageModelV3FunctionTool[] = [
+      { type: "function", name: "zebra", inputSchema: { type: "object" } },
+      { type: "function", name: "alpha", inputSchema: { type: "object" } },
+    ]
+    const providerTool = {
+      type: "provider" as const,
+      id: "test.search" as const,
+      name: "search",
+      args: {},
+    }
+    let testDir: string
+    let originalXdgDataHome: string | undefined
+
+    beforeEach(() => {
+      testDir = createTempToolsDir()
+      originalXdgDataHome = process.env.XDG_DATA_HOME
+      process.env.XDG_DATA_HOME = testDir
+    })
+
+    afterEach(() => {
+      if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = originalXdgDataHome
+      rmSync(testDir, { recursive: true, force: true })
+    })
+
+    function fixture(overrides: Partial<ACPClient> = {}, config: Partial<KiroACPModelConfig> = {}) {
+      const toolsFilePath = join(testDir, "tools-session.json")
+      const client = createMockClient({
+        getAgentName: mock(() => "agent"),
+        getCwd: mock(() => testDir),
+        createSessionToolsFilePath: mock(() => toolsFilePath),
+        prompt: mock(async (opts: PromptOptions) => {
+          opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "ok" } })
+          return { stopReason: "end_turn" }
+        }),
+        ...overrides,
+      } as unknown as Partial<ACPClient>)
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { ...config, client })
+      const options = makeCallOptions(userPrompt, { tools: functionTools })
+      return { client, model, options, toolsFilePath }
+    }
+
+    function expectNormalFinish(parts: LanguageModelV3StreamPart[]) {
+      expect(parts.filter(part => part.type === "error")).toEqual([])
+      const finishes = parts.filter(part => part.type === "finish")
+      expect(finishes).toHaveLength(1)
+      expect(finishes[0].finishReason.unified).toBe("stop")
+    }
+
+    test("waits for the new session's tools path and sorted function names before prompting", async () => {
+      let resolveWait!: (ready: boolean) => void
+      const waitGate = new Promise<boolean>(resolve => { resolveWait = resolve })
+      let enteredWait!: () => void
+      const waitEntered = new Promise<void>(resolve => { enteredWait = resolve })
+      const waitForSessionTools = mock(() => {
+        enteredWait()
+        return waitGate
+      })
+      const { client, model, options, toolsFilePath } = fixture({ waitForSessionTools })
+      options.tools = [functionTools[0], providerTool, functionTools[1]]
+
+      const pendingStream = model.doStream(options)
+      let parts: LanguageModelV3StreamPart[] = []
+      try {
+        await waitEntered
+        expect(client.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
+        expect(client.createSessionWithToolsPath).toHaveBeenCalledWith(toolsFilePath)
+        expect(waitForSessionTools).toHaveBeenCalledTimes(1)
+        expect(waitForSessionTools).toHaveBeenCalledWith("sess-1", toolsFilePath, ["alpha", "zebra"])
+        expect(client.prompt).not.toHaveBeenCalled()
+      } finally {
+        resolveWait(true)
+        parts = await collectStream((await pendingStream).stream)
+      }
+
+      expect(client.prompt).toHaveBeenCalledTimes(1)
+      expectNormalFinish(parts)
+    })
+
+    for (const ready of [true, false]) {
+      test(`${ready ? "already-ready success" : "timeout fallback"} continues to a normal prompt and finish`, async () => {
+        const waitForSessionTools = mock(() => Promise.resolve(ready))
+        const { client, model, options, toolsFilePath } = fixture({ waitForSessionTools })
+
+        const parts = await collectStream((await model.doStream(options)).stream)
+
+        expect(waitForSessionTools).toHaveBeenCalledTimes(1)
+        expect(waitForSessionTools).toHaveBeenCalledWith("sess-1", toolsFilePath, ["alpha", "zebra"])
+        expect(client.prompt).toHaveBeenCalledTimes(1)
+        expectNormalFinish(parts)
+      })
+    }
+
+    test("skips the wait without any tools", async () => {
+      const { client, model, options } = fixture()
+      delete options.tools
+
+      const parts = await collectStream((await model.doStream(options)).stream)
+
+      expect(client.createSession).toHaveBeenCalledTimes(1)
+      expect(client.createSessionWithToolsPath).not.toHaveBeenCalled()
+      expect(client.waitForSessionTools).not.toHaveBeenCalled()
+      expect(client.prompt).toHaveBeenCalledTimes(1)
+      expectNormalFinish(parts)
+    })
+
+    test("skips the wait when all tools are provider tools", async () => {
+      const { client, model, options, toolsFilePath } = fixture()
+      options.tools = [providerTool]
+
+      const parts = await collectStream((await model.doStream(options)).stream)
+
+      expect(client.createSessionWithToolsPath).toHaveBeenCalledWith(toolsFilePath)
+      expect(JSON.parse(readFileSync(toolsFilePath, "utf-8")).tools).toEqual([])
+      expect(client.waitForSessionTools).not.toHaveBeenCalled()
+      expect(client.prompt).toHaveBeenCalledTimes(1)
+      expectNormalFinish(parts)
+    })
+
+    test("skips the wait without an agent but still creates the tooled session and prompts", async () => {
+      const { client, model, options, toolsFilePath } = fixture({ getAgentName: mock(() => undefined) })
+
+      const parts = await collectStream((await model.doStream(options)).stream)
+
+      expect(client.start).toHaveBeenCalledWith(toolsFilePath)
+      expect(client.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
+      expect(client.createSessionWithToolsPath).toHaveBeenCalledWith(toolsFilePath)
+      expect(JSON.parse(readFileSync(toolsFilePath, "utf-8")).tools.map((tool: { name: string }) => tool.name))
+        .toEqual(["zebra", "alpha"])
+      expect(client.waitForSessionTools).not.toHaveBeenCalled()
+      expect(client.prompt).toHaveBeenCalledTimes(1)
+      expectNormalFinish(parts)
+    })
+
+    for (const source of ["configured", "persisted"] as const) {
+      test(`skips the wait when the ${source} session loads with affinity`, async () => {
+        const loadedSession: ACPSession = {
+          sessionId: `sess-${source}`,
+          modes: { currentModeId: "agent", availableModes: [] },
+          models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+        }
+        const { client, model, options } = fixture(
+          { loadSession: mock(async () => loadedSession) },
+          source === "configured" ? { sessionId: loadedSession.sessionId } : {},
+        )
+        const affinityId = `affinity-${source}`
+        options.headers = { "x-session-affinity": affinityId }
+        if (source === "persisted") persistSession(testDir, loadedSession.sessionId, affinityId)
+
+        const parts = await collectStream((await model.doStream(options)).stream)
+
+        expect(client.loadSession).toHaveBeenCalledTimes(1)
+        expect(client.loadSession).toHaveBeenCalledWith(loadedSession.sessionId)
+        expect(client.createSession).not.toHaveBeenCalled()
+        expect(client.createSessionWithToolsPath).not.toHaveBeenCalled()
+        expect(client.waitForSessionTools).not.toHaveBeenCalled()
+        expect(client.prompt).toHaveBeenCalledTimes(1)
+        expect((client.prompt as ReturnType<typeof mock>).mock.calls[0][0].sessionId).toBe(loadedSession.sessionId)
+        expectNormalFinish(parts)
+      })
+
+      test(`waits on the fresh session after the ${source} load fails`, async () => {
+        const oldSessionId = `missing-${source}`
+        const { client, model, options, toolsFilePath } = fixture(
+          { loadSession: mock(async () => { throw new Error("Session not found") }) },
+          source === "configured" ? { sessionId: oldSessionId } : {},
+        )
+        const affinityId = `affinity-failed-${source}`
+        options.headers = { "x-session-affinity": affinityId }
+        if (source === "persisted") persistSession(testDir, oldSessionId, affinityId)
+
+        const parts = await collectStream((await model.doStream(options)).stream)
+
+        expect(client.loadSession).toHaveBeenCalledTimes(1)
+        expect(client.loadSession).toHaveBeenCalledWith(oldSessionId)
+        expect(client.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
+        expect(client.createSessionWithToolsPath).toHaveBeenCalledWith(toolsFilePath)
+        expect(client.waitForSessionTools).toHaveBeenCalledTimes(1)
+        expect(client.waitForSessionTools).toHaveBeenCalledWith("sess-1", toolsFilePath, ["alpha", "zebra"])
+        expect(client.prompt).toHaveBeenCalledTimes(1)
+        expectNormalFinish(parts)
+      })
+    }
+
+    test("tool-result resumption reuses the prompt without another session or tools wait", async () => {
+      let resolvePrompt!: (result: { stopReason: string }) => void
+      const promptGate = new Promise<{ stopReason: string }>(resolve => { resolvePrompt = resolve })
+      const laneRouter = new LaneRouter()
+      const ipcServer = createMockIPCServer({
+        resolveToolResult: mock(() => { resolvePrompt({ stopReason: "end_turn" }) }),
+      })
+      const { client, model, options, toolsFilePath } = fixture({
+        getLaneRouter: mock(() => laneRouter),
+        getIPCServer: mock(() => ipcServer),
+        prompt: mock(() => {
+          laneRouter.route({ callId: "tc-wait-resume", toolName: "alpha", args: {} })
+          return promptGate
+        }),
+      })
+
+      try {
+        const firstParts = await collectStream((await model.doStream(options)).stream)
+        const firstFinish = firstParts.find(part => part.type === "finish")
+        expect(firstFinish?.type === "finish" && firstFinish.finishReason.unified).toBe("tool-calls")
+        expect(client.waitForSessionTools).toHaveBeenCalledWith("sess-1", toolsFilePath, ["alpha", "zebra"])
+
+        const resumedOptions = makeCallOptions([
+          ...userPrompt,
+          { role: "assistant", content: [{ type: "tool-call", toolCallId: "tc-wait-resume", toolName: "alpha", input: "{}" }] },
+          { role: "tool", content: [{ type: "tool-result", toolCallId: "tc-wait-resume", toolName: "alpha", output: { type: "text", value: "done" } }] },
+        ], { tools: functionTools })
+        const parts = await collectStream((await model.doStream(resumedOptions)).stream)
+
+        expect(ipcServer.resolveToolResult).toHaveBeenCalledWith({ callId: "tc-wait-resume", result: "done", isError: false })
+        expect(client.setPromptCallback).toHaveBeenCalledTimes(1)
+        expect(client.loadSession).not.toHaveBeenCalled()
+        expect(client.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
+        expect(client.waitForSessionTools).toHaveBeenCalledTimes(1)
+        expect(client.prompt).toHaveBeenCalledTimes(1)
+        expectNormalFinish(parts)
+      } finally {
+        resolvePrompt({ stopReason: "end_turn" })
+      }
+    })
+  })
+
   describe("ensureClient concurrency", () => {
     /**
      * Build a mock client whose `start` blocks on a manually-resolved gate.
@@ -4477,6 +4708,39 @@ describe("KiroACPLanguageModel", () => {
 
       // Assert: startedToolless ends false (reset by stop() during restart).
       expect(getStartedToolless()).toBe(false)
+    })
+
+    test("toolless-to-tooled restart waits for the new tooled session's bridge", async () => {
+      const { client, startCalls, resolveStart, getStartedToolless, getStopCalls } =
+        createDeferredStartClient()
+      client.getAgentName = mock(() => "agent")
+      client.createSessionWithToolsPath = mock(async () => ({
+        sessionId: "sess-after-restart",
+        modes: { currentModeId: "agent", availableModes: [] },
+        models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+      }))
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const userPrompt: LanguageModelV3Prompt = [
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+      ]
+      const toollessStream = model.doStream(makeCallOptions(userPrompt))
+      resolveStart()
+      await collectStream((await toollessStream).stream)
+      expect(client.waitForSessionTools).not.toHaveBeenCalled()
+
+      await collectStream((await model.doStream(makeCallOptions(userPrompt, {
+        tools: [{ type: "function", name: "bash", inputSchema: { type: "object" } }],
+      }))).stream)
+
+      expect(startCalls).toHaveLength(2)
+      expect(startCalls[0]).toBeUndefined()
+      expect(startCalls[1]).toBeDefined()
+      expect(getStopCalls()).toBe(1)
+      expect(getStartedToolless()).toBe(false)
+      expect(client.createSessionWithToolsPath).toHaveBeenCalledWith(startCalls[1])
+      expect(client.waitForSessionTools).toHaveBeenCalledTimes(1)
+      expect(client.waitForSessionTools).toHaveBeenCalledWith("sess-after-restart", startCalls[1], ["bash"])
+      expect(client.prompt).toHaveBeenCalledTimes(2)
     })
   })
 
