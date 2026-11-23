@@ -1375,6 +1375,22 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     return null
   }
 
+  /** Text of user messages sent after the last assistant message (mid-run messages). */
+  private extractMidRunUserText(prompt: LanguageModelV3Prompt): string {
+    let lastAssistant = -1
+    prompt.forEach((m, i) => {
+      if (m.role === "assistant") lastAssistant = i
+    })
+    const texts: string[] = []
+    for (const m of prompt.slice(lastAssistant + 1)) {
+      if (m.role !== "user") continue
+      for (const part of m.content) {
+        if (part.type === "text" && part.text) texts.push(part.text)
+      }
+    }
+    return texts.join("\n\n")
+  }
+
   // -------------------------------------------------------------------------
   // Shared stream infrastructure for prompt flows
   // -------------------------------------------------------------------------
@@ -2079,6 +2095,19 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     const turn = this.pendingTurns.get(sessionId)
     if (!turn) {
       throw new Error(`No pending turn for session ${sessionId}`)
+    }
+
+    // The open ACP turn only receives tool results, so attach any user
+    // messages sent mid-run to the last result or the model never sees them.
+    const midRunText = this.extractMidRunUserText(options.prompt)
+    if (midRunText) {
+      const last = toolResults[toolResults.length - 1]
+      const note = `\n\n<system-reminder>\nThe user sent this message while you were working:\n${midRunText}\n</system-reminder>`
+      toolResults = toolResults.map(r => r !== last ? r : {
+        ...r,
+        result: (r.result ?? "") + note,
+        ...(r.content ? { content: [...r.content, { type: "text" as const, text: note }] } : {}),
+      })
     }
 
     // Check if any tool results contain images
