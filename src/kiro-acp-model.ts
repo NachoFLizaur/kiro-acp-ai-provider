@@ -108,6 +108,8 @@ interface PendingTurnState {
   outputCharCount: number
   streamSegment: number
   promptAbort: AbortController
+  /** Conversation the turn belongs to; undefined for one-shot sessions. */
+  affinityId?: string
   /** Stall accounting carried across tool-call segments of the same turn. */
   stalledMs: number
   stallHint: string | undefined
@@ -1375,6 +1377,20 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     return null
   }
 
+  /** End an abandoned open turn: fail its tool calls, then cancel it. */
+  private async cancelTurn(sessionId: string, turn: PendingTurnState): Promise<void> {
+    for (const callId of turn.pendingToolCalls.keys()) {
+      this.sendToolResult(callId, "Cancelled: the conversation history was rewritten.", true)
+    }
+    turn.promptAbort.abort()
+    try {
+      await turn.promptPromise
+    } catch {
+      // Expected: abort causes rejection
+    }
+    this.pendingTurns.delete(sessionId)
+  }
+
   // -------------------------------------------------------------------------
   // Shared stream infrastructure for prompt flows
   // -------------------------------------------------------------------------
@@ -1958,6 +1974,21 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     options: LanguageModelV3CallOptions,
     reset = false,
   ): Promise<LanguageModelV3StreamResult> {
+    // This request does not answer the conversation's open turn. After a
+    // history rewrite the turn is abandoned, so end it; otherwise the request
+    // runs beside it (e.g. background compaction) and is served in a one-shot
+    // session with the full history instead of the busy one.
+    const affinityId = affinityFromOptions(options)
+    let beside = false
+    for (const [sessionId, turn] of this.pendingTurns) {
+      if (!affinityId || turn.affinityId !== affinityId) continue
+      if (reset) await this.cancelTurn(sessionId, turn)
+      else beside = true
+    }
+    if (beside) {
+      options = { ...options, headers: { ...options.headers, "x-session-affinity": undefined } }
+    }
+
     const session = await this.acquireSession(options.tools, affinityFromOptions(options))
     await this.ensureModel(session)
     await this.ensureEffort(session, this.resolveRequestedEffort(options))
@@ -1966,7 +1997,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     let deliversInstructions = false
     let promptBlocks: ContentBlock[]
 
-    const hasHistory = reset && options.prompt.some(
+    const hasHistory = (reset || beside) && options.prompt.some(
       (m) => m.role === "assistant" || m.role === "tool",
     )
 
@@ -2017,6 +2048,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           outputCharCount: state.outputCharCount,
           streamSegment: state.nextSegment,
           promptAbort,
+          affinityId: affinityFromOptions(options),
           stalledMs: state.stalledMs,
           stallHint: state.stallHint,
           stallReason: state.stallReason,
@@ -2177,6 +2209,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           outputCharCount: state.outputCharCount,
           streamSegment: state.nextSegment,
           promptAbort,
+          affinityId: turn.affinityId,
           stalledMs: state.stalledMs,
           stallHint: state.stallHint,
           stallReason: state.stallReason,
