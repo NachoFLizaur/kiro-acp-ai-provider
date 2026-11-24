@@ -1418,6 +1418,65 @@ describe("KiroACPLanguageModel", () => {
     })
   })
 
+  describe("doStream() — fresh prompt beside an open turn", () => {
+    function openTurnFixture() {
+      const laneRouter = new LaneRouter()
+      const ipc = createMockIPCServer()
+      const calls: PromptOptions[] = []
+      let sessions = 0
+      const client = createMockClient({
+        getLaneRouter: mock(() => laneRouter),
+        getIPCServer: mock(() => ipc),
+        getCwd: mock(() => createTempToolsDir()),
+        loadSession: mock(() => Promise.reject(new Error("busy"))),
+        createSession: mock(() => Promise.resolve({ sessionId: `sess-${++sessions}` } as ACPSession)),
+        prompt: mock((opts: PromptOptions) => {
+          calls.push(opts)
+          if (calls.length > 1) return Promise.resolve({ stopReason: "end_turn" })
+          // First turn calls a tool and stays open until cancelled.
+          laneRouter.route({ callId: "tc-open", toolName: "write", args: {} })
+          return new Promise((resolve) => {
+            opts.signal?.addEventListener("abort", () => resolve({ stopReason: "cancelled" }), { once: true })
+          })
+        }),
+      } as unknown as Partial<ACPClient>)
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const history: LanguageModelV3Prompt = [
+        { role: "user", content: [{ type: "text", text: "port it" }] },
+        { role: "assistant", content: [{ type: "text", text: "working" }] },
+        { role: "user", content: [{ type: "text", text: "summarize" }] },
+      ]
+      return { calls, client, ipc, model, history }
+    }
+
+    test("runs in a one-shot session with the history and leaves the turn open", async () => {
+      const { calls, client, ipc, model, history } = openTurnFixture()
+      const headers = { "x-session-affinity": "aff-open" }
+      await collectStream((await model.doStream(makeCallOptions(history.slice(0, 1), { headers }))).stream)
+      await collectStream((await model.doStream(makeCallOptions(history, { headers }))).stream)
+
+      expect(client.createSession).toHaveBeenCalledTimes(2)
+      const replay = (calls[1].prompt[0] as { text: string }).text
+      expect(replay).toContain("User: port it")
+      expect(replay).toContain("Assistant: working")
+      expect(calls[0].signal?.aborted).toBe(false)
+      expect(ipc.resolveToolResult).not.toHaveBeenCalled()
+    })
+
+    test("cancels the open turn when the history was rewritten", async () => {
+      const { calls, ipc, model, history } = openTurnFixture()
+      await collectStream((await model.doStream(makeCallOptions(history.slice(0, 1), {
+        headers: { "x-session-affinity": "aff-reset" },
+      }))).stream)
+      await collectStream((await model.doStream(makeCallOptions(history, {
+        headers: { "x-session-affinity": "aff-reset", "x-session-reset": "true" },
+      }))).stream)
+
+      expect(calls[0].signal?.aborted).toBe(true)
+      expect(ipc.resolveToolResult).toHaveBeenCalledWith(expect.objectContaining({ callId: "tc-open", isError: true }))
+    })
+  })
+
   describe("doStream() — reasoning", () => {
     test("emits reasoning-start, reasoning-delta, reasoning-end for thought chunks", async () => {
       const client = createMockClient({
