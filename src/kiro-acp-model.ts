@@ -1509,6 +1509,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     /** Distinct id per narrated window so a resumed turn never re-opens a closed part. */
     let stallWindows = 0
     let stallFragmentId: string | null = null
+    // Reason (if any) already narrated in the current window; gates the one
+    // evidence line so bare ticks stay quiet.
+    let noticeReason: string | undefined = undefined
 
     const clearStallTimer = (): void => {
       if (stallTimer) {
@@ -1553,7 +1556,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
 
       if (stallLive === "reasoning") {
         const silence = formatSeconds(stallNotices * stallAfterMs)
-        const notice = `Kiro: no output for ${silence} - the model may be overloaded and kiro-cli is retrying.`
+        // The overload claim is asserted only when kiro-cli's own log produced
+        // a reason for this turn; without evidence the notice stays a neutral
+        // observation (opencode-kiro#9).
+        const notice =
+          stallReason === undefined
+            ? `Kiro: no output for ${silence} - still waiting for output.`
+            : `Kiro: no output for ${silence} - kiro-cli logged ${stallReason}; the model may be overloaded and kiro-cli is retrying.`
+        const hasNewEvidence = stallReason !== undefined && stallReason !== noticeReason
         if (stallFragmentId === null) {
           // Close whatever real block is open so the notice never lands inside
           // the model's own text or reasoning; the next real chunk re-opens it.
@@ -1570,8 +1580,13 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           ensureStreamStarted()
           writePart({ type: "reasoning-start", id: stallFragmentId })
           writePart({ type: "reasoning-delta", id: stallFragmentId, delta: notice })
-        } else {
+          noticeReason = stallReason
+        } else if (hasNewEvidence) {
+          // One upgrade line when log evidence arrives mid-window. The silence
+          // duration is reported by the closing line, so bare ticks stay quiet
+          // instead of appending a line every afterMs (opencode-kiro#9).
           writePart({ type: "reasoning-delta", id: stallFragmentId, delta: `\n${notice}` })
+          noticeReason = stallReason
         }
       }
 
@@ -1586,6 +1601,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       stalledMs += windowMs
       stallWindowStart = null
       stallNotices = 0
+      noticeReason = undefined
       return windowMs
     }
 
