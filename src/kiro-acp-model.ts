@@ -562,9 +562,29 @@ function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
       continue
     }
 
-    // Skip tool-result messages entirely — they reference tool names
-    // and outputs that could mislead the model about available tools.
+    // Tool results carry the evidence the model already gathered; a session
+    // that starts empty must not lose it. The tool name is still omitted —
+    // naming tools in the replay primes the model to reference tools that may
+    // not be available in the new session.
     if (message.role === "tool") {
+      for (const part of message.content) {
+        if (part.type !== "tool-result") continue
+        const output = part.output
+        let text = ""
+        if (output.type === "text") {
+          text = output.value
+        } else if (output.type === "content") {
+          text = output.value
+            .filter((b) => b.type === "text")
+            .map((b) => b.text)
+            .join("\n")
+        } else if (output.type === "json") {
+          text = JSON.stringify(output.value)
+        }
+        if (text) {
+          historyParts.push(`Tool output:\n${text}`)
+        }
+      }
       continue
     }
   }
@@ -718,7 +738,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    */
   private async acquireSession(
     tools?: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
-  ): Promise<ACPSession> {
+  ): Promise<{ session: ACPSession; created: boolean }> {
     // Write tools BEFORE creating the session so the MCP bridge
     // has them from the very first `tools/list` query.
     let toolsFilePath: string | undefined
@@ -753,7 +773,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
           }
           persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
-          return loaded
+          return { session: loaded, created: false }
         } catch (err) {
           // Fall through to persisted session or create new
         }
@@ -771,7 +791,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
               this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
             }
             persistSession(this.client.getCwd(), sessionId, this.currentAffinityId)
-            return session
+            return { session, created: false }
           }
         } catch (err: unknown) {
           // Fall through to create new session
@@ -795,7 +815,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       persistSession(this.client.getCwd(), session.sessionId, this.currentAffinityId)
     }
 
-    return session
+    return { session, created: true }
   }
 
   /**
@@ -900,7 +920,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
    * Used when session/load fails and we need to rehydrate from the consumer's history.
    */
   async injectContext(summary: string): Promise<void> {
-    const session = await this.acquireSession()
+    const { session } = await this.acquireSession()
 
     try {
       await this.client.prompt({
@@ -1931,7 +1951,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     options: LanguageModelV3CallOptions,
     reset = false,
   ): Promise<LanguageModelV3StreamResult> {
-    const session = await this.acquireSession(options.tools)
+    const { session, created } = await this.acquireSession(options.tools)
     await this.ensureModel(session)
     await this.ensureEffort(session, this.resolveRequestedEffort(options))
 
@@ -1939,7 +1959,11 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     let deliversInstructions = false
     let promptBlocks: ContentBlock[]
 
-    const hasHistory = reset && options.prompt.some(
+    // A freshly created kiro session has no history of its own, and a reset
+    // session is about to receive one: both must carry the full conversation.
+    // A loaded session already keeps its history in kiro-cli, so only the
+    // incremental parts go over the wire there.
+    const hasHistory = (reset || created) && options.prompt.some(
       (m) => m.role === "assistant" || m.role === "tool",
     )
 

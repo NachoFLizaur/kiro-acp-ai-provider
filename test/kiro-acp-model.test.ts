@@ -889,7 +889,7 @@ describe("KiroACPLanguageModel", () => {
           ? [{ type: "text", text: "hello" }, { type: "file", data: "imgdata", mediaType: "image/png" }]
           : [{ type: "text", text: "hello" }],
       })
-      return makeCallOptions(prompt)
+      return makeCallOptions(prompt, { headers: { "x-session-affinity": "aff-delivery" } })
     }
 
     function deferredPrompt() {
@@ -926,7 +926,7 @@ describe("KiroACPLanguageModel", () => {
           return onPrompt?.(opts, calls.length - 1) ?? Promise.resolve({ stopReason: "end_turn" })
         }),
       }, ledger)
-      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, stall: { afterMs: 0 } })
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, sessionId: "sess-1", stall: { afterMs: 0 } })
       return { ledger, calls, session, client, model }
     }
 
@@ -953,7 +953,7 @@ describe("KiroACPLanguageModel", () => {
               : { type: "text", value: "done" },
           }],
         },
-      ])
+      ], { headers: { "x-session-affinity": "aff-delivery" } })
     }
 
     for (const image of [false, true]) {
@@ -2288,10 +2288,11 @@ describe("KiroACPLanguageModel", () => {
   })
 
   describe("prompt extraction", () => {
-    test("sends only the last user message, skipping history and assistant messages", async () => {
+    test("a loaded session sends only the last user message, skipping history and assistant messages", async () => {
       let capturedPrompt: unknown[] = []
 
       const client = createMockClient({
+        getCwd: mock(() => createTempToolsDir()),
         prompt: mock(async (opts: PromptOptions) => {
           capturedPrompt = opts.prompt
           opts.onUpdate({
@@ -2302,7 +2303,7 @@ describe("KiroACPLanguageModel", () => {
         }),
       } as unknown as Partial<ACPClient>)
 
-      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, sessionId: "sess-loaded" })
 
       await model.doStream(
         makeCallOptions([
@@ -2312,7 +2313,7 @@ describe("KiroACPLanguageModel", () => {
             content: [{ type: "text", text: "first answer" }],
           },
           { role: "user", content: [{ type: "text", text: "follow up" }] },
-        ]),
+        ], { headers: { "x-session-affinity": "aff-loaded" } }),
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
@@ -2351,10 +2352,11 @@ describe("KiroACPLanguageModel", () => {
       expect(textContent).toContain("<system_instructions>")
     })
 
-    test("skips tool messages — kiro-cli manages tool results in its session", async () => {
+    test("a loaded session skips tool messages — kiro-cli manages tool results in its session", async () => {
       let capturedPrompt: unknown[] = []
 
       const client = createMockClient({
+        getCwd: mock(() => createTempToolsDir()),
         prompt: mock(async (opts: PromptOptions) => {
           capturedPrompt = opts.prompt
           opts.onUpdate({
@@ -2365,7 +2367,7 @@ describe("KiroACPLanguageModel", () => {
         }),
       } as unknown as Partial<ACPClient>)
 
-      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, sessionId: "sess-loaded" })
 
       await model.doStream(
         makeCallOptions([
@@ -2393,7 +2395,7 @@ describe("KiroACPLanguageModel", () => {
             ],
           },
           { role: "user", content: [{ type: "text", text: "what was the output?" }] },
-        ]),
+        ], { headers: { "x-session-affinity": "aff-loaded" } }),
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
@@ -5524,5 +5526,51 @@ describe("doStream() - turnWallMs", () => {
     const kiro = kiroOf(partsOfType(parts, "finish")[0])!
     expect(kiro.turnDurationMs).toBeNull()
     expect(typeof kiro.turnWallMs).toBe("number")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Conversation replay on freshly created sessions
+// ---------------------------------------------------------------------------
+
+describe("session replay on fresh sessions", () => {
+  test("a freshly created session receives the full conversation, not just the last user message", async () => {
+    let capturedPrompt: unknown
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        capturedPrompt = opts.prompt
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+
+    const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+    const prompt: LanguageModelV3Prompt = [
+      { role: "system", content: "You are a test agent." },
+      { role: "user", content: [{ type: "text", text: "TASK_MARKER do the thing" }] },
+      { role: "assistant", content: [{ type: "text", text: "ASSISTANT_MARKER earlier reply" }] },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "read",
+            output: { type: "text", value: "TOOL_MARKER result" },
+          },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "FOLLOWUP_MARKER continue" }] },
+    ]
+    const result = await model.doStream(makeCallOptions(prompt))
+    await collectStream(result.stream)
+
+    // The session was created by this call, so the new kiro session must be
+    // brought up to speed: the task, the earlier reply and the tool result all
+    // have to reach the model, not only the follow-up.
+    const sent = JSON.stringify(capturedPrompt ?? [])
+    expect(sent).toContain("TASK_MARKER")
+    expect(sent).toContain("ASSISTANT_MARKER")
+    expect(sent).toContain("TOOL_MARKER")
+    expect(sent).toContain("FOLLOWUP_MARKER")
   })
 })

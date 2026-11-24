@@ -998,6 +998,7 @@ type FakeProcess = EventEmitter & {
   stderr: PassThrough
   pid: number
   kill: ReturnType<typeof mock>
+  requests: Array<{ method?: string; params?: Record<string, unknown> }>
 }
 
 /** In-memory stand-in for `kiro-cli acp`: answers initialize, exits on stdin end. */
@@ -1007,19 +1008,34 @@ function fakeKiroProcess(): FakeProcess {
   proc.stdout = new PassThrough()
   proc.stderr = new PassThrough()
   proc.pid = 4242
+  proc.requests = []
   proc.kill = mock(() => {
     setImmediate(() => proc.emit("exit", null, "SIGTERM"))
     return true
   })
   const lines = createInterface({ input: proc.stdin })
   lines.on("line", (line) => {
-    const msg = JSON.parse(line) as { id?: number; method?: string }
+    const msg = JSON.parse(line) as { id?: number; method?: string; params?: Record<string, unknown> }
+    proc.requests.push({ method: msg.method, params: msg.params })
     if (msg.method === "initialize") {
       proc.stdout.write(
         JSON.stringify({
           jsonrpc: "2.0",
           id: msg.id,
           result: { agentInfo: { name: "kiro-cli", version: "1.0.0" }, agentCapabilities: {} },
+        }) + "\n",
+      )
+    }
+    if (msg.method === "session/new" || msg.method === "session/load") {
+      proc.stdout.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: {
+            sessionId: "sess-fake",
+            modes: { currentModeId: "agent", availableModes: [] },
+            models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+          },
         }) + "\n",
       )
     }
@@ -1757,5 +1773,62 @@ describe("isKiroNotLoggedInError", () => {
     expect(isKiroNotLoggedInError({ data: null })).toBe(false)
     expect(isKiroNotLoggedInError({ data: "not-logged-in" })).toBe(false)
     expect(isKiroNotLoggedInError({ message: 7 })).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// session/new and session/load carry the agent config's MCP servers
+// ---------------------------------------------------------------------------
+
+describe("session MCP servers", () => {
+  const clients: ACPClient[] = []
+  let spies: ReturnType<typeof installChildProcessSpies> | undefined
+
+  beforeEach(() => {
+    spies = installChildProcessSpies()
+  })
+
+  afterEach(() => {
+    spies?.restore()
+    spies = undefined
+    for (const client of clients.splice(0)) void client.stop()
+  })
+
+  /** Start a client whose agent config points at a tools file. */
+  async function startClientWithTools(cwd: string): Promise<{ client: ACPClient; toolsPath: string }> {
+    const client = new ACPClient({ cwd, agent: "opencode" })
+    clients.push(client)
+    ;(client as unknown as { resolvedBridgePath: string }).resolvedBridgePath = join(cwd, "mcp-bridge.mjs")
+    const toolsPath = join(cwd, "tools.json")
+    writeFileSync(toolsPath, JSON.stringify({ tools: [{ name: "read", description: "", inputSchema: {} }] }))
+    await client.start(toolsPath)
+    return { client, toolsPath }
+  }
+
+  function requestParams(method: string): Record<string, unknown> {
+    const proc = spies!.processes[0]!
+    return proc.requests.find((r) => r.method === method)?.params ?? {}
+  }
+
+  test("session/new carries the MCP server from the agent config", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-mcp-test-"))
+    const { client, toolsPath } = await startClientWithTools(cwd)
+
+    await client.createSession()
+
+    const servers = requestParams("session/new").mcpServers as Array<Record<string, unknown>> | undefined
+    expect(servers).toHaveLength(1)
+    expect(servers![0].command).toBe("node")
+    expect(servers![0].args).toContain(toolsPath)
+  })
+
+  test("session/load carries the MCP server too", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-mcp-test-"))
+    const { client } = await startClientWithTools(cwd)
+
+    await client.loadSession("sess-old")
+
+    const servers = requestParams("session/load").mcpServers as Array<Record<string, unknown>> | undefined
+    expect(servers).toHaveLength(1)
   })
 })

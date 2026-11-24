@@ -421,6 +421,22 @@ export class ACPClient {
   private agentConfigPath: string | null = null
 
   /**
+   * The mcpServers map of the agent config this client last wrote. Sent on
+   * `session/new` and `session/load` so every session is self-describing
+   * instead of relying on kiro-cli picking the rewritten config up
+   * (see NachoFLizaur/opencode-kiro#9's sibling reports on toolless sessions).
+   */
+  private currentMcpServers: Record<string, unknown> | undefined = undefined
+
+  /** ACP-shaped stdio entries derived from the current agent config. */
+  private mcpServersForRequest(): Array<Record<string, unknown>> {
+    return Object.entries(this.currentMcpServers ?? {}).map(([name, value]) => {
+      const entry = value as Record<string, unknown>
+      return { name, command: entry.command, args: entry.args, env: [] }
+    })
+  }
+
+  /**
    * Mutex for serializing agent config rewrites + session creation.
    * Prevents race where model A rewrites config, model B overwrites it,
    * then model A creates a session reading model B's config.
@@ -695,7 +711,7 @@ export class ACPClient {
   private async sendNewSession(): Promise<ACPSession> {
     const result = await this.sendRequest("session/new", {
       cwd: this.options.cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServersForRequest(),
     })
     const session = result as ACPSession
     if (!session || typeof session !== "object" || typeof session.sessionId !== "string") {
@@ -708,7 +724,7 @@ export class ACPClient {
     const result = await this.sendRequest("session/load", {
       sessionId,
       cwd: this.options.cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServersForRequest(),
     })
     const session = result as ACPSession
     if (!session || typeof session !== "object") {
@@ -982,6 +998,7 @@ export class ACPClient {
           prompt: this.options.agentPrompt,
         })
         this.agentConfigPath = writeAgentConfig(this.options.cwd, this.options.agent, config, this.instanceId)
+        this.currentMcpServers = config.mcpServers as Record<string, unknown> | undefined
       }
 
       return await this.sendNewSession()
@@ -1122,6 +1139,7 @@ export class ACPClient {
         prompt: this.options.agentPrompt,
       })
       this.agentConfigPath = writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
+      this.currentMcpServers = config.mcpServers as Record<string, unknown> | undefined
       return // Early return — no MCP bridge needed for toolless startup
     }
 
@@ -1134,6 +1152,7 @@ export class ACPClient {
     })
 
     this.agentConfigPath = writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
+    this.currentMcpServers = config.mcpServers as Record<string, unknown> | undefined
   }
 
   /**
