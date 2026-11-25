@@ -762,7 +762,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     if (affinityId) {
       if (this.config.sessionId) {
         try {
-          const loaded = await this.client.loadSession(this.config.sessionId)
+          const loaded = await this.client.loadSession(this.config.sessionId, toolsFilePath)
           const sessionId = loaded.sessionId || this.config.sessionId
           if (!loaded.sessionId) loaded.sessionId = sessionId
           await this.ensureSessionMode(loaded)
@@ -779,7 +779,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       const persisted = loadPersistedSession(this.client.getCwd(), affinityId)
       if (persisted) {
         try {
-          const session = await this.client.loadSession(persisted.kiroSessionId)
+          const session = await this.client.loadSession(persisted.kiroSessionId, toolsFilePath)
           const sessionId = session.sessionId || persisted.kiroSessionId
           if (!session.sessionId) session.sessionId = sessionId
           if (session) {
