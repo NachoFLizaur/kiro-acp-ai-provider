@@ -248,8 +248,15 @@ describe("readStallHint", () => {
     expect(hint).toBeUndefined()
   })
 
-  test("defaults to the kiro-cli chat log under the system temp directory", () => {
-    expect(kiroChatLogPath()).toBe(join(tmpdir(), "kiro-log", "kiro-chat.log"))
+  test("falls back to the system temp directory without XDG_RUNTIME_DIR", () => {
+    const oldXdg = process.env.XDG_RUNTIME_DIR
+    try {
+      delete process.env.XDG_RUNTIME_DIR
+      expect(kiroChatLogPath()).toBe(join(tmpdir(), "kiro-log", "kiro-chat.log"))
+    } finally {
+      if (oldXdg === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = oldXdg
+    }
   })
 })
 
@@ -364,6 +371,23 @@ describe("stallReason", () => {
   test("returns undefined for an absent or empty hint", () => {
     expect(stallReason(undefined)).toBeUndefined()
     expect(stallReason("")).toBeUndefined()
+  })
+
+  test("kiroChatLogPath prefers XDG_RUNTIME_DIR over tmpdir", () => {
+    const oldXdg = process.env.XDG_RUNTIME_DIR
+    const oldTmp = process.env.TMPDIR
+    try {
+      process.env.XDG_RUNTIME_DIR = "/xdg-run-test"
+      process.env.TMPDIR = "/tmp-test-x"
+      expect(kiroChatLogPath()).toBe(join("/xdg-run-test", "kiro-log", "kiro-chat.log"))
+      delete process.env.XDG_RUNTIME_DIR
+      expect(kiroChatLogPath()).toBe(join("/tmp-test-x", "kiro-log", "kiro-chat.log"))
+    } finally {
+      if (oldXdg === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = oldXdg
+      if (oldTmp === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = oldTmp
+    }
   })
 
   test("never throws for non-string input", () => {

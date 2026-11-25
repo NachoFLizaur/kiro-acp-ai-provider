@@ -22,7 +22,7 @@ import { interceptSessionAffinity } from "./session-affinity"
 import type { MCPToolDefinition, MCPToolsFile } from "./mcp-bridge-tools"
 import type { IPCContentBlock, PendingToolCall } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
-import { readStallHintDetail } from "./kiro-log-hint"
+import { isOverloadReason, readStallHintDetail } from "./kiro-log-hint"
 import { INSTRUCTION_DELIVERY_HIGH_WATER_PERCENT } from "./delivery-ledger"
 
 // ---------------------------------------------------------------------------
@@ -116,8 +116,9 @@ interface PendingTurnState {
 
 /**
  * Stall watchdog settings. A turn is "stalled" when kiro-cli has sent no
- * session/update for `afterMs`; this typically means the model backend is
- * overloaded and kiro-cli is retrying without telling the client.
+ * session/update for `afterMs`. Silence alone does not say why: it can be an
+ * ordinary slow first chunk, a mid-turn wait, or a genuine wedge, and the
+ * notice wording reflects only what kiro-cli's own log evidences.
  *
  * @since 3.2.0
  */
@@ -1512,6 +1513,9 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     // Reason (if any) already narrated in the current window; gates the one
     // evidence line so bare ticks stay quiet.
     let noticeReason: string | undefined = undefined
+    // Reason captured inside the current window only; the turn-level
+    // `stallReason` outlives windows and stays for the closing line/metadata.
+    let windowReason: string | undefined = undefined
 
     const clearStallTimer = (): void => {
       if (stallTimer) {
@@ -1533,11 +1537,12 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
      * The lookup is best-effort and is not run when the watchdog is disabled.
      */
     const captureStallHint = (): void => {
-      readStallHintDetail(promptStartedAt)
+      readStallHintDetail(stallWindowStart ?? promptStartedAt)
         .then((detail) => {
           if (streamClosed || detail === undefined) return
           stallHint = detail.hint
           stallReason = detail.reason
+          windowReason = detail.reason
         })
         .catch(() => {
           // The reader never rejects; this guard keeps the promise settled anyway.
@@ -1559,11 +1564,14 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
         // The overload claim is asserted only when kiro-cli's own log produced
         // a reason for this turn; without evidence the notice stays a neutral
         // observation (opencode-kiro#9).
+        const evidence = windowReason
         const notice =
-          stallReason === undefined
+          evidence === undefined
             ? `Kiro: no output for ${silence} - still waiting for output.`
-            : `Kiro: no output for ${silence} - kiro-cli logged ${stallReason}; the model may be overloaded and kiro-cli is retrying.`
-        const hasNewEvidence = stallReason !== undefined && stallReason !== noticeReason
+            : isOverloadReason(evidence)
+              ? `Kiro: no output for ${silence} - kiro-cli logged ${evidence}; the model may be overloaded and kiro-cli is retrying.`
+              : `Kiro: no output for ${silence} - kiro-cli logged ${evidence}.`
+        const hasNewEvidence = evidence !== undefined && evidence !== noticeReason
         if (stallFragmentId === null) {
           // Close whatever real block is open so the notice never lands inside
           // the model's own text or reasoning; the next real chunk re-opens it.
@@ -1580,13 +1588,13 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
           ensureStreamStarted()
           writePart({ type: "reasoning-start", id: stallFragmentId })
           writePart({ type: "reasoning-delta", id: stallFragmentId, delta: notice })
-          noticeReason = stallReason
+          noticeReason = evidence
         } else if (hasNewEvidence) {
           // One upgrade line when log evidence arrives mid-window. The silence
           // duration is reported by the closing line, so bare ticks stay quiet
           // instead of appending a line every afterMs (opencode-kiro#9).
           writePart({ type: "reasoning-delta", id: stallFragmentId, delta: `\n${notice}` })
-          noticeReason = stallReason
+          noticeReason = evidence
         }
       }
 
@@ -1602,6 +1610,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       stallWindowStart = null
       stallNotices = 0
       noticeReason = undefined
+      windowReason = undefined
       return windowMs
     }
 

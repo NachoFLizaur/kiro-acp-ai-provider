@@ -5868,6 +5868,51 @@ describe("stall notice", () => {
     expect(lines.length).toBeLessThanOrEqual(2)
   })
 
+  test("a non-overload log reason is quoted without the overload claim", async () => {
+    const parts = await runStalledTurn(260, () => {
+      mkdirSync(join(sandbox, "kiro-log"), { recursive: true })
+      writeFileSync(
+        kiroChatLogPath(),
+        `${new Date().toISOString()} ERROR test: ServiceError { kind: IoError, message: "token refresh failed" }\n`,
+      )
+    })
+    const lines = noticeLines(parts)
+    expect(lines.some((line) => /may be overloaded/.test(line))).toBe(false)
+    expect(lines.some((line) => /retrying/.test(line))).toBe(false)
+    expect(lines.some((line) => line.includes("Io"))).toBe(true)
+  })
+
+  test("a reason from an earlier window does not leak into the next window's notice", async () => {
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        mkdirSync(join(sandbox, "kiro-log"), { recursive: true })
+        writeFileSync(
+          kiroChatLogPath(),
+          `${new Date().toISOString()} ERROR test: ServiceError { kind: ModelOverloadedError, message: "x" }\n`,
+        )
+        await sleep(140)
+        // Content closes window 1; the silence that follows is a new window.
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "first" } })
+        await sleep(140)
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+    const model = new KiroACPLanguageModel("claude-sonnet-4.6", {
+      client,
+      stall: { afterMs: 50, live: "reasoning" },
+    })
+    const result = await model.doStream(
+      makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+    )
+    const lines = noticeLines(await collectStream(result.stream))
+    expect(lines.length).toBeGreaterThanOrEqual(3)
+    // window 1: neutral first line, then the evidence upgrade line
+    expect(lines[1]).toContain("ModelOverloaded")
+    // window 2: the stale reason must not narrate a fresh overload claim
+    expect(lines[lines.length - 1]).toContain("still waiting for output")
+    expect(lines[lines.length - 1]).not.toContain("logged")
+  })
+
   test("the overload claim appears only when kiro-cli's log carries a reason", async () => {
     const parts = await runStalledTurn(260, () => {
       mkdirSync(join(sandbox, "kiro-log"), { recursive: true })
