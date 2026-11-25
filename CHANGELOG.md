@@ -8,6 +8,12 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file was introduced after 3.1.0 was published; the 3.1.0 entry below is
 retroactive and earlier releases are recorded by their git tags only.
 
+## [Unreleased]
+
+### Changed
+
+- **Session MCP servers travel on the request, not in the agent config.** The generated agent config carries no `mcpServers`; each session's bridge entry is sent on its own `session/new` / `session/load`, derived from that session's tools file. Sessions no longer share, hot-load or clobber each other's bridges, and a load that rebinds a session to a fresh tools file restates that file's bridge (opencode-kiro#9 follow-up). Bridge tool calls now pass through `session/request_permission` and are auto-approved by the client's default handler; custom `onPermission` handlers will see them. Without an `agent` option, requests keep sending `[]` as before.
+
 ## [3.3.2] - 2026-10-16
 
 ### Fixed

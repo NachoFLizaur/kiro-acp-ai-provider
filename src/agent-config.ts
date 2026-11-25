@@ -68,6 +68,30 @@ export function getMcpServerName(agentName: string | undefined, toolsFilePath: s
     : `${(agentName ?? "kiro-acp")}-tools`
 }
 
+/** The value of one `mcpServers` map entry in an agent config. */
+export interface McpServerConfigEntry {
+  command: string
+  args: string[]
+  cwd: string
+}
+
+/**
+ * The `mcpServers` entry for a bridge serving `toolsFilePath`. Used by
+ * generateAgentConfig() and by the ACP request payloads, so the agent config
+ * and the request entries a session carries agree on the bridge arguments.
+ */
+export function mcpServerEntry(options: {
+  mcpBridgePath: string
+  toolsFilePath: string
+  cwd: string
+}): McpServerConfigEntry {
+  return {
+    command: "node",
+    args: [options.mcpBridgePath, "--tools", options.toolsFilePath],
+    cwd: options.cwd,
+  }
+}
+
 /**
  * Generate the agent configuration object for kiro-cli.
  *
@@ -86,11 +110,11 @@ export function generateAgentConfig(options: AgentConfigOptions): Record<string,
     allowedTools: [mcpServerRef],
     includeMcpJson: false,
     mcpServers: {
-      [mcpServerName]: {
-        command: "node",
-        args: [options.mcpBridgePath, "--tools", options.toolsFilePath],
+      [mcpServerName]: mcpServerEntry({
+        mcpBridgePath: options.mcpBridgePath,
+        toolsFilePath: options.toolsFilePath,
         cwd: options.cwd,
-      },
+      }),
     },
     prompt:
       options.prompt ??

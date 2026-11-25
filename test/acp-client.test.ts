@@ -16,7 +16,7 @@ import type { ChildProcess } from "node:child_process"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
 import { createInterface } from "node:readline"
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from "node:fs"
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 
@@ -1141,6 +1141,7 @@ type FakeProcess = EventEmitter & {
   stderr: PassThrough
   pid: number
   kill: ReturnType<typeof mock>
+  requests: Array<{ method?: string; params?: Record<string, unknown> }>
 }
 
 /** In-memory stand-in for `kiro-cli acp`: answers initialize, exits on stdin end. */
@@ -1150,13 +1151,39 @@ function fakeKiroProcess(): FakeProcess {
   proc.stdout = new PassThrough()
   proc.stderr = new PassThrough()
   proc.pid = 4242
+  proc.requests = []
   proc.kill = mock(() => {
     setImmediate(() => proc.emit("exit", null, "SIGTERM"))
     return true
   })
+  let sessionCounter = 0
   const lines = createInterface({ input: proc.stdin })
   lines.on("line", (line) => {
-    const msg = JSON.parse(line) as { id?: number; method?: string }
+    const msg = JSON.parse(line) as { id?: number; method?: string; params?: Record<string, unknown> }
+    proc.requests.push({ method: msg.method, params: msg.params })
+    if (msg.method === "session/new") {
+      proc.stdout.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: {
+            sessionId: `sess-${++sessionCounter}`,
+            modes: { currentModeId: "agent", availableModes: [] },
+            models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+          },
+        }) + "\n",
+      )
+    }
+    if (msg.method === "session/load") {
+      // Real kiro-cli 3.6.0 omits sessionId on session/load (measured); the
+      // "sess-rename" knob simulates an agent that answers with a new id.
+      const result: Record<string, unknown> = {
+        modes: { currentModeId: "agent", availableModes: [] },
+        models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
+      }
+      if (msg.params?.sessionId === "sess-rename") result.sessionId = "sess-renamed"
+      proc.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\n")
+    }
     if (msg.method === "initialize") {
       proc.stdout.write(
         JSON.stringify({
@@ -1900,5 +1927,167 @@ describe("isKiroNotLoggedInError", () => {
     expect(isKiroNotLoggedInError({ data: null })).toBe(false)
     expect(isKiroNotLoggedInError({ data: "not-logged-in" })).toBe(false)
     expect(isKiroNotLoggedInError({ message: 7 })).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Per-session MCP servers on session/new and session/load
+//
+// Every session's request must carry the MCP bridge entry for THAT session's
+// tools file, so kiro-cli spawns a bridge serving the right tools even when
+// the agent config on disk is stale (review C1: a client-level "last config
+// written" must never leak one session's servers into another's load).
+// ---------------------------------------------------------------------------
+
+describe("per-session MCP servers", () => {
+  const clients: ACPClient[] = []
+  let spies: ReturnType<typeof installChildProcessSpies> | undefined
+
+  beforeEach(() => {
+    spies = installChildProcessSpies()
+  })
+
+  afterEach(() => {
+    spies?.restore()
+    spies = undefined
+    for (const client of clients.splice(0)) void client.stop()
+  })
+
+  async function startClient(cwd: string): Promise<ACPClient> {
+    const client = new ACPClient({ cwd, agent: "opencode" })
+    clients.push(client)
+    ;(client as unknown as { resolvedBridgePath: string }).resolvedBridgePath = join(cwd, "mcp-bridge.mjs")
+    await client.start()
+    return client
+  }
+
+  function writeToolsFile(cwd: string, name: string): string {
+    const path = join(cwd, name)
+    writeFileSync(path, JSON.stringify({ tools: [{ name: "read", description: "", inputSchema: {} }] }))
+    return path
+  }
+
+  function lastParams(method: string): Record<string, unknown> {
+    const proc = spies!.processes[0]!
+    const found = proc.requests.filter((r) => r.method === method)
+    return found[found.length - 1]?.params ?? {}
+  }
+
+  test("createSessionWithToolsPath sends that session's own tools file in mcpServers", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-sess-mcp-"))
+    const client = await startClient(cwd)
+    const toolsPath = writeToolsFile(cwd, "tools-deadbeef-aaaa1111.json")
+
+    await client.createSessionWithToolsPath(toolsPath)
+
+    const servers = lastParams("session/new").mcpServers as Array<Record<string, unknown>>
+    expect(servers).toHaveLength(1)
+    expect(servers[0].command).toBe("node")
+    expect(servers[0].args).toContain(toolsPath)
+    expect(servers[0].name).toBe(`${client.getAgentName()}-tools-aaaa1111`)
+  })
+
+  test("loadSession restates the session's own servers, not the most recent tools file's (C1)", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-sess-mcp-"))
+    const client = await startClient(cwd)
+    const toolsA = writeToolsFile(cwd, "tools-deadbeef-aaaa1111.json")
+    const toolsB = writeToolsFile(cwd, "tools-deadbeef-bbbb2222.json")
+
+    const sessionA = await client.createSessionWithToolsPath(toolsA)
+    await client.createSessionWithToolsPath(toolsB)
+
+    await client.loadSession(sessionA.sessionId)
+
+    const servers = lastParams("session/load").mcpServers as Array<Record<string, unknown>>
+    expect(servers).toHaveLength(1)
+    expect(servers[0].args).toContain(toolsA)
+    expect(servers[0].args).not.toContain(toolsB)
+  })
+
+  test("loadSession with an explicit tools file re-binds the session's servers", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-sess-mcp-"))
+    const client = await startClient(cwd)
+    const toolsA = writeToolsFile(cwd, "tools-deadbeef-aaaa1111.json")
+    const toolsC = writeToolsFile(cwd, "tools-deadbeef-cccc3333.json")
+
+    const session = await client.createSessionWithToolsPath(toolsA)
+    await client.loadSession(session.sessionId, toolsC)
+
+    const first = lastParams("session/load").mcpServers as Array<Record<string, unknown>>
+    expect(first[0].args).toContain(toolsC)
+
+    // The re-bind sticks: a later plain load restates the new binding.
+    await client.loadSession(session.sessionId)
+    const second = lastParams("session/load").mcpServers as Array<Record<string, unknown>>
+    expect(second[0].args).toContain(toolsC)
+  })
+
+  test("without an agent, createSessionWithToolsPath sends an empty list instead of crashing", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-sess-mcp-"))
+    const client = new ACPClient({ cwd })
+    clients.push(client)
+    ;(client as unknown as { resolvedBridgePath: string }).resolvedBridgePath = join(cwd, "mcp-bridge.mjs")
+    await client.start()
+    const toolsPath = writeToolsFile(cwd, "tools-deadbeef-aaaa1111.json")
+
+    const session = await client.createSessionWithToolsPath(toolsPath)
+
+    expect(session.sessionId).toBeTruthy()
+    expect(lastParams("session/new").mcpServers).toEqual([])
+  })
+
+  test("without an agent, loadSession with a tools file sends an empty list", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-sess-mcp-"))
+    const client = new ACPClient({ cwd })
+    clients.push(client)
+    ;(client as unknown as { resolvedBridgePath: string }).resolvedBridgePath = join(cwd, "mcp-bridge.mjs")
+    await client.start()
+    const toolsPath = writeToolsFile(cwd, "tools-deadbeef-aaaa1111.json")
+
+    await client.loadSession("sess-any", toolsPath)
+
+    expect(lastParams("session/load").mcpServers).toEqual([])
+  })
+
+  test("the agent config carries no MCP server; registration travels on the request", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-sess-mcp-"))
+    const client = await startClient(cwd)
+    const toolsA = writeToolsFile(cwd, "tools-deadbeef-aaaa1111.json")
+    const toolsB = writeToolsFile(cwd, "tools-deadbeef-bbbb2222.json")
+
+    await client.createSessionWithToolsPath(toolsA)
+    await client.createSessionWithToolsPath(toolsB)
+
+    const agentsDir = join(cwd, ".kiro", "agents")
+    const files = readdirSync(agentsDir).filter((f) => f.endsWith(".json"))
+    expect(files.length).toBeGreaterThan(0)
+    const config = JSON.parse(readFileSync(join(agentsDir, files[0]), "utf-8")) as Record<string, unknown>
+    expect(config.mcpServers).toEqual({})
+    expect(config.tools).toEqual([])
+    expect(config.allowedTools).toEqual([])
+  })
+
+  test("a load answered with a different sessionId records the binding under the returned id", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-sess-mcp-"))
+    const client = await startClient(cwd)
+    const toolsA = writeToolsFile(cwd, "tools-deadbeef-aaaa1111.json")
+
+    await client.loadSession("sess-rename", toolsA)
+    await client.loadSession("sess-renamed")
+
+    const servers = lastParams("session/load").mcpServers as Array<Record<string, unknown>>
+    expect(servers).toHaveLength(1)
+    expect(servers[0].args).toContain(toolsA)
+  })
+
+  // Pins today's behavior (a session never seen in this process has no
+  // binding to restate), not a desired contract change.
+  test("loadSession without a binding or tools file sends an empty list", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "acp-sess-mcp-"))
+    const client = await startClient(cwd)
+
+    await client.loadSession("sess-from-a-previous-process")
+
+    expect(lastParams("session/load").mcpServers).toEqual([])
   })
 })

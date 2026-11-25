@@ -4496,7 +4496,7 @@ describe("KiroACPLanguageModel", () => {
           modes: { currentModeId: "agent", availableModes: [] },
           models: { currentModelId: "claude-sonnet-4.6", availableModels: [] },
         }
-        const { client, model, options } = fixture(
+        const { client, model, options, toolsFilePath } = fixture(
           { loadSession: mock(async () => loadedSession) },
           source === "configured" ? { sessionId: loadedSession.sessionId } : {},
         )
@@ -4507,7 +4507,7 @@ describe("KiroACPLanguageModel", () => {
         const parts = await collectStream((await model.doStream(options)).stream)
 
         expect(client.loadSession).toHaveBeenCalledTimes(1)
-        expect(client.loadSession).toHaveBeenCalledWith(loadedSession.sessionId)
+        expect(client.loadSession).toHaveBeenCalledWith(loadedSession.sessionId, toolsFilePath)
         expect(client.createSession).not.toHaveBeenCalled()
         expect(client.createSessionWithToolsPath).not.toHaveBeenCalled()
         expect(client.waitForSessionTools).not.toHaveBeenCalled()
@@ -4529,7 +4529,7 @@ describe("KiroACPLanguageModel", () => {
         const parts = await collectStream((await model.doStream(options)).stream)
 
         expect(client.loadSession).toHaveBeenCalledTimes(1)
-        expect(client.loadSession).toHaveBeenCalledWith(oldSessionId)
+        expect(client.loadSession).toHaveBeenCalledWith(oldSessionId, toolsFilePath)
         expect(client.createSessionWithToolsPath).toHaveBeenCalledTimes(1)
         expect(client.createSessionWithToolsPath).toHaveBeenCalledWith(toolsFilePath)
         expect(client.waitForSessionTools).toHaveBeenCalledTimes(1)

@@ -9,7 +9,7 @@ import { dirname, join, isAbsolute } from "node:path"
 import { existsSync, mkdirSync, chmodSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { getXdgDataHome } from "./session-storage"
-import { generateAgentConfig, generateToollessAgentConfig, getMcpServerName, writeAgentConfig, removeAgentConfig } from "./agent-config"
+import { generateToollessAgentConfig, getMcpServerName, mcpServerEntry, writeAgentConfig, removeAgentConfig } from "./agent-config"
 import { createIPCServer, type IPCServer } from "./ipc-server"
 import type { LaneRouter } from "./lane-router"
 import type { KiroEffort } from "./kiro-effort"
@@ -375,6 +375,14 @@ function ensureMcpTimeoutSetting(value: string): Promise<void> {
   return attempt
 }
 
+/** One stdio MCP server entry in a `session/new` / `session/load` request. */
+export interface AcpStdioMcpServer {
+  name: string
+  command: string
+  args: string[]
+  env: Array<{ name: string; value: string }>
+}
+
 export class ACPClient {
   private readonly options: ACPClientOptions
   private process: ChildProcess | null = null
@@ -420,6 +428,32 @@ export class ACPClient {
    * after deletion, so a second stop() has nothing left to remove.
    */
   private agentConfigPath: string | null = null
+
+  /**
+   * The ACP-shaped MCP server entries of each session, keyed by its canonical
+   * session id. A session is self-describing: `session/new` and `session/load`
+   * carry the bridge for THAT session's own tools file, never another
+   * session's. Recorded on creation and on every successful load, so a later
+   * plain load restates the same binding.
+   */
+  private sessionMcpEntries = new Map<string, AcpStdioMcpServer[]>()
+
+  /**
+   * ACP request-shaped stdio entry for the bridge serving `toolsFilePath`.
+   * Without an agent there is no generated agent config and no MCP bridge
+   * (see the toolless start path), so requests keep sending `[]`. Otherwise
+   * the entry is derived from mcpServerEntry()/getMcpServerName(), so it
+   * agrees with what generateAgentConfig() would name and pass to the bridge.
+   */
+  private mcpEntriesForToolsFile(toolsFilePath: string): AcpStdioMcpServer[] {
+    if (!this.options.agent) return []
+    const entry = mcpServerEntry({
+      mcpBridgePath: this.resolveBridgePath(),
+      toolsFilePath,
+      cwd: this.options.cwd,
+    })
+    return [{ name: getMcpServerName(this.uniqueAgentName, toolsFilePath), command: entry.command, args: entry.args, env: [] }]
+  }
 
   /**
    * Mutex for serializing agent config rewrites + session creation.
@@ -641,6 +675,7 @@ export class ACPClient {
     this.toolsReadyListeners.clear()
     this.availableTools = []
     this.sessionTools.clear()
+    this.sessionMcpEntries.clear()
     this.startedToolless = false
 
     const ipcServer = this.ipcServer
@@ -687,36 +722,46 @@ export class ACPClient {
   // -------------------------------------------------------------------------
 
   async createSession(): Promise<ACPSession> {
-    // No agent config rewrite — tools files are kept alive (not deleted
-    // on cleanup), so any existing config still references a valid bridge.
-    // Writing a toolless config here would race with createSessionWithToolsPath
-    // and clobber the MCP bridge definition for concurrent sessions.
+    // No tools, no MCP bridge: the request carries an empty mcpServers list,
+    // and the agent config carries none either (it is written once at start).
     return this.sendNewSession()
   }
 
-  private async sendNewSession(): Promise<ACPSession> {
+  private async sendNewSession(mcpServers: AcpStdioMcpServer[] = []): Promise<ACPSession> {
     const result = await this.sendRequest("session/new", {
       cwd: this.options.cwd,
-      mcpServers: [],
+      mcpServers,
     })
     const session = result as ACPSession
     if (!session || typeof session !== "object" || typeof session.sessionId !== "string") {
       throw new KiroACPError("Invalid response from session/new: missing sessionId", -1)
     }
+    this.sessionMcpEntries.set(session.sessionId, mcpServers)
     return session
   }
 
-  async loadSession(sessionId: string): Promise<ACPSession> {
+  /**
+   * Load an existing session. `toolsFilePath` is the tools file this session
+   * is being (re)bound to in this process; its bridge entry is sent so
+   * kiro-cli spawns a bridge serving the session's current tools even when
+   * the agent config on disk points elsewhere. Without one, the session's
+   * recorded binding is restated; sessions never seen before send `[]`.
+   */
+  async loadSession(sessionId: string, toolsFilePath?: string): Promise<ACPSession> {
+    const mcpServers: AcpStdioMcpServer[] = toolsFilePath
+      ? this.mcpEntriesForToolsFile(toolsFilePath)
+      : (this.sessionMcpEntries.get(sessionId) ?? [])
     const result = await this.sendRequest("session/load", {
       sessionId,
       cwd: this.options.cwd,
-      mcpServers: [],
+      mcpServers,
     })
     const session = result as ACPSession
     if (!session || typeof session !== "object") {
       throw new KiroACPError("Invalid response from session/load: expected object", -1)
     }
     if (!session.sessionId) session.sessionId = sessionId
+    this.sessionMcpEntries.set(session.sessionId, mcpServers)
     return session
   }
 
@@ -960,9 +1005,12 @@ export class ACPClient {
   }
 
   /**
-   * Atomically rewrite the agent config to point to a different tools file,
-   * then create a new session. Protected by a mutex to prevent concurrent
-   * model instances from interfering.
+   * Create a new session that carries its own MCP bridge entry for
+   * `toolsFilePath`. The agent config is written once at start() and carries
+   * no MCP server, so nothing is rewritten here: each session's registration
+   * travels on its own request and cannot disturb the other sessions. The
+   * mutex keeps session creation serialized across model instances sharing
+   * this client.
    */
   async createSessionWithToolsPath(toolsFilePath: string): Promise<ACPSession> {
     const previousLock = this.sessionCreationLock
@@ -973,20 +1021,7 @@ export class ACPClient {
 
     try {
       await previousLock
-
-      if (this.options.agent) {
-        const bridgePath = this.resolveBridgePath()
-        const config = generateAgentConfig({
-          name: this.uniqueAgentName,
-          mcpBridgePath: bridgePath,
-          toolsFilePath,
-          cwd: this.options.cwd,
-          prompt: this.options.agentPrompt,
-        })
-        this.agentConfigPath = writeAgentConfig(this.options.cwd, this.options.agent, config, this.instanceId)
-      }
-
-      return await this.sendNewSession()
+      return await this.sendNewSession(this.mcpEntriesForToolsFile(toolsFilePath))
     } finally {
       releaseLock!()
     }
@@ -1138,16 +1173,15 @@ export class ACPClient {
   /**
    * Generate and write the agent config file.
    *
-   * When a populated tools file path is provided, the config points directly
-   * to it. Otherwise creates a placeholder (safe because createSessionWithToolsPath
-   * rewrites the config before any session is created).
+   * The config carries NO MCP server: every session's server travels on its
+   * own `session/new` / `session/load` request, so concurrent sessions never
+   * share, hot-load or clobber each other's bridges. When a populated tools
+   * file path is provided, the IPC coordinates are injected into that file so
+   * the bridge can call back into this process.
    */
   private setupAgentConfig(populatedToolsFilePath?: string): void {
-    const bridgePath = this.resolveBridgePath()
-
-    let toolsFile: string
     if (populatedToolsFilePath) {
-      toolsFile = populatedToolsFilePath
+      const toolsFile = populatedToolsFilePath
       // Inject ipcPort and ipcSecret if the model wrote tools before start() was called
       if (this.ipcPort != null) {
         try {
@@ -1165,25 +1199,12 @@ export class ACPClient {
           // Will be handled by writeToolsFile later
         }
       }
-    } else {
-      // No tools provided (e.g., title generation call) — write a toolless config
-      // so kiro-cli doesn't spawn a dead MCP bridge that blocks later tool loading.
-      const config = generateToollessAgentConfig({
-        name: this.uniqueAgentName,
-        prompt: this.options.agentPrompt,
-      })
-      this.agentConfigPath = writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
-      return // Early return — no MCP bridge needed for toolless startup
     }
 
-    const config = generateAgentConfig({
+    const config = generateToollessAgentConfig({
       name: this.uniqueAgentName,
-      mcpBridgePath: bridgePath,
-      toolsFilePath: toolsFile,
-      cwd: this.options.cwd,
       prompt: this.options.agentPrompt,
     })
-
     this.agentConfigPath = writeAgentConfig(this.options.cwd, this.options.agent!, config, this.instanceId)
   }
 
