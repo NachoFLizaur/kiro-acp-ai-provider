@@ -4,6 +4,7 @@ import type {
   LanguageModelV3Content,
   LanguageModelV3FinishReason,
   LanguageModelV3FunctionTool,
+  LanguageModelV3Message,
   LanguageModelV3GenerateResult,
   LanguageModelV3ProviderTool,
   LanguageModelV3StreamPart,
@@ -531,32 +532,44 @@ function extractPrompt(prompt: LanguageModelV3Prompt): {
 function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
   const systemParts: string[] = []
   const historyParts: string[] = []
-  let lastUserMessage = ""
+  let lastUserIndex = -1
+  for (let i = 0; i < prompt.length; i++) {
+    if (prompt[i].role === "user") lastUserIndex = i
+  }
 
-  for (const message of prompt) {
+  const renderUser = (message: Extract<LanguageModelV3Message, { role: "user" }>): string => {
+    const parts: string[] = []
+    for (const part of message.content) {
+      if (part.type === "text") {
+        parts.push(part.text)
+        continue
+      }
+      if (part.type === "file" && isImageMediaType(part.mediaType)) {
+        parts.push(`[Image: ${normalizeMediaType(part.mediaType)}]`)
+      } else if (part.type === "file") {
+        parts.push(`[File: ${part.mediaType}]`)
+      }
+    }
+    return parts.join("\n")
+  }
+
+  for (let i = 0; i < prompt.length; i++) {
+    const message = prompt[i]
+
     if (message.role === "system") {
       systemParts.push(message.content)
       continue
     }
 
+    // User messages are history like any other and stay where they stand:
+    // deferring each one to the next flushed the task below the replies it
+    // produced. Only the LAST user message is the query, appended at the end.
     if (message.role === "user") {
-      // Flush previous user message to history (if any)
-      if (lastUserMessage) {
-        historyParts.push(`User: ${lastUserMessage}`)
+      const text = renderUser(message)
+      if (i === lastUserIndex) {
+        continue
       }
-      const parts: string[] = []
-      for (const part of message.content) {
-        if (part.type === "text") {
-          parts.push(part.text)
-          continue
-        }
-        if (part.type === "file" && isImageMediaType(part.mediaType)) {
-          parts.push(`[Image: ${normalizeMediaType(part.mediaType)}]`)
-        } else if (part.type === "file") {
-          parts.push(`[File: ${part.mediaType}]`)
-        }
-      }
-      lastUserMessage = parts.join("\n")
+      if (text) historyParts.push(`User: ${text}`)
       continue
     }
 
@@ -575,9 +588,51 @@ function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
       continue
     }
 
-    // Skip tool-result messages entirely — they reference tool names
-    // and outputs that could mislead the model about available tools.
+    // Tool results carry the evidence the model already gathered; a session
+    // that starts empty must not lose them. Tool names stay out of the replay
+    // (anti-priming, as above), and failures and refusals keep their own
+    // labels so a new session does not retry what already failed or was
+    // denied. Media in tool output degrades to a placeholder.
     if (message.role === "tool") {
+      for (const part of message.content) {
+        if (part.type !== "tool-result") continue
+        const output = part.output
+        let label = "Tool output"
+        let text = ""
+        switch (output.type) {
+          case "text":
+            text = output.value
+            break
+          case "json":
+            text = JSON.stringify(output.value)
+            break
+          case "content": {
+            const chunks: string[] = []
+            for (const block of output.value) {
+              if (block.type === "text") {
+                chunks.push(block.text)
+              } else if (block.type === "image-data") {
+                chunks.push(`[Image: ${block.mediaType}]`)
+              }
+            }
+            text = chunks.join("\n")
+            break
+          }
+          case "error-text":
+            label = "Tool error"
+            text = output.value
+            break
+          case "error-json":
+            label = "Tool error"
+            text = JSON.stringify(output.value)
+            break
+          case "execution-denied":
+            label = "Tool call denied by the user"
+            text = output.reason ?? ""
+            break
+        }
+        historyParts.push(text ? `${label}:\n${text}` : `${label}: (no output)`)
+      }
       continue
     }
   }
@@ -593,9 +648,15 @@ function formatConversationReplay(prompt: LanguageModelV3Prompt): string {
     sections.push(`<context>\n${historyParts.join("\n\n")}\n</context>`)
   }
 
+  const lastUserMessage =
+    lastUserIndex >= 0 && prompt[lastUserIndex].role === "user"
+      ? renderUser(prompt[lastUserIndex] as Extract<LanguageModelV3Message, { role: "user" }>)
+      : ""
+
   sections.push(`Resume and act on the following message.\n\n${lastUserMessage}`)
 
   return sections.join("\n\n")
+
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +793,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
   private async acquireSession(
     tools?: Array<LanguageModelV3FunctionTool | LanguageModelV3ProviderTool>,
     affinityId?: string,
-  ): Promise<ACPSession> {
+  ): Promise<{ session: ACPSession; created: boolean }> {
     // Write tools BEFORE creating the session so the MCP bridge
     // has them from the very first `tools/list` query.
     let toolsFilePath: string | undefined
@@ -770,7 +831,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
             this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
           }
           persistSession(this.client.getCwd(), sessionId, affinityId)
-          return loaded
+          return { session: loaded, created: false }
         } catch (err) {
           // Fall through to persisted session or create new
         }
@@ -788,7 +849,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
               this.sessionToolsFiles.set(sessionId, { filePath: toolsFilePath, toolNames })
             }
             persistSession(this.client.getCwd(), sessionId, affinityId)
-            return session
+            return { session, created: false }
           }
         } catch (err: unknown) {
           // Fall through to create new session
@@ -817,7 +878,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
       persistSession(this.client.getCwd(), session.sessionId, affinityId)
     }
 
-    return session
+    return { session, created: true }
   }
 
   /**
@@ -925,7 +986,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     // Rehydration is not tied to a request; use the affinity last seen by this model,
     // captured once so a concurrent doStream() cannot change it mid-flight.
     const affinityId = this.currentAffinityId
-    const session = await this.acquireSession(undefined, affinityId)
+    const { session } = await this.acquireSession(undefined, affinityId)
 
     try {
       await this.client.prompt({
@@ -1958,7 +2019,7 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     options: LanguageModelV3CallOptions,
     reset = false,
   ): Promise<LanguageModelV3StreamResult> {
-    const session = await this.acquireSession(options.tools, affinityFromOptions(options))
+    const { session, created } = await this.acquireSession(options.tools, affinityFromOptions(options))
     await this.ensureModel(session)
     await this.ensureEffort(session, this.resolveRequestedEffort(options))
 
@@ -1966,13 +2027,23 @@ export class KiroACPLanguageModel implements LanguageModelV3 {
     let deliversInstructions = false
     let promptBlocks: ContentBlock[]
 
-    const hasHistory = reset && options.prompt.some(
-      (m) => m.role === "assistant" || m.role === "tool",
-    )
+    // A freshly created kiro session has no history of its own, and a reset
+    // one is about to lose it: both must carry the full conversation. A
+    // loaded session keeps its history in kiro-cli, so only the incremental
+    // parts go over the wire there. Anything preceding the last user message
+    // counts as history — including an earlier user message with no assistant
+    // reply yet, which extractPrompt used to drop entirely (issue #7).
+    const lastUserIndex = options.prompt.reduce((last, m, i) => (m.role === "user" ? i : last), -1)
+    const hasPriorContent = options.prompt.some((m, i) => m.role !== "system" && i < lastUserIndex)
+    const hasHistory = (reset || created) && hasPriorContent
 
     if (hasHistory) {
       const compositeText = formatConversationReplay(options.prompt)
-      promptBlocks = [{ type: "text", text: compositeText }]
+      // The replay renders images as placeholders; carry the current
+      // message's image blocks alongside so the model still sees what the
+      // user just attached.
+      const imageBlocks = userParts.filter((p) => p.type === "image")
+      promptBlocks = [{ type: "text", text: compositeText }, ...imageBlocks]
       deliversInstructions = !!systemPrompt
     } else {
       deliversInstructions = !!systemPrompt && this.client.needsInstructions(

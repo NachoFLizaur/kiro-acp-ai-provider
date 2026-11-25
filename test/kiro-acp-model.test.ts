@@ -904,7 +904,10 @@ describe("KiroACPLanguageModel", () => {
       return { promise, resolve, reject }
     }
 
-    function deliveryFixture(onPrompt?: (opts: PromptOptions, index: number) => Promise<{ stopReason: string }>) {
+    function deliveryFixture(
+      onPrompt?: (opts: PromptOptions, index: number) => Promise<{ stopReason: string }>,
+      sessionId?: string,
+    ) {
       const ledger = new InstructionDeliveryLedger()
       const calls: PromptOptions[] = []
       const cwd = createTempToolsDir()
@@ -928,7 +931,7 @@ describe("KiroACPLanguageModel", () => {
           return onPrompt?.(opts, calls.length - 1) ?? Promise.resolve({ stopReason: "end_turn" })
         }),
       }, ledger)
-      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, stall: { afterMs: 0 } })
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, ...(sessionId ? { sessionId } : {}), stall: { afterMs: 0 } })
       return { ledger, calls, session, client, model }
     }
 
@@ -1219,7 +1222,7 @@ describe("KiroACPLanguageModel", () => {
       await finish(model, replay)
       expect(calls[0].prompt).toEqual([{
         type: "text",
-        text: "<system_instructions>\nA\n\nB\n</system_instructions>\n\n<context>\nAssistant: first answer\n\nUser: first question\n</context>\n\nResume and act on the following message.\n\nhello",
+        text: "<system_instructions>\nA\n\nB\n</system_instructions>\n\n<context>\nUser: first question\n\nAssistant: first answer\n</context>\n\nResume and act on the following message.\n\nhello",
       }])
       await finish(model, deliveryOptions("A\n\nB"))
       expect(calls.map(carriesInstructions)).toEqual([true, false])
@@ -1227,10 +1230,11 @@ describe("KiroACPLanguageModel", () => {
       expect(client.acknowledgeInstructionDelivery).toHaveBeenCalledTimes(1)
     })
 
-    test("AC5: tool results without a pending turn fall through the ledger-aware fresh path", async () => {
-      const { calls, model } = deliveryFixture()
-      await finish(model, toolResultOptions(false))
-      await finish(model, toolResultOptions(false))
+    test("AC5: tool results without a pending turn on a loaded session fall through the ledger-aware fresh path", async () => {
+      const { calls, model } = deliveryFixture(undefined, "sess-loaded")
+      const opts = { ...toolResultOptions(false), headers: { "x-session-affinity": "aff-loaded" } }
+      await finish(model, opts)
+      await finish(model, opts)
       expect(calls.map(carriesInstructions)).toEqual([true, false])
       expect(calls[1].prompt).toEqual([{ type: "text", text: "hello" }])
     })
@@ -2290,10 +2294,11 @@ describe("KiroACPLanguageModel", () => {
   })
 
   describe("prompt extraction", () => {
-    test("sends only the last user message, skipping history and assistant messages", async () => {
+    test("a loaded session sends only the last user message, skipping history and assistant messages", async () => {
       let capturedPrompt: unknown[] = []
 
       const client = createMockClient({
+        getCwd: mock(() => createTempToolsDir()),
         prompt: mock(async (opts: PromptOptions) => {
           capturedPrompt = opts.prompt
           opts.onUpdate({
@@ -2304,7 +2309,7 @@ describe("KiroACPLanguageModel", () => {
         }),
       } as unknown as Partial<ACPClient>)
 
-      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, sessionId: "sess-loaded" })
 
       await model.doStream(
         makeCallOptions([
@@ -2314,7 +2319,7 @@ describe("KiroACPLanguageModel", () => {
             content: [{ type: "text", text: "first answer" }],
           },
           { role: "user", content: [{ type: "text", text: "follow up" }] },
-        ]),
+        ], { headers: { "x-session-affinity": "aff-loaded" } }),
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
@@ -2353,10 +2358,11 @@ describe("KiroACPLanguageModel", () => {
       expect(textContent).toContain("<system_instructions>")
     })
 
-    test("skips tool messages — kiro-cli manages tool results in its session", async () => {
+    test("a loaded session skips tool messages — kiro-cli manages tool results in its session", async () => {
       let capturedPrompt: unknown[] = []
 
       const client = createMockClient({
+        getCwd: mock(() => createTempToolsDir()),
         prompt: mock(async (opts: PromptOptions) => {
           capturedPrompt = opts.prompt
           opts.onUpdate({
@@ -2367,7 +2373,7 @@ describe("KiroACPLanguageModel", () => {
         }),
       } as unknown as Partial<ACPClient>)
 
-      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+      const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client, sessionId: "sess-loaded" })
 
       await model.doStream(
         makeCallOptions([
@@ -2395,7 +2401,7 @@ describe("KiroACPLanguageModel", () => {
             ],
           },
           { role: "user", content: [{ type: "text", text: "what was the output?" }] },
-        ]),
+        ], { headers: { "x-session-affinity": "aff-loaded" } }),
       )
 
       const textContent = (capturedPrompt[0] as { text: string }).text
@@ -5789,5 +5795,127 @@ describe("doStream() - turnWallMs", () => {
     const kiro = kiroOf(partsOfType(parts, "finish")[0])!
     expect(kiro.turnDurationMs).toBeNull()
     expect(typeof kiro.turnWallMs).toBe("number")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Conversation replay on freshly created sessions
+// ---------------------------------------------------------------------------
+
+describe("conversation replay on fresh sessions", () => {
+  /** Run a doStream whose session is created by this call; return the prompt blocks sent to kiro. */
+  async function replayOf(prompt: LanguageModelV3Prompt): Promise<unknown> {
+    let capturedPrompt: unknown
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        capturedPrompt = opts.prompt
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+    const model = new KiroACPLanguageModel("claude-sonnet-4.6", { client })
+    const result = await model.doStream(makeCallOptions(prompt))
+    await collectStream(result.stream)
+    return capturedPrompt
+  }
+
+  function sentText(captured: unknown): string {
+    return JSON.stringify(captured ?? [])
+  }
+
+  test("replays the task, earlier turns and tool outputs into a fresh session", async () => {
+    const sent = sentText(await replayOf([
+      { role: "system", content: "You are a test agent." },
+      { role: "user", content: [{ type: "text", text: "TASK_MARKER do the thing" }] },
+      { role: "assistant", content: [{ type: "text", text: "ASSISTANT_MARKER earlier reply" }] },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "tc-1",
+            toolName: "read",
+            output: { type: "text", value: "TOOL_MARKER result" },
+          },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "FOLLOWUP_MARKER continue" }] },
+    ]))
+    expect(sent).toContain("TASK_MARKER")
+    expect(sent).toContain("ASSISTANT_MARKER")
+    expect(sent).toContain("TOOL_MARKER")
+    expect(sent).toContain("FOLLOWUP_MARKER")
+  })
+
+  test("replays the task when the history has no assistant turn (issue #7 shape)", async () => {
+    const sent = sentText(await replayOf([
+      { role: "system", content: "You are a test agent." },
+      { role: "user", content: [{ type: "text", text: "TASK_MARKER original task" }] },
+      { role: "user", content: [{ type: "text", text: "CONT_MARKER keep going" }] },
+    ]))
+    expect(sent).toContain("TASK_MARKER")
+    expect(sent).toContain("CONT_MARKER")
+  })
+
+  test("keeps message order: each message before the replies it produced", async () => {
+    const sent = sentText(await replayOf([
+      { role: "system", content: "You are a test agent." },
+      { role: "user", content: [{ type: "text", text: "U1_MARKER" }] },
+      { role: "assistant", content: [{ type: "text", text: "A1_MARKER" }] },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "tc-1",
+            toolName: "read",
+            output: { type: "text", value: "T1_MARKER" },
+          },
+        ],
+      },
+      { role: "assistant", content: [{ type: "text", text: "A2_MARKER" }] },
+      { role: "user", content: [{ type: "text", text: "U2_MARKER" }] },
+    ]))
+    const order = ["U1_MARKER", "A1_MARKER", "T1_MARKER", "A2_MARKER", "U2_MARKER"].map((m) => sent.indexOf(m))
+    expect(order.every((i) => i >= 0)).toBe(true)
+    expect([...order].sort((a, b) => a - b)).toEqual(order)
+  })
+
+  test("renders tool errors and user denials instead of dropping them", async () => {
+    const sent = sentText(await replayOf([
+      { role: "system", content: "You are a test agent." },
+      { role: "user", content: [{ type: "text", text: "T" }] },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "tc-1", toolName: "bash", output: { type: "error-text", value: "ERRTEXT_MARKER failed" } },
+          { type: "tool-result", toolCallId: "tc-2", toolName: "bash", output: { type: "error-json", value: { code: "ERRJSON_MARKER" } } },
+          { type: "tool-result", toolCallId: "tc-3", toolName: "write", output: { type: "execution-denied", reason: "DENIED_MARKER user said no" } },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "next" }] },
+    ]))
+    expect(sent).toContain("Tool error")
+    expect(sent).toContain("ERRTEXT_MARKER")
+    expect(sent).toContain("ERRJSON_MARKER")
+    expect(sent).toContain("Tool call denied")
+    expect(sent).toContain("DENIED_MARKER")
+  })
+
+  test("keeps the current message's images in the replay", async () => {
+    const captured = await replayOf([
+      { role: "system", content: "You are a test agent." },
+      { role: "user", content: [{ type: "text", text: "U1" }] },
+      { role: "assistant", content: [{ type: "text", text: "A1" }] },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "CUR_MARKER look at this" },
+          { type: "file", data: "aW1n", mediaType: "image/png" },
+        ],
+      },
+    ])
+    const blocks = (captured ?? []) as Array<{ type: string }>
+    expect(sentText(captured)).toContain("CUR_MARKER")
+    expect(blocks.some((b) => b.type === "image")).toBe(true)
   })
 })
