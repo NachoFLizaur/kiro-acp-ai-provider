@@ -50,7 +50,20 @@ interface StallHintDetail {
 
 /** Absolute path of the kiro-cli chat log for the current user. */
 export function kiroChatLogPath(): string {
-  return join(tmpdir(), "kiro-log", "kiro-chat.log")
+  // kiro-cli writes to $XDG_RUNTIME_DIR/kiro-log on Linux (where the variable
+  // is set); tmpdir() is the fallback for platforms without XDG.
+  return join(process.env.XDG_RUNTIME_DIR || tmpdir(), "kiro-log", "kiro-chat.log")
+}
+
+const OVERLOAD_REASON_PATTERN = /Overload|Throttl|ServiceUnavailable|TooManyRequests|RateLimit/i
+
+/**
+ * Whether a derived reason names an overload-class failure. Only these justify
+ * the "may be overloaded and kiro-cli is retrying" claim; other reasons are
+ * quoted as-is without it (opencode-kiro#9).
+ */
+export function isOverloadReason(reason: string): boolean {
+  return OVERLOAD_REASON_PATTERN.test(reason)
 }
 
 /**

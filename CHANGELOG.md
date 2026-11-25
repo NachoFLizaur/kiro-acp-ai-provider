@@ -8,6 +8,13 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 This file was introduced after 3.1.0 was published; the 3.1.0 entry below is
 retroactive and earlier releases are recorded by their git tags only.
 
+## [Unreleased]
+
+### Changed
+
+- **Stall notice wording is evidence-based and quiet** (opencode-kiro#9). The notice now reads "still waiting for output" unless kiro-cli's log produced a reason during the current silence window; the "may be overloaded and kiro-cli is retrying" claim is only made for overload-class reasons (e.g. `ModelOverloaded`), and other reasons are quoted plainly. Bare ticks no longer append a line each `afterMs` — a line is added only when a reason arrives. A reason from an earlier window no longer narrates a later one.
+- `kiroChatLogPath()` resolves through `$XDG_RUNTIME_DIR` before the OS temp directory, matching where kiro-cli writes its chat log on Linux; without the hint reader this far, the "reason" half of the stall status was silently dead there.
+
 ## [3.3.2] - 2026-10-16
 
 ### Fixed

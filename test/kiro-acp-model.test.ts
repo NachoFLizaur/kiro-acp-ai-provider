@@ -13,10 +13,11 @@ import type {
   LanguageModelV3Prompt,
   LanguageModelV3FunctionTool,
 } from "@ai-sdk/provider"
-import { readFileSync, mkdirSync, mkdtempSync, existsSync, rmSync } from "node:fs"
+import { readFileSync, mkdirSync, mkdtempSync, existsSync, writeFileSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import * as childProcess from "node:child_process"
+import { kiroChatLogPath } from "../src/kiro-log-hint"
 
 // `buildStreamError` corroborates -32603 via `verifyAuth()`, which spawns
 // `kiro-cli`. Mock execFileSync so the auth probe is deterministic (no real
@@ -4835,8 +4836,7 @@ const STALL_AFTER_MS = 100
 /** Silence long enough for the watchdog to fire at least once, with margin. */
 const STALL_GAP_MS = 260
 
-const FIRST_NOTICE = "Kiro: no output for 0.1s - the model may be overloaded and kiro-cli is retrying."
-const SECOND_NOTICE = "\nKiro: no output for 0.2s - the model may be overloaded and kiro-cli is retrying."
+const FIRST_NOTICE = "Kiro: no output for 0.1s - still waiting for output."
 
 const USER_TURN: LanguageModelV3Prompt = [{ role: "user", content: [{ type: "text", text: "hello" }] }]
 
@@ -5023,7 +5023,7 @@ describe("doStream() - stall watchdog", () => {
     expect(types).toContain("finish")
   })
 
-  test("repeats the notice while the silence continues", async () => {
+  test("does not repeat the notice while the silence continues", async () => {
     // Arrange: silence for four thresholds before the first chunk
     const client = createMockClient({
       prompt: mock(async (opts: PromptOptions) => {
@@ -5036,13 +5036,12 @@ describe("doStream() - stall watchdog", () => {
     // Act
     const parts = await streamWithStall(client, { afterMs: STALL_AFTER_MS })
 
-    // Assert: one fragment, several notices, then the resume line
+    // Assert: one fragment, a single notice line, then the resume line
     expect(partsOfType(parts, "reasoning-start")).toHaveLength(1)
     const deltas = partsOfType(parts, "reasoning-delta").map((p) => p.delta)
     const notices = deltas.filter((d) => d.includes("Kiro: no output for"))
-    expect(notices.length).toBeGreaterThanOrEqual(2)
+    expect(notices).toHaveLength(1)
     expect(notices[0]).toBe(FIRST_NOTICE)
-    expect(notices[1]).toBe(SECOND_NOTICE)
     expect(deltas.at(-1)).toMatch(RESUMED_LINE)
   })
 
@@ -5789,5 +5788,147 @@ describe("doStream() - turnWallMs", () => {
     const kiro = kiroOf(partsOfType(parts, "finish")[0])!
     expect(kiro.turnDurationMs).toBeNull()
     expect(typeof kiro.turnWallMs).toBe("number")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Stall notice wording and quietness (opencode-kiro#9)
+// ---------------------------------------------------------------------------
+
+describe("stall notice", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  let oldTmpdir: string | undefined
+  let sandbox: string
+
+  beforeEach(() => {
+    oldTmpdir = process.env.TMPDIR
+    sandbox = mkdtempSync(join(tmpdir(), "stall-notice-test-"))
+    process.env.TMPDIR = sandbox
+  })
+
+  afterEach(() => {
+    if (oldTmpdir === undefined) delete process.env.TMPDIR
+    else process.env.TMPDIR = oldTmpdir
+    rmSync(sandbox, { recursive: true, force: true })
+  })
+
+  /**
+   * Drive a turn whose prompt stays silent for holdMs (long enough for the
+   * 50ms watchdog to tick), then ends. `onPromptStart` runs inside the prompt,
+   * i.e. after the stall clock starts, so a log line written there passes
+   * readStallHintDetail's timestamp filter.
+   */
+  async function runStalledTurn(
+    holdMs: number,
+    onPromptStart?: () => void,
+  ): Promise<LanguageModelV3StreamPart[]> {
+    const client = createMockClient({
+      prompt: mock(async (_opts: PromptOptions) => {
+        onPromptStart?.()
+        await sleep(holdMs)
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+    const model = new KiroACPLanguageModel("claude-sonnet-4.6", {
+      client,
+      stall: { afterMs: 50, live: "reasoning" },
+    })
+    const result = await model.doStream(
+      makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+    )
+    return collectStream(result.stream)
+  }
+
+  /** Reasoning deltas that belong to the stall narration. */
+  function noticeLines(parts: LanguageModelV3StreamPart[]): string[] {
+    const lines: string[] = []
+    for (const part of parts) {
+      if (part.type === "reasoning-delta" && part.delta.includes("Kiro: no output")) {
+        lines.push(part.delta)
+      }
+    }
+    return lines
+  }
+
+  test("first stall notice uses neutral wording without log evidence", async () => {
+    const parts = await runStalledTurn(130)
+    const lines = noticeLines(parts)
+    expect(lines.length).toBeGreaterThanOrEqual(1)
+    const first = lines[0] ?? ""
+    expect(first).toContain("still waiting for output")
+    expect(first).not.toMatch(/overloaded/)
+    expect(first).not.toMatch(/retrying/)
+  })
+
+  test("a stall window does not repeat the notice on every tick", async () => {
+    // ~5 ticks at 50ms: one notice line, plus at most one evidence line if a
+    // reason appears. Per-tick repetition is the noise this guards against.
+    const parts = await runStalledTurn(260)
+    const lines = noticeLines(parts)
+    expect(lines.length).toBeLessThanOrEqual(2)
+  })
+
+  test("a non-overload log reason is quoted without the overload claim", async () => {
+    const parts = await runStalledTurn(260, () => {
+      mkdirSync(join(sandbox, "kiro-log"), { recursive: true })
+      writeFileSync(
+        kiroChatLogPath(),
+        `${new Date().toISOString()} ERROR test: ServiceError { kind: IoError, message: "token refresh failed" }\n`,
+      )
+    })
+    const lines = noticeLines(parts)
+    expect(lines.some((line) => /may be overloaded/.test(line))).toBe(false)
+    expect(lines.some((line) => /retrying/.test(line))).toBe(false)
+    expect(lines.some((line) => line.includes("Io"))).toBe(true)
+  })
+
+  test("a reason from an earlier window does not leak into the next window's notice", async () => {
+    const client = createMockClient({
+      prompt: mock(async (opts: PromptOptions) => {
+        mkdirSync(join(sandbox, "kiro-log"), { recursive: true })
+        writeFileSync(
+          kiroChatLogPath(),
+          `${new Date().toISOString()} ERROR test: ServiceError { kind: ModelOverloadedError, message: "x" }\n`,
+        )
+        await sleep(140)
+        // Content closes window 1; the silence that follows is a new window.
+        opts.onUpdate({ sessionUpdate: "agent_message_chunk", content: { text: "first" } })
+        await sleep(140)
+        return { stopReason: "end_turn" }
+      }),
+    } as unknown as Partial<ACPClient>)
+    const model = new KiroACPLanguageModel("claude-sonnet-4.6", {
+      client,
+      stall: { afterMs: 50, live: "reasoning" },
+    })
+    const result = await model.doStream(
+      makeCallOptions([{ role: "user", content: [{ type: "text", text: "hello" }] }]),
+    )
+    const lines = noticeLines(await collectStream(result.stream))
+    expect(lines.length).toBeGreaterThanOrEqual(3)
+    // window 1: neutral first line, then the evidence upgrade line
+    expect(lines[1]).toContain("ModelOverloaded")
+    // window 2: the stale reason must not narrate a fresh overload claim
+    expect(lines[lines.length - 1]).toContain("still waiting for output")
+    expect(lines[lines.length - 1]).not.toContain("logged")
+  })
+
+  test("the overload claim appears only when kiro-cli's log carries a reason", async () => {
+    const parts = await runStalledTurn(260, () => {
+      mkdirSync(join(sandbox, "kiro-log"), { recursive: true })
+      writeFileSync(
+        kiroChatLogPath(),
+        `${new Date().toISOString()} ERROR test: ServiceError { kind: ModelOverloadedError, message: "x" }\n`,
+      )
+    })
+    const lines = noticeLines(parts)
+    const claims = lines.filter((line) => /may be overloaded/.test(line))
+    expect(claims.length).toBe(1)
+    expect(claims[0]).toContain("ModelOverloaded")
+    const closed = parts
+      .filter((part) => part.type === "reasoning-delta")
+      .map((part) => (part as { delta: string }).delta)
+      .join("")
+    expect(closed).toContain("(ModelOverloaded)")
   })
 })
